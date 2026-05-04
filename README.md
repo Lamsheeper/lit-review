@@ -1,2 +1,321 @@
 # lit-review
-Pipeline for academic literature review
+
+Pipeline for academic literature review.
+
+## LitHarvest
+
+LitHarvest is a draft-to-PDF literature collection tool. Given a plain-text or
+Markdown draft, it extracts search terms, queries scholarly metadata APIs, finds
+open or directly downloadable PDFs when available, downloads them to a local
+folder, and writes machine-readable logs for downstream processing.
+
+LitHarvest does not scrape Google Scholar, bypass paywalls, solve CAPTCHAs, or
+automate browser sessions. It uses API-first sources and only downloads PDFs
+that are openly accessible or directly accessible from returned metadata.
+
+Supported search and resolution sources:
+
+- OpenAlex
+- Semantic Scholar
+- Crossref
+- Europe PMC
+- Unpaywall for DOI-based open-access PDF resolution
+
+## Requirements
+
+- Python 3.10 or newer
+- Internet access for live API searches and PDF downloads
+- A draft file in `.txt` or `.md` format
+
+The current implementation uses only the Python standard library. No package
+installation is required for the baseline workflow.
+
+## Quick Start
+
+Create or choose a draft file:
+
+```bash
+cat > seed_paper.md <<'EOF'
+# Robust Sensor Fusion for Autonomous Flight
+
+This draft surveys robust sensor fusion methods for autonomous flight in
+degraded visual environments, including radar, inertial navigation, and visual
+odometry.
+EOF
+```
+
+Run LitHarvest:
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --max-queries 8 \
+  --top-k-per-query 10 \
+  --email you@example.com
+```
+
+After the run, check:
+
+```text
+collected_papers/
+├── *.pdf
+└── logs/
+    ├── manifest.json
+    └── download_log.json
+```
+
+## Safe First Run
+
+Use `--dry-run` to test draft parsing and query generation without making API
+calls or downloading files:
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --dry-run
+```
+
+Use `--metadata-only` to perform API searches and write manifests without
+attempting PDF downloads:
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --metadata-only \
+  --email you@example.com
+```
+
+## Recommended Full Run
+
+For better open-access PDF resolution, provide an Unpaywall email. Semantic
+Scholar works without an API key, but an API key can improve reliability and
+rate limits.
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --logs ./collected_papers/logs \
+  --max-queries 8 \
+  --top-k-per-query 10 \
+  --max-downloads 50 \
+  --email you@example.com \
+  --unpaywall-email you@example.com \
+  --semantic-scholar-api-key YOUR_KEY \
+  --csv-report \
+  --bibtex
+```
+
+You can also provide credentials through environment variables:
+
+```bash
+export LITHARVEST_EMAIL="you@example.com"
+export UNPAYWALL_EMAIL="you@example.com"
+export SEMANTIC_SCHOLAR_API_KEY="YOUR_KEY"
+```
+
+## Configuration File
+
+Copy the example config and edit it:
+
+```bash
+cp config.example.json config.local.json
+```
+
+Run with the config:
+
+```bash
+python3 lit_harvest.py --config config.local.json
+```
+
+Command-line flags override values from the config file:
+
+```bash
+python3 lit_harvest.py \
+  --config config.local.json \
+  --draft ./another_draft.md \
+  --output ./another_collection
+```
+
+Important config fields:
+
+- `draft`: input draft path
+- `output`: folder for downloaded PDFs
+- `logs`: folder for `manifest.json`, `download_log.json`, and optional reports
+- `max_queries`: maximum number of search queries generated from the draft
+- `top_k_per_query`: maximum results per source per query
+- `sources`: enabled search sources
+- `year_from` and `year_to`: optional publication year filters
+- `email`: contact email for polite API usage
+- `unpaywall_email`: email required for Unpaywall DOI lookups
+- `semantic_scholar_api_key`: optional Semantic Scholar API key
+- `max_pdf_mb`: maximum accepted PDF size
+- `max_downloads`: maximum successful PDF downloads
+- `metadata_only`: search without downloading PDFs
+- `csv_report`: write `candidates.csv`
+- `bibtex`: write `candidates.bib`
+
+## Common Options
+
+Limit search to specific sources:
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --sources openalex,semantic_scholar
+```
+
+Limit by publication year:
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --year-from 2019 \
+  --year-to 2026
+```
+
+Reduce result volume for a fast trial:
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --max-queries 3 \
+  --top-k-per-query 5 \
+  --max-downloads 10
+```
+
+Increase network tolerance:
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --timeout 30 \
+  --retries 4 \
+  --backoff 2 \
+  --rate-limit-delay 0.25
+```
+
+Show detailed logs:
+
+```bash
+python3 lit_harvest.py \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --verbose
+```
+
+## Outputs
+
+`manifest.json` contains the full run record:
+
+- draft path, hash, and character count
+- effective configuration with API keys redacted
+- extracted title, headings, keywords, noun phrases, and domain terms
+- generated search queries
+- all discovered candidates
+- source metadata, DOI, authors, venue, year, abstract, URLs, and scores
+- deduplication and merged-source evidence
+- PDF resolution attempts
+- download status for each candidate
+
+`download_log.json` contains a smaller download-focused record:
+
+- successful downloads
+- failed downloads and reasons
+- per-URL download attempts
+- search errors
+
+Optional reports:
+
+- `candidates.csv` with a spreadsheet-friendly candidate summary
+- `candidates.bib` with a lightweight BibTeX export
+
+PDF filenames use this pattern:
+
+```text
+year_firstauthor_shorttitle_hash.pdf
+```
+
+Example:
+
+```text
+2024_lovelace_sensor_fusion_radar_visual_navigation_1a2b3c4d5e.pdf
+```
+
+## How the Pipeline Works
+
+1. Reads the draft and normalizes text.
+2. Extracts title-like lines, Markdown headings, repeated terms, noun-like
+   n-grams, acronyms, and hyphenated technical terms.
+3. Builds a compact set of search queries.
+4. Searches enabled API sources.
+5. Normalizes metadata into a shared candidate format.
+6. Deduplicates candidates by DOI, normalized title, and title-year-author
+   heuristics.
+7. Ranks candidates with keyword overlap, title/abstract similarity signals,
+   source relevance scores, citations, recency, DOI presence, and PDF
+   availability.
+8. Resolves PDF URLs from source metadata and Unpaywall when a DOI is available.
+9. Downloads only responses that validate as PDFs.
+10. Writes the manifest and download log.
+
+## What LitHarvest Will Not Do
+
+- It will not scrape Google Scholar.
+- It will not bypass paywalls, login walls, robot protections, or CAPTCHAs.
+- It will not OCR downloaded PDFs.
+- It will not summarize papers.
+- It will not synthesize citations into your draft.
+
+## Testing
+
+Run the local tests:
+
+```bash
+python3 -m unittest discover
+```
+
+Run syntax checks:
+
+```bash
+python3 -m py_compile lit_harvest.py test_lit_harvest.py
+```
+
+Run a no-network smoke test:
+
+```bash
+python3 lit_harvest.py \
+  --draft README_lit_harvest.md \
+  --output /tmp/litharvest_smoke \
+  --dry-run
+```
+
+## Troubleshooting
+
+If few or no PDFs download, check `manifest.json`. Many scholarly APIs return
+metadata without direct PDF URLs, and some open-access records only expose HTML
+landing pages.
+
+If Semantic Scholar returns rate-limit or authentication errors, use
+`--semantic-scholar-api-key` or lower `--top-k-per-query`.
+
+If Unpaywall is skipped, provide `--unpaywall-email` or set
+`UNPAYWALL_EMAIL`.
+
+If downloaded URLs return HTML instead of PDFs, LitHarvest records the failure
+and skips the file. This is expected for landing pages, stale links, and pages
+that require interaction.
+
+If a run is too broad, reduce `--max-queries`, reduce `--top-k-per-query`, add
+year filters, or limit `--sources`.
+
+If a run is too narrow, increase `--max-queries`, increase `--top-k-per-query`,
+include all sources, and use a draft that contains a title, abstract, headings,
+and repeated technical terms.

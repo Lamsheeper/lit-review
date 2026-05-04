@@ -1,0 +1,27 @@
+{
+  "draft": "./seed_paper.txt",
+  "output": "./collected_papers",
+  "logs": "./collected_papers/logs",
+  "max_queries": 8,
+  "top_k_per_query": 10,
+  "sources": [
+    "openalex",
+    "semantic_scholar",
+    "crossref",
+    "europe_pmc"
+  ],
+  "year_from": null,
+  "year_to": null,
+  "email": "you@example.com",
+  "unpaywall_email": "you@example.com",
+  "semantic_scholar_api_key": null,
+  "timeout": 20,
+  "retries": 2,
+  "backoff": 1.5,
+  "rate_limit_delay": 0.1,
+  "max_pdf_mb": 80,
+  "max_downloads": 50,
+  "metadata_only": false,
+  "csv_report": true,
+  "bibtex": true
+}
