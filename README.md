@@ -162,6 +162,7 @@ Important config fields:
 - `output`: folder for downloaded PDFs
 - `logs`: folder for `manifest.json`, `download_log.json`, and optional reports
 - `max_queries`: maximum number of search queries generated from the draft
+- `extra_queries`: optional hand-curated seed queries searched before generated draft queries
 - `top_k_per_query`: maximum results per source per query
 - `sources`: enabled search sources
 - `year_from` and `year_to`: optional publication year filters

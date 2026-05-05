@@ -119,6 +119,7 @@ Also save:
 - initial draft file path
 - output folder path
 - maximum number of queries to generate
+- optional hand-curated seed queries to search before generated queries
 - maximum papers to retrieve per source
 - optional year filters
 - optional domain/source filters

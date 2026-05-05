@@ -9,9 +9,12 @@ from lit_harvest import (
     PdfDownloader,
     build_pdf_filename,
     build_search_queries,
+    combine_search_queries,
+    configured_search_queries,
     candidate_matches_keywords,
     extract_pdf_urls_from_html,
     extract_keywords,
+    is_saved_document_status,
     merge_candidates,
     normalize_doi,
 )
@@ -145,6 +148,35 @@ class LitHarvestCoreTests(unittest.TestCase):
         self.assertTrue(result["path"].endswith(".pdf"))
         self.assertTrue(Path(result["path"]).exists())
         self.assertEqual(candidate.download["status"], "abstract_only")
+
+    def test_saved_document_status_includes_abstract_fallbacks(self):
+        self.assertTrue(is_saved_document_status("downloaded"))
+        self.assertTrue(is_saved_document_status("already_exists"))
+        self.assertTrue(is_saved_document_status("abstract_only"))
+        self.assertFalse(is_saved_document_status("failed"))
+
+    def test_configured_queries_precede_generated_queries(self):
+        configured = configured_search_queries(
+            [
+                {
+                    "bucket": "persuasion",
+                    "text": "propaganda technique classification rhetorical strategy taxonomy",
+                    "terms": ["propaganda", "rhetorical strategy"],
+                }
+            ]
+        )
+        generated_queries = build_search_queries(
+            extract_keywords("# Moral Framing\n\nmoral framing detection media"),
+            max_queries=2,
+        )
+        combined = combine_search_queries(configured, generated_queries, max_queries=3)
+
+        self.assertEqual(combined[0].bucket, "persuasion")
+        self.assertEqual(
+            combined[0].text,
+            "propaganda technique classification rhetorical strategy taxonomy",
+        )
+        self.assertLessEqual(len(combined), 3)
 
 
 if __name__ == "__main__":

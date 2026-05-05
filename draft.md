@@ -8,12 +8,19 @@ This literature review surveys psychology, communication research, computational
 
 propaganda persuasion technique classification moral framing emotion sentiment stance detection media framing institution agenda
 
+## LitHarvest Search Focus
+
+This collection should prioritize three media attribute families: persuasion techniques, moral framing, and sentiment or emotion. Persuasion technique classification covers propaganda technique detection, rhetorical strategy taxonomy, fallacy detection, argumentation scheme classification, and persuasive message features in news, propaganda, and political communication. Moral framing detection covers moral foundations theory, moral rhetoric, moral language, moral sentiment, and moral emotions in media framing and political communication. Sentiment and emotion classification covers sentiment analysis, emotion detection, intended reader emotion, emotional framing, affective computing, stance-linked sentiment, and appraisal-based emotion in media analysis.
+
+The core search target is media attribute classification: persuasion technique classification, moral framing detection, and sentiment emotion classification. These media attributes should support stance detection and institution agenda analysis, but stance is downstream of the three primary attributes rather than a fourth equal collection category.
+
 ## Media Framing Political Communication
 
 persuasion technique detection in propaganda and media
 propaganda technique classification and rhetorical strategy taxonomy
 moral framing detection moral foundations theory political communication
 emotion classification sentiment analysis intended affect media persuasion
+sentiment emotion classification intended reader emotion media analysis
 stance detection actor agenda institution attitude media discourse
 media framing political communication persuasion rhetoric narrative framing
 

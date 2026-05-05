@@ -442,6 +442,58 @@ def build_search_queries(terms: ExtractedTerms, max_queries: int) -> list[Search
     return queries[:max_queries]
 
 
+def configured_search_queries(raw_queries: Any) -> list[SearchQuery]:
+    if not raw_queries:
+        return []
+    if not isinstance(raw_queries, list):
+        raise ValueError("extra_queries must be a list of strings or objects.")
+
+    queries: list[SearchQuery] = []
+    for idx, item in enumerate(raw_queries, start=1):
+        bucket = "config"
+        terms: list[str] = []
+        if isinstance(item, str):
+            text = item
+        elif isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            bucket = str(item.get("bucket") or bucket).strip() or bucket
+            raw_terms = item.get("terms") or []
+            if isinstance(raw_terms, str):
+                terms = content_tokens(raw_terms)
+            elif isinstance(raw_terms, list):
+                terms = [str(term).strip() for term in raw_terms if str(term).strip()]
+            else:
+                raise ValueError(f"extra_queries[{idx}].terms must be a string or list.")
+        else:
+            raise ValueError(f"extra_queries[{idx}] must be a string or object.")
+
+        text = normalize_whitespace(text)
+        if not text:
+            raise ValueError(f"extra_queries[{idx}] is missing text.")
+        queries.append(
+            SearchQuery(bucket=bucket, text=text, terms=terms or content_tokens(text))
+        )
+    return queries
+
+
+def combine_search_queries(
+    configured: list[SearchQuery],
+    generated: list[SearchQuery],
+    max_queries: int,
+) -> list[SearchQuery]:
+    queries: list[SearchQuery] = []
+    seen: set[str] = set()
+    for query in configured + generated:
+        normalized = normalize_title(query.text)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        queries.append(query)
+        if len(queries) >= max_queries:
+            break
+    return queries
+
+
 def strip_markup(value: str | None) -> str | None:
     if not value:
         return None
@@ -1618,6 +1670,10 @@ class PdfDownloader:
         return destination.stat().st_size
 
 
+def is_saved_document_status(status: str | None) -> bool:
+    return status in {"downloaded", "already_exists", "abstract_only"}
+
+
 def build_pdf_filename(candidate: Candidate) -> str:
     year = str(candidate.year or "undated")
     first_author = "unknown"
@@ -1770,7 +1826,11 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
 
     draft_text = read_text_file(draft_path)
     extracted = extract_keywords(draft_text)
-    queries = build_search_queries(extracted, int(config["max_queries"]))
+    queries = combine_search_queries(
+        configured_search_queries(config.get("extra_queries")),
+        build_search_queries(extracted, int(config["max_queries"])),
+        int(config["max_queries"]),
+    )
     LOGGER.info("Built %d search queries.", len(queries))
     for query in queries:
         LOGGER.info("Query [%s]: %s", query.bucket, query.text)
@@ -1856,11 +1916,11 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                     continue
                 urls = resolver.resolve(candidate)
                 result = downloader.download(candidate, urls)
-                if result["status"] in {"downloaded", "already_exists"}:
+                if is_saved_document_status(result.get("status")):
                     downloaded_count += 1
-                    LOGGER.info("PDF %s: %s", result["status"], candidate.title)
+                    LOGGER.info("Document %s: %s", result["status"], candidate.title)
                 else:
-                    LOGGER.info("No PDF downloaded for: %s", candidate.title)
+                    LOGGER.info("No document saved for: %s", candidate.title)
     else:
         LOGGER.info("Dry run requested; no API searches or downloads were attempted.")
 
@@ -1891,7 +1951,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "downloaded_count": sum(
             1
             for candidate in candidates
-            if candidate.download.get("status") in {"downloaded", "already_exists"}
+            if is_saved_document_status(candidate.download.get("status"))
         ),
         "keyword_search_counts": {
             source: dict(counter) for source, counter in keyword_search_counts.items()
@@ -1945,6 +2005,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "csv_report": False,
     "bibtex": False,
     "dry_run": False,
+    "extra_queries": [],
 }
 
 
