@@ -262,6 +262,7 @@ class Candidate:
     discovered_via: list[dict[str, Any]] = field(default_factory=list)
     pdf_resolution: dict[str, Any] = field(default_factory=dict)
     download: dict[str, Any] = field(default_factory=dict)
+    matched_keywords: list[str] = field(default_factory=list)
 
 
 def utc_now() -> str:
@@ -470,6 +471,26 @@ def normalize_title(value: str | None) -> str:
     value = value.lower()
     value = re.sub(r"[^a-z0-9]+", " ", value)
     return normalize_whitespace(value)
+
+
+def candidate_matches_keywords(candidate: Candidate, keywords: list[str]) -> list[str]:
+    if not keywords:
+        return []
+    text = " ".join(
+        part.strip()
+        for part in [candidate.title or "", candidate.abstract or "", candidate.venue or ""]
+        if part
+    ).lower()
+    matches: list[str] = []
+    for keyword in keywords:
+        if not keyword:
+            continue
+        normalized = keyword.lower().strip()
+        if not normalized:
+            continue
+        if re.search(r"\b" + re.escape(normalized) + r"\b", text):
+            matches.append(keyword)
+    return dedupe_preserve(matches)
 
 
 def year_in_range(year: int | None, year_from: int | None, year_to: int | None) -> bool:
@@ -745,6 +766,61 @@ def is_pdf_response(content_type: str | None, first_chunk: bytes) -> bool:
 def looks_like_html(content: bytes) -> bool:
     sample = content[:200].lstrip().lower()
     return sample.startswith(b"<!doctype html") or sample.startswith(b"<html")
+
+
+def extract_pdf_urls_from_html(html_text: str, base_url: str) -> list[str]:
+    urls: list[str] = []
+
+    # Direct href="...pdf..." links
+    for match in re.findall(r"href=[\"']([^\"']*\.pdf[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
+        if match:
+            absolute = urllib.parse.urljoin(base_url, match)
+            urls.append(absolute)
+
+    # Meta tags for PDF URLs
+    for match in re.findall(r"<meta[^>]*name=[\"']citation_pdf_url[\"'][^>]*content=[\"']([^\"']*)[\"']", html_text, flags=re.IGNORECASE):
+        if match:
+            absolute = urllib.parse.urljoin(base_url, match)
+            urls.append(absolute)
+
+    # Link rel="alternate" type="application/pdf"
+    for match in re.findall(r"<link[^>]*rel=[\"']alternate[\"'][^>]*type=[\"']application/pdf[\"'][^>]*href=[\"']([^\"']*)[\"']", html_text, flags=re.IGNORECASE):
+        if match:
+            absolute = urllib.parse.urljoin(base_url, match)
+            urls.append(absolute)
+
+    # Iframe src attributes that might point to PDFs
+    for match in re.findall(r"<iframe[^>]*src=[\"']([^\"']*\.pdf[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
+        if match:
+            absolute = urllib.parse.urljoin(base_url, match)
+            urls.append(absolute)
+
+    # A href links that might be PDFs (even if not ending in .pdf, but containing pdf in path)
+    for match in re.findall(r"href=[\"']([^\"']*pdf[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
+        if match and not match.endswith('.pdf'):  # Avoid duplicates
+            absolute = urllib.parse.urljoin(base_url, match)
+            urls.append(absolute)
+
+    # Publisher-specific patterns
+    parsed_base = urllib.parse.urlparse(base_url)
+    if 'ieeexplore.ieee.org' in parsed_base.netloc:
+        # IEEE Xplore: look for specific patterns
+        for match in re.findall(r"href=[\"']([^\"']*download[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
+            if match and 'pdf' in match.lower():
+                absolute = urllib.parse.urljoin(base_url, match)
+                urls.append(absolute)
+    elif 'academic.oup.com' in parsed_base.netloc:
+        # OUP: look for chapter-pdf or similar
+        for match in re.findall(r"href=[\"']([^\"']*chapter-pdf[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
+            absolute = urllib.parse.urljoin(base_url, match)
+            urls.append(absolute)
+    elif 'scholarship.law.umn.edu' in parsed_base.netloc:
+        # UMN scholarship: look for viewcontent
+        for match in re.findall(r"href=[\"']([^\"']*viewcontent[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
+            absolute = urllib.parse.urljoin(base_url, match)
+            urls.append(absolute)
+
+    return dedupe_preserve(urls)
 
 
 class SearchClient:
@@ -1218,6 +1294,9 @@ def merge_candidate_into(target: Candidate, incoming: Candidate) -> None:
     target.candidate_pdf_urls = dedupe_preserve(
         target.candidate_pdf_urls + incoming.candidate_pdf_urls
     )
+    target.matched_keywords = dedupe_preserve(
+        target.matched_keywords + incoming.matched_keywords
+    )
     target.discovered_via.extend(incoming.discovered_via)
     if not target.doi and incoming.doi:
         target.doi = incoming.doi
@@ -1318,6 +1397,29 @@ class PdfResolver:
                 }
             )
 
+        if candidate.landing_page_url:
+            try:
+                landing_urls = self._resolve_landing_page(candidate.landing_page_url)
+                for url in landing_urls:
+                    add_url(urls, url)
+                attempts.append(
+                    {
+                        "source": "landing_page",
+                        "status": "resolved" if landing_urls else "no_pdf_url",
+                        "url_count": len(landing_urls),
+                        "landing_page_url": candidate.landing_page_url,
+                    }
+                )
+            except Exception as exc:  # pragma: no cover - network defensive path
+                attempts.append(
+                    {
+                        "source": "landing_page",
+                        "status": "error",
+                        "reason": str(exc),
+                        "landing_page_url": candidate.landing_page_url,
+                    }
+                )
+
         candidate.pdf_resolution = {
             "resolved_at": utc_now(),
             "urls": urls,
@@ -1343,6 +1445,31 @@ class PdfResolver:
             if looks_like_pdf_url(fallback):
                 add_url(urls, fallback)
         return urls
+
+    def _resolve_landing_page(self, landing_page_url: str) -> list[str]:
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Cache-Control": "max-age=0",
+        }
+        body, _, _ = self.http.request_bytes(
+            landing_page_url,
+            headers=headers,
+        )
+        if not body:
+            return []
+        try:
+            html_text = body.decode("utf-8", errors="replace")
+        except Exception:
+            html_text = body.decode("latin-1", errors="replace")
+        return extract_pdf_urls_from_html(html_text, landing_page_url)
 
 
 class PdfDownloader:
@@ -1382,6 +1509,40 @@ class PdfDownloader:
             except Exception as exc:  # pragma: no cover - network defensive path
                 attempts.append({"url": url, "status": "failed", "reason": str(exc)})
 
+        if candidate.abstract:
+            try:
+                bytes_written = self._write_abstract_pdf(
+                    destination,
+                    title=candidate.title,
+                    authors=candidate.authors,
+                    abstract=candidate.abstract,
+                )
+                result = {
+                    "status": "abstract_only",
+                    "filename": filename,
+                    "path": str(destination),
+                    "attempts": attempts
+                    + [
+                        {
+                            "source": "abstract_fallback",
+                            "status": "generated",
+                            "reason": "Saved abstract as PDF because no PDF was available.",
+                        }
+                    ],
+                    "bytes": bytes_written,
+                    "content_type": "application/pdf",
+                }
+                candidate.download = result
+                return result
+            except Exception as exc:  # pragma: no cover - PDF generation error
+                attempts.append(
+                    {
+                        "source": "abstract_fallback",
+                        "status": "failed",
+                        "reason": str(exc),
+                    }
+                )
+
         result = {
             "status": "failed",
             "filename": filename,
@@ -1392,6 +1553,69 @@ class PdfDownloader:
         }
         candidate.download = result
         return result
+
+    def _write_abstract_pdf(
+        self,
+        destination: Path,
+        title: str,
+        authors: list[str],
+        abstract: str,
+    ) -> int:
+        lines: list[str] = []
+        if title:
+            lines.append(title)
+            lines.append("")
+        if authors:
+            lines.append(", ".join(authors))
+            lines.append("")
+        lines.append("Abstract:")
+        lines.append("")
+        for paragraph in abstract.strip().splitlines():
+            paragraph = paragraph.strip()
+            if not paragraph:
+                lines.append("")
+                continue
+            lines.extend(_wrap_text(paragraph, width=80))
+        content_line = []
+        for line in lines:
+            content_line.append(f"({ _pdf_escape(line) }) Tj")
+            content_line.append("T*")
+        content_stream = "BT\n/F1 12 Tf\n72 760 Td\n" + "\n".join(content_line) + "\nET\n"
+        stream_bytes = content_stream.encode("latin-1", errors="replace")
+
+        objs: list[bytes] = []
+        objs.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+        objs.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+        objs.append(
+            b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+        )
+        objs.append(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n"
+        )
+        objs.append(
+            f"5 0 obj\n<< /Length {len(stream_bytes)} >>\nstream\n".encode("ascii")
+            + stream_bytes
+            + b"\nendstream\nendobj\n"
+        )
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        body = b"%PDF-1.4\n" + b"".join(objs)
+        offsets = []
+        current = len(b"%PDF-1.4\n")
+        for obj in objs:
+            offsets.append(current)
+            current += len(obj)
+        xref = [b"xref\n0 6\n0000000000 65535 f \n"]
+        for offset in offsets:
+            xref.append(f"{offset:010d} 00000 n \n".encode("ascii"))
+        startxref = len(body)
+        trailer = (
+            b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n"
+            + str(startxref).encode("ascii")
+            + b"\n%%EOF\n"
+        )
+        destination.write_bytes(body + b"".join(xref) + trailer)
+        return destination.stat().st_size
 
 
 def build_pdf_filename(candidate: Candidate) -> str:
@@ -1405,6 +1629,30 @@ def build_pdf_filename(candidate: Candidate) -> str:
     )
     digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:10]
     return f"{year}_{slugify(first_author, 24)}_{title_slug}_{digest}.pdf"
+
+
+def _pdf_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _wrap_text(text: str, width: int = 80) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if current:
+            candidate = f"{current} {word}"
+        else:
+            candidate = word
+        if len(candidate) > width:
+            if current:
+                lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 def slugify(value: str | None, max_length: int = 80) -> str:
@@ -1434,6 +1682,7 @@ def write_csv_report(path: Path, candidates: list[Candidate]) -> None:
         "relevance_score",
         "landing_page_url",
         "candidate_pdf_urls",
+        "matched_keywords",
         "download_status",
         "download_path",
     ]
@@ -1452,6 +1701,7 @@ def write_csv_report(path: Path, candidates: list[Candidate]) -> None:
                     "relevance_score": candidate.relevance_score,
                     "landing_page_url": candidate.landing_page_url or "",
                     "candidate_pdf_urls": "; ".join(candidate.candidate_pdf_urls),
+                    "matched_keywords": "; ".join(candidate.matched_keywords),
                     "download_status": candidate.download.get("status", ""),
                     "download_path": candidate.download.get("path", ""),
                 }
@@ -1527,6 +1777,8 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
 
     search_errors: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
+    keyword_search_counts: dict[str, Counter[str]] = {}
+    keyword_lookup = {normalize_title(keyword): keyword for keyword in extracted.keywords}
     if not config.get("dry_run"):
         http = HttpClient(
             timeout=float(config["timeout"]),
@@ -1547,6 +1799,18 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                         year_to=config.get("year_to"),
                     )
                     LOGGER.info("%s returned %d candidates.", client.name, len(results))
+                    for candidate in results:
+                        candidate.matched_keywords = candidate_matches_keywords(candidate, extracted.keywords)
+                    query_keywords: set[str] = set()
+                    normalized_query_text = normalize_title(query.text)
+                    if normalized_query_text in keyword_lookup:
+                        query_keywords.add(keyword_lookup[normalized_query_text])
+                    for term in query.terms:
+                        normalized_term = normalize_title(term)
+                        if normalized_term in keyword_lookup:
+                            query_keywords.add(keyword_lookup[normalized_term])
+                    for keyword in query_keywords:
+                        keyword_search_counts.setdefault(client.name, Counter())[keyword] += len(results)
                     candidates.extend(results)
                 except Exception as exc:
                     LOGGER.warning("%s search failed for %r: %s", client.name, query.text, exc)
@@ -1629,6 +1893,9 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             for candidate in candidates
             if candidate.download.get("status") in {"downloaded", "already_exists"}
         ),
+        "keyword_search_counts": {
+            source: dict(counter) for source, counter in keyword_search_counts.items()
+        },
         "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
     }
     download_log = {

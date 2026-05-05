@@ -1,12 +1,18 @@
+import contextlib
+import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from lit_synthesize import (
     build_index,
     collect_paper_records,
     convert_pdfs_to_markdown,
+    main,
+    parse_args,
     search_index,
     write_report,
 )
@@ -208,6 +214,98 @@ construct validity and clear non redundant categories.
             self.assertEqual(payload["paper_count"], 1)
             self.assertEqual(payload["failed_count"], 1)
             self.assertIn("pypdf", payload["papers"][0]["conversion"]["reason"])
+
+    def test_config_file_can_drive_index_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            md_dir = run_dir / "papers_md"
+            md_dir.mkdir()
+            md_path = md_dir / "paper1.md"
+            md_path.write_text(
+                """---
+paper_id: "paper1"
+title: "Emotion and Stance"
+authors: []
+year: 2024
+doi: null
+venue: null
+pdf_path: "paper1.pdf"
+---
+
+# Emotion and Stance
+
+## Page 1
+
+Emotion classification, stance detection, and media framing are useful for
+propaganda analysis and persuasion taxonomy validation.
+""",
+                encoding="utf-8",
+            )
+            (run_dir / "paper_index.json").write_text(
+                json.dumps(
+                    {
+                        "papers": [
+                            {
+                                "paper_id": "paper1",
+                                "title": "Emotion and Stance",
+                                "authors": [],
+                                "year": 2024,
+                                "doi": None,
+                                "venue": None,
+                                "pdf_path": "paper1.pdf",
+                                "md_path": str(md_path),
+                                "conversion": {"status": "converted"},
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config_path = run_dir / "index_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "command": "index",
+                        "run": str(run_dir),
+                        "chunk_words": 60,
+                        "overlap_words": 5,
+                        "min_chunk_words": 5,
+                        "force": True,
+                        "quiet": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = main(["--config", str(config_path)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((run_dir / "index.sqlite").exists())
+
+    def test_config_file_supports_api_key_env_without_storing_secret(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "write_gemini.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "command": "write",
+                        "run": "review_runs/demo",
+                        "goal": "draft.md",
+                        "output": "review_runs/demo/report.md",
+                        "api_key_env": "GEMINI_API_KEY",
+                        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+                        "model": "gemini-3-flash-preview",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-secret"}):
+                args = parse_args(["--config", str(config_path)])
+
+            self.assertEqual(args.command, "write")
+            self.assertEqual(args.api_key, "test-secret")
+            self.assertEqual(args.model, "gemini-3-flash-preview")
 
 
 if __name__ == "__main__":

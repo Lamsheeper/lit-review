@@ -46,12 +46,6 @@ uv run lit-harvest --help
 uv run lit-synthesize --help
 ```
 
-For the optional PyMuPDF extractor:
-
-```bash
-uv sync --extra pymupdf
-```
-
 ## Quick Start
 
 Create or choose a draft file:
@@ -314,11 +308,10 @@ collected PDFs + manifest.json
 
 ### Optional PDF Text Extractors
 
-PDF text conversion needs one local extractor. `uv sync` installs `pypdf` by
-default. You can also provide one of:
+PDF text conversion needs one local extractor. `uv sync` installs `pypdf` and
+`PyMuPDF` by default. You can also provide:
 
-- `PyMuPDF` via `uv sync --extra pymupdf`
-- Poppler's `pdftotext`
+- Poppler's `pdftotext` (install via `brew install poppler` on macOS)
 
 If no extractor is available, LitSynth records conversion failures in
 `paper_index.json` instead of guessing.
@@ -396,6 +389,21 @@ uv run lit-synthesize search \
   --query "moral framing authority loyalty news media" \
   --limit 5
 ```
+
+### Config-Driven Test Runs
+
+LitSynth can also run from JSON configs:
+
+```bash
+uv run lit-synthesize --config synthesize_configs/00_convert_pdf_text.json
+uv run lit-synthesize --config synthesize_configs/01_index_balanced_chunks.json
+uv run lit-synthesize --config synthesize_configs/02_search_moral_framing.json
+uv run lit-synthesize --config synthesize_configs/03_write_offline_evidence_report.json
+```
+
+The config runner accepts a `command` field matching a LitSynth subcommand
+(`convert`, `index`, `search`, `write`, or `run`). API-backed configs can use
+`api_key_env` to read a key from the environment without storing secrets.
 
 Key generated files:
 

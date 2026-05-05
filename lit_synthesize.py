@@ -22,6 +22,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -98,6 +99,70 @@ DEFAULT_MIN_CHUNK_WORDS = 40
 DEFAULT_MODEL = "gpt-4o-mini"
 PAGE_HEADING_RE = re.compile(r"^## Page\s+(\d+)\s*$", re.MULTILINE)
 CITATION_RE = re.compile(r"\[([A-Za-z0-9_.:-]+)\]")
+CONFIG_ARG_FIELDS: dict[str, list[tuple[str, str]]] = {
+    "convert": [
+        ("papers", "--papers"),
+        ("manifest", "--manifest"),
+        ("out", "--out"),
+        ("extractor", "--extractor"),
+        ("force", "--force"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
+    "index": [
+        ("run", "--run"),
+        ("chunk_words", "--chunk-words"),
+        ("overlap_words", "--overlap-words"),
+        ("min_chunk_words", "--min-chunk-words"),
+        ("force", "--force"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
+    "search": [
+        ("run", "--run"),
+        ("query", "--query"),
+        ("limit", "--limit"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
+    "write": [
+        ("run", "--run"),
+        ("goal", "--goal"),
+        ("output", "--output"),
+        ("api_key", "--api-key"),
+        ("model", "--model"),
+        ("base_url", "--base-url"),
+        ("max_questions", "--max-questions"),
+        ("per_question", "--per-question"),
+        ("max_evidence", "--max-evidence"),
+        ("evidence_chars", "--evidence-chars"),
+        ("temperature", "--temperature"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
+    "run": [
+        ("papers", "--papers"),
+        ("manifest", "--manifest"),
+        ("goal", "--goal"),
+        ("out", "--out"),
+        ("report", "--report"),
+        ("extractor", "--extractor"),
+        ("chunk_words", "--chunk-words"),
+        ("overlap_words", "--overlap-words"),
+        ("min_chunk_words", "--min-chunk-words"),
+        ("api_key", "--api-key"),
+        ("model", "--model"),
+        ("base_url", "--base-url"),
+        ("max_questions", "--max-questions"),
+        ("per_question", "--per-question"),
+        ("max_evidence", "--max-evidence"),
+        ("evidence_chars", "--evidence-chars"),
+        ("temperature", "--temperature"),
+        ("force", "--force"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
+}
 
 
 @dataclass
@@ -1217,14 +1282,77 @@ def env_model() -> str:
     return os.getenv("LIT_SYNTH_LLM_MODEL") or DEFAULT_MODEL
 
 
+def load_synth_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Synthesis config does not exist: {path}")
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("Synthesis config must contain a JSON object.")
+    return config
+
+
+def synth_config_to_argv(config: dict[str, Any]) -> list[str]:
+    command = str(config.get("command") or "").strip()
+    if not command:
+        raise ValueError("Synthesis config must include a command.")
+    if command not in CONFIG_ARG_FIELDS:
+        allowed = ", ".join(sorted(CONFIG_ARG_FIELDS))
+        raise ValueError(f"Unknown synthesis config command {command!r}; expected one of {allowed}.")
+
+    config = dict(config)
+    api_key_env = config.get("api_key_env")
+    if api_key_env and not config.get("api_key"):
+        api_key = os.getenv(str(api_key_env))
+        if api_key:
+            config["api_key"] = api_key
+
+    argv = [command]
+    for key, flag in CONFIG_ARG_FIELDS[command]:
+        value = config.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+            continue
+        argv.extend([flag, str(value)])
+    return argv
+
+
+def expand_config_argv(argv: list[str] | None) -> list[str] | None:
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = list(argv)
+    if "--config" not in argv:
+        return argv
+
+    config_index = argv.index("--config")
+    try:
+        config_path = Path(argv[config_index + 1]).expanduser()
+    except IndexError as exc:
+        raise ValueError("--config requires a JSON config path.") from exc
+
+    remaining = argv[:config_index] + argv[config_index + 2 :]
+    config_argv = synth_config_to_argv(load_synth_config(config_path))
+    return config_argv + remaining
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verbose", action="store_true", help="Show detailed progress logs.")
     parser.add_argument("--quiet", action="store_true", help="Show warnings and errors only.")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = expand_config_argv(argv)
     parser = argparse.ArgumentParser(
         description="Convert LitHarvest PDFs to Markdown, index them, and write a review report."
+    )
+    parser.add_argument(
+        "--config",
+        help=(
+            "Path to a JSON synthesis config. Put this before the command, for example: "
+            "lit-synthesize --config synthesize_configs/04_run_offline_smoke.json"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

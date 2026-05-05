@@ -7,20 +7,16 @@ name = "lit-review"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "pypdf" },
-]
-
-[package.optional-dependencies]
-pymupdf = [
     { name = "pymupdf" },
+    { name = "pypdf" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "pymupdf", marker = "extra == 'pymupdf'", specifier = ">=1.24.0" },
+    { name = "pymupdf", specifier = ">=1.24.0" },
     { name = "pypdf", specifier = ">=5.0.0" },
 ]
-provides-extras = ["pymupdf", "dev"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "pymupdf"
