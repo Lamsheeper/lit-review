@@ -1,0 +1,3 @@
+[console_scripts]
+lit-harvest = lit_harvest:main
+lit-synthesize = lit_synthesize:main

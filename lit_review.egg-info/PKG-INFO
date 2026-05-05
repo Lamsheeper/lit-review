@@ -1,3 +1,14 @@
+Metadata-Version: 2.4
+Name: lit-review
+Version: 0.1.0
+Summary: API-first literature collection and evidence-bound review synthesis tools.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: pypdf>=5.0.0
+Provides-Extra: pymupdf
+Requires-Dist: PyMuPDF>=1.24.0; extra == "pymupdf"
+Provides-Extra: dev
+
 # lit-review
 
 Pipeline for academic literature review.
