@@ -8,3 +8,4 @@ logs/
 review_runs/
 *.pdf
 *_configs
+collected_*

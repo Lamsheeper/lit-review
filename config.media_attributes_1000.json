@@ -1,9 +1,9 @@
 {
   "draft": "./draft.md",
-  "output": "./collected_media_attribute_papers",
-  "logs": "./collected_media_attribute_papers/logs",
-  "max_queries": 80,
-  "top_k_per_query": 50,
+  "output": "./collected_media_attribute_papers_v2",
+  "logs": "./collected_media_attribute_papers_v2/logs",
+  "max_queries": 100,
+  "top_k_per_query": 10,
   "sources": [
     "openalex",
     "semantic_scholar",
@@ -13,18 +13,18 @@
   "extra_queries": [
     {
       "bucket": "persuasion_techniques",
-      "text": "propaganda technique classification rhetorical strategy taxonomy media",
-      "terms": ["propaganda technique", "rhetorical strategy", "taxonomy", "media"]
+      "text": "propaganda technique classification news articles annotation taxonomy",
+      "terms": ["propaganda technique", "classification", "news articles", "annotation", "taxonomy"]
     },
     {
       "bucket": "persuasion_techniques",
-      "text": "persuasion technique detection news political communication",
-      "terms": ["persuasion technique", "detection", "news", "political communication"]
+      "text": "fine grained propaganda detection span identification technique labeling",
+      "terms": ["fine grained propaganda detection", "span identification", "technique labeling"]
     },
     {
       "bucket": "persuasion_techniques",
-      "text": "propaganda techniques corpus annotation classification",
-      "terms": ["propaganda techniques", "corpus", "annotation", "classification"]
+      "text": "propaganda techniques corpus annotation codebook media text",
+      "terms": ["propaganda techniques", "corpus", "annotation", "codebook", "media text"]
     },
     {
       "bucket": "persuasion_techniques",
@@ -33,33 +33,98 @@
     },
     {
       "bucket": "persuasion_techniques",
-      "text": "fear appeal threat appeal moral panic media persuasion",
-      "terms": ["fear appeal", "threat appeal", "moral panic", "media persuasion"]
+      "text": "appeal to fear threat appeal anger outrage media persuasion",
+      "terms": ["appeal to fear", "threat appeal", "anger", "outrage", "media persuasion"]
     },
     {
       "bucket": "persuasion_techniques",
-      "text": "whataboutism ad hominem scapegoating political discourse detection",
-      "terms": ["whataboutism", "ad hominem", "scapegoating", "political discourse"]
+      "text": "whataboutism tu quoque straw man red herring political discourse detection",
+      "terms": ["whataboutism", "tu quoque", "straw man", "red herring", "political discourse"]
     },
     {
       "bucket": "persuasion_techniques",
-      "text": "argumentation scheme fallacy detection propaganda media",
-      "terms": ["argumentation scheme", "fallacy detection", "propaganda", "media"]
+      "text": "ad hominem false dilemma slippery slope causal oversimplification propaganda",
+      "terms": ["ad hominem", "false dilemma", "slippery slope", "causal oversimplification", "propaganda"]
     },
     {
       "bucket": "persuasion_techniques",
-      "text": "framing effects persuasive message features political communication",
-      "terms": ["framing effects", "persuasive message features", "political communication"]
+      "text": "card stacking cherry picking selective evidence media framing propaganda",
+      "terms": ["card stacking", "cherry picking", "selective evidence", "media framing", "propaganda"]
     },
     {
       "bucket": "persuasion_techniques",
-      "text": "misinformation disinformation propaganda rhetorical devices detection",
-      "terms": ["misinformation", "disinformation", "rhetorical devices", "detection"]
+      "text": "scapegoating demonization dehumanization media discourse detection",
+      "terms": ["scapegoating", "demonization", "dehumanization", "media discourse", "detection"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "slogans repetition thought terminating cliches propaganda techniques",
+      "terms": ["slogans", "repetition", "thought terminating cliches", "propaganda techniques"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "rhetorical strategy taxonomy persuasive writing media classification",
+      "terms": ["rhetorical strategy", "taxonomy", "persuasive writing", "media classification"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "persuasive message features political communication text classification",
+      "terms": ["persuasive message features", "political communication", "text classification"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "social proof authority scarcity reciprocity persuasion text analysis",
+      "terms": ["social proof", "authority", "scarcity", "reciprocity", "persuasion", "text analysis"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "ethos pathos logos rhetoric classification political speeches",
+      "terms": ["ethos", "pathos", "logos", "rhetoric classification", "political speeches"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "argumentation schemes annotation fallacy detection political text",
+      "terms": ["argumentation schemes", "annotation", "fallacy detection", "political text"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "framing by emphasis one sided evidence news persuasion",
+      "terms": ["framing by emphasis", "one sided evidence", "news", "persuasion"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "guilt shame pride hope appeals political communication",
+      "terms": ["guilt appeal", "shame appeal", "pride appeal", "hope appeal", "political communication"]
+    },
+    {
+      "bucket": "persuasion_techniques",
+      "text": "unity in group loyalty out group threat persuasion media",
+      "terms": ["unity", "in group loyalty", "out group threat", "persuasion", "media"]
     },
     {
       "bucket": "moral_framing",
-      "text": "moral framing detection moral foundations theory political communication",
-      "terms": ["moral framing", "moral foundations theory", "political communication"]
+      "text": "moral foundations theory text classification moral framing",
+      "terms": ["moral foundations theory", "text classification", "moral framing"]
+    },
+    {
+      "bucket": "moral_framing",
+      "text": "Moral Foundations Twitter Corpus moral sentiment annotation",
+      "terms": ["Moral Foundations Twitter Corpus", "moral sentiment", "annotation"]
+    },
+    {
+      "bucket": "moral_framing",
+      "text": "Moral Foundations Dictionary extended Moral Foundations Dictionary lexicon",
+      "terms": ["Moral Foundations Dictionary", "extended Moral Foundations Dictionary", "lexicon"]
+    },
+    {
+      "bucket": "moral_framing",
+      "text": "care harm fairness cheating loyalty betrayal authority subversion purity degradation text analysis",
+      "terms": ["care harm", "fairness cheating", "loyalty betrayal", "authority subversion", "purity degradation"]
+    },
+    {
+      "bucket": "moral_framing",
+      "text": "liberty oppression moral foundation freedom coercion political discourse",
+      "terms": ["liberty oppression", "moral foundation", "freedom", "coercion", "political discourse"]
     },
     {
       "bucket": "moral_framing",
@@ -68,98 +133,163 @@
     },
     {
       "bucket": "moral_framing",
-      "text": "moral foundations care fairness loyalty authority sanctity liberty text analysis",
-      "terms": ["care", "fairness", "loyalty", "authority", "sanctity", "liberty"]
+      "text": "moral reframing political communication persuasion foundations",
+      "terms": ["moral reframing", "political communication", "persuasion", "foundations"]
     },
     {
       "bucket": "moral_framing",
-      "text": "moral sentiment moral emotion political discourse media analysis",
-      "terms": ["moral sentiment", "moral emotion", "political discourse", "media analysis"]
+      "text": "moral outrage moral conviction moral emotion media discourse",
+      "terms": ["moral outrage", "moral conviction", "moral emotion", "media discourse"]
     },
     {
       "bucket": "moral_framing",
-      "text": "moral outrage moral conviction institutional trust legitimacy",
-      "terms": ["moral outrage", "moral conviction", "institutional trust", "legitimacy"]
+      "text": "individualizing binding foundations political communication text",
+      "terms": ["individualizing foundations", "binding foundations", "political communication", "text"]
     },
     {
       "bucket": "moral_framing",
-      "text": "loyalty betrayal authority subversion purity degradation political communication",
-      "terms": ["loyalty betrayal", "authority subversion", "purity degradation"]
+      "text": "group identity intergroup threat moral framing media",
+      "terms": ["group identity", "intergroup threat", "moral framing", "media"]
     },
     {
       "bucket": "moral_framing",
-      "text": "group identity intergroup threat institutional legitimacy media framing",
-      "terms": ["group identity", "intergroup threat", "institutional legitimacy", "media framing"]
+      "text": "virtue vice moral sentiment annotation codebook",
+      "terms": ["virtue vice", "moral sentiment", "annotation", "codebook"]
+    },
+    {
+      "bucket": "moral_framing",
+      "text": "sanctity purity degradation disgust political discourse",
+      "terms": ["sanctity", "purity", "degradation", "disgust", "political discourse"]
+    },
+    {
+      "bucket": "moral_framing",
+      "text": "fairness justice cheating exploitation media framing",
+      "terms": ["fairness", "justice", "cheating", "exploitation", "media framing"]
+    },
+    {
+      "bucket": "moral_framing",
+      "text": "authority order subversion law tradition political text",
+      "terms": ["authority", "order", "subversion", "law", "tradition", "political text"]
+    },
+    {
+      "bucket": "moral_framing",
+      "text": "care compassion harm victimization media discourse",
+      "terms": ["care", "compassion", "harm", "victimization", "media discourse"]
     },
     {
       "bucket": "sentiment_emotion",
-      "text": "sentiment analysis emotion detection media persuasion political communication",
-      "terms": ["sentiment analysis", "emotion detection", "media persuasion"]
+      "text": "emotion detection classification media political communication taxonomy",
+      "terms": ["emotion detection", "classification", "media", "political communication", "taxonomy"]
+    },
+    {
+      "bucket": "sentiment_emotion",
+      "text": "GoEmotions fine grained emotion classification taxonomy corpus",
+      "terms": ["GoEmotions", "fine grained emotion", "classification", "taxonomy", "corpus"]
+    },
+    {
+      "bucket": "sentiment_emotion",
+      "text": "NRC Emotion Lexicon sentiment emotion categories positive negative",
+      "terms": ["NRC Emotion Lexicon", "sentiment", "emotion categories", "positive", "negative"]
+    },
+    {
+      "bucket": "sentiment_emotion",
+      "text": "NRC VAD Lexicon valence arousal dominance text analysis",
+      "terms": ["NRC VAD Lexicon", "valence", "arousal", "dominance", "text analysis"]
+    },
+    {
+      "bucket": "sentiment_emotion",
+      "text": "sentiment analysis opinion mining target specific sentiment media",
+      "terms": ["sentiment analysis", "opinion mining", "target specific sentiment", "media"]
     },
     {
       "bucket": "sentiment_emotion",
       "text": "intended reader emotion emotional framing news media classification",
-      "terms": ["intended reader emotion", "emotional framing", "news media"]
-    },
-    {
-      "bucket": "sentiment_emotion",
-      "text": "affective computing emotion classification political text media analysis",
-      "terms": ["affective computing", "emotion classification", "political text"]
-    },
-    {
-      "bucket": "sentiment_emotion",
-      "text": "appraisal theory discrete emotion theory sentiment media framing",
-      "terms": ["appraisal theory", "discrete emotion theory", "sentiment", "media framing"]
+      "terms": ["intended reader emotion", "emotional framing", "news media", "classification"]
     },
     {
       "bucket": "sentiment_emotion",
       "text": "fear anger disgust sadness joy hope political communication emotion",
-      "terms": ["fear", "anger", "disgust", "sadness", "joy", "hope"]
+      "terms": ["fear", "anger", "disgust", "sadness", "joy", "hope", "political communication"]
     },
     {
       "bucket": "sentiment_emotion",
-      "text": "outrage anxiety contempt empathy threat perception affective polarization",
-      "terms": ["outrage", "anxiety", "contempt", "empathy", "threat perception"]
+      "text": "outrage anxiety contempt empathy threat perception media emotion",
+      "terms": ["outrage", "anxiety", "contempt", "empathy", "threat perception", "media emotion"]
     },
     {
       "bucket": "sentiment_emotion",
-      "text": "emotion annotation sentiment classification media text corpus",
-      "terms": ["emotion annotation", "sentiment classification", "media text corpus"]
+      "text": "moral emotion classification outrage disgust anger guilt shame",
+      "terms": ["moral emotion", "classification", "outrage", "disgust", "anger", "guilt", "shame"]
     },
     {
-      "bucket": "stance_agenda",
-      "text": "stance detection target specific stance institution agenda media discourse",
-      "terms": ["stance detection", "target specific stance", "institution agenda"]
+      "bucket": "sentiment_emotion",
+      "text": "affective computing emotion annotation media text corpus",
+      "terms": ["affective computing", "emotion annotation", "media text", "corpus"]
     },
     {
-      "bucket": "stance_agenda",
-      "text": "actor agenda institution attitude legitimacy framing media analysis",
-      "terms": ["actor agenda", "institution attitude", "legitimacy framing"]
+      "bucket": "sentiment_emotion",
+      "text": "Plutchik Ekman emotion taxonomy text classification",
+      "terms": ["Plutchik", "Ekman", "emotion taxonomy", "text classification"]
     },
     {
-      "bucket": "stance_agenda",
-      "text": "blame assignment responsibility framing institution criticism political discourse",
-      "terms": ["blame assignment", "responsibility framing", "institution criticism"]
+      "bucket": "sentiment_emotion",
+      "text": "circumplex model affect valence arousal media discourse",
+      "terms": ["circumplex model", "affect", "valence", "arousal", "media discourse"]
+    },
+    {
+      "bucket": "sentiment_emotion",
+      "text": "emotion annotation inter annotator agreement political text",
+      "terms": ["emotion annotation", "inter annotator agreement", "political text"]
+    },
+    {
+      "bucket": "sentiment_emotion",
+      "text": "aspect based sentiment sentiment toward entity media discourse",
+      "terms": ["aspect based sentiment", "sentiment toward entity", "media discourse"]
+    },
+    {
+      "bucket": "sentiment_emotion",
+      "text": "mixed sentiment ambivalence neutral emotion text classification",
+      "terms": ["mixed sentiment", "ambivalence", "neutral emotion", "text classification"]
     },
     {
       "bucket": "annotation_validity",
-      "text": "annotation schema codebook development propaganda persuasion moral framing emotion classification",
-      "terms": ["annotation schema", "codebook development", "classification"]
+      "text": "annotation schema codebook development persuasion moral framing emotion classification",
+      "terms": ["annotation schema", "codebook development", "persuasion", "moral framing", "emotion classification"]
     },
     {
       "bucket": "annotation_validity",
       "text": "taxonomy development construct validity inter annotator agreement media classification",
-      "terms": ["taxonomy development", "construct validity", "inter annotator agreement"]
+      "terms": ["taxonomy development", "construct validity", "inter annotator agreement", "media classification"]
     },
     {
       "bucket": "annotation_validity",
-      "text": "multi label classification hierarchical classification explainable NLP propaganda",
-      "terms": ["multi label classification", "hierarchical classification", "explainable NLP"]
+      "text": "multi label hierarchical text classification media attributes",
+      "terms": ["multi label", "hierarchical text classification", "media attributes"]
     },
     {
-      "bucket": "integrated_media_attributes",
-      "text": "persuasion moral framing sentiment emotion stance detection media analysis",
-      "terms": ["persuasion", "moral framing", "sentiment", "emotion", "stance detection"]
+      "bucket": "annotation_validity",
+      "text": "span level sentence level document level annotation propaganda emotion",
+      "terms": ["span level", "sentence level", "document level", "annotation", "propaganda", "emotion"]
+    },
+    {
+      "bucket": "annotation_validity",
+      "text": "overlapping labels multi label annotation political communication",
+      "terms": ["overlapping labels", "multi label annotation", "political communication"]
+    },
+    {
+      "bucket": "annotation_validity",
+      "text": "explainable NLP media attribute classification taxonomy",
+      "terms": ["explainable NLP", "media attribute", "classification", "taxonomy"]
+    },
+    {
+      "bucket": "annotation_validity",
+      "text": "human annotation guidelines persuasion moral emotion sentiment",
+      "terms": ["human annotation guidelines", "persuasion", "moral emotion", "sentiment"]
+    },
+    {
+      "bucket": "annotation_validity",
+      "text": "media text annotation codebook validation intercoder reliability",
+      "terms": ["media text annotation", "codebook", "validation", "intercoder reliability"]
     }
   ],
   "year_from": null,
@@ -169,7 +299,7 @@
   "backoff": 2.0,
   "rate_limit_delay": 0.25,
   "max_pdf_mb": 100,
-  "max_downloads": 1000,
+  "max_downloads": 4000,
   "metadata_only": false,
   "force_download": false,
   "csv_report": true,
