@@ -7,16 +7,24 @@ from lit_harvest import (
     Candidate,
     HttpClient,
     PdfDownloader,
+    PdfResolver,
+    WebPdfSearcher,
+    WebSearchProvider,
+    WebSearchResult,
     build_pdf_filename,
     build_search_queries,
+    build_web_pdf_queries,
     combine_search_queries,
     configured_search_queries,
     candidate_matches_keywords,
     extract_pdf_urls_from_html,
     extract_keywords,
+    inferred_pdf_urls,
     is_saved_document_status,
+    load_candidate_cache,
     merge_candidates,
     normalize_doi,
+    write_candidate_cache,
 )
 
 
@@ -71,8 +79,8 @@ class LitHarvestCoreTests(unittest.TestCase):
         html_text = '''
             <html>
               <head>
-                <meta name="citation_pdf_url" content="/papers/1234.pdf">
-                <link rel="alternate" type="application/pdf" href="https://example.org/full.pdf">
+                <meta content="/papers/1234.pdf" name="citation_pdf_url">
+                <link href="https://example.org/full.pdf" type="application/pdf" rel="alternate">
               </head>
               <body>
                 <a href="/papers/5678.pdf">Download PDF</a>
@@ -91,6 +99,141 @@ class LitHarvestCoreTests(unittest.TestCase):
         self.assertIn("https://example.org/files/report.PDF", urls)
         self.assertIn("https://example.org/embed.pdf", urls)
         self.assertIn("https://example.com/download?type=pdf", urls)
+
+    def test_extract_pdf_urls_from_embedded_json_and_pdf_paths(self):
+        html_text = r'''
+            <script>
+              window.paper = {"pdfUrl":"https:\/\/repo.example.org\/paper\/full.pdf"};
+            </script>
+            <a href="/doi/pdf/10.1000/example">Publisher PDF</a>
+            <div data-pdf-url="/article-pdf/12345">PDF</div>
+        '''
+        urls = extract_pdf_urls_from_html(html_text, "https://publisher.example.org/article")
+
+        self.assertIn("https://repo.example.org/paper/full.pdf", urls)
+        self.assertIn("https://publisher.example.org/doi/pdf/10.1000/example", urls)
+        self.assertIn("https://publisher.example.org/article-pdf/12345", urls)
+
+    def test_resolve_landing_page_uses_redirect_final_url_as_base(self):
+        class FakeHttp:
+            def request_bytes(self, url, params=None, headers=None):
+                return (
+                    b'<html><a href="/article/123/full.pdf">PDF</a></html>',
+                    {"Content-Type": "text/html"},
+                    "https://publisher.example.org/article/123",
+                )
+
+        resolver = PdfResolver(FakeHttp())
+        urls = resolver._resolve_landing_page("https://doi.org/10.1000/example")
+
+        self.assertEqual(urls, ["https://publisher.example.org/article/123/full.pdf"])
+
+    def test_inferred_pdf_urls_from_common_open_identifiers(self):
+        candidate = Candidate(
+            title="Open Identifiers",
+            doi="10.48550/arxiv.2301.12345",
+            source_ids={
+                "semantic_scholar:ACL": "P19-1021",
+                "semantic_scholar:PubMedCentral": "PMC1234567",
+            },
+        )
+
+        urls = inferred_pdf_urls(candidate)
+
+        self.assertIn("https://arxiv.org/pdf/2301.12345.pdf", urls)
+        self.assertIn("https://aclanthology.org/P19-1021.pdf", urls)
+        self.assertIn("https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/", urls)
+
+    def test_build_web_pdf_queries_uses_doi_and_exact_title(self):
+        candidate = Candidate(
+            title='A "Very" Specific Paper',
+            doi="10.1000/example",
+            authors=["Ada Lovelace"],
+        )
+
+        queries = build_web_pdf_queries(candidate, max_queries=3)
+
+        self.assertEqual(queries[0], '"10.1000/example" pdf')
+        self.assertIn('"A Very Specific Paper" filetype:pdf', queries)
+        self.assertIn('"A Very Specific Paper" pdf', queries)
+
+    def test_web_pdf_searcher_splits_pdf_and_landing_results(self):
+        class FakeProvider(WebSearchProvider):
+            name = "fake"
+
+            def search(self, query, max_results):
+                return [
+                    WebSearchResult(
+                        source=self.name,
+                        query=query,
+                        rank=1,
+                        url="https://repo.example.org/very-specific-paper.pdf",
+                        title="A Very Specific Paper",
+                    ),
+                    WebSearchResult(
+                        source=self.name,
+                        query=query,
+                        rank=2,
+                        url="https://authors.example.org/very-specific-paper",
+                        title="A Very Specific Paper project page",
+                    ),
+                    WebSearchResult(
+                        source=self.name,
+                        query=query,
+                        rank=3,
+                        url="https://irrelevant.example.org/file.pdf",
+                        title="An unrelated result",
+                    ),
+                ]
+
+        candidate = Candidate(title="A Very Specific Paper")
+        searcher = WebPdfSearcher([FakeProvider()], max_results=5, queries_per_candidate=1)
+
+        pdf_urls, landing_urls, attempts = searcher.resolve(candidate)
+
+        self.assertEqual(pdf_urls, ["https://repo.example.org/very-specific-paper.pdf"])
+        self.assertEqual(landing_urls, ["https://authors.example.org/very-specific-paper"])
+        self.assertEqual(attempts[0]["source"], "web_search:fake")
+        self.assertEqual(attempts[0]["accepted_count"], 2)
+
+    def test_candidate_cache_round_trips_post_search_data(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        draft_path = tmp_dir / "draft.md"
+        draft_text = "# Cache Test\n\nsensor fusion methods"
+        draft_path.write_text(draft_text, encoding="utf-8")
+        cache_path = tmp_dir / "logs" / "candidates.json"
+        extracted = extract_keywords(draft_text)
+        queries = build_search_queries(extracted, max_queries=2)
+        candidate = Candidate(
+            title="A Study of Sensor Fusion",
+            authors=["Ada Lovelace"],
+            year=2024,
+            doi="10.1000/test",
+            source_apis=["openalex"],
+            candidate_pdf_urls=["https://example.org/paper.pdf"],
+            candidate_landing_page_urls=["https://example.org/paper"],
+            relevance_score=0.42,
+        )
+
+        write_candidate_cache(
+            cache_path,
+            draft_path=draft_path,
+            draft_text=draft_text,
+            config={"draft": str(draft_path), "output": str(tmp_dir)},
+            extracted=extracted,
+            queries=queries,
+            search_errors=[],
+            keyword_search_counts={},
+            candidates=[candidate],
+        )
+        loaded = load_candidate_cache(cache_path)
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["candidate_count"], 1)
+        self.assertEqual(loaded["candidates"][0].title, "A Study of Sensor Fusion")
+        self.assertEqual(loaded["candidates"][0].doi, "10.1000/test")
+        self.assertEqual(loaded["candidates"][0].candidate_pdf_urls, ["https://example.org/paper.pdf"])
+        self.assertEqual(loaded["queries"][0].text, queries[0].text)
 
     def test_candidate_matches_keywords(self):
         candidate = Candidate(

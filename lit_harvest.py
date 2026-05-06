@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import gzip
 import hashlib
 import html
 import json
@@ -23,9 +24,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -245,6 +248,16 @@ class SearchQuery:
 
 
 @dataclass
+class WebSearchResult:
+    source: str
+    query: str
+    rank: int
+    url: str
+    title: str | None = None
+    snippet: str | None = None
+
+
+@dataclass
 class Candidate:
     title: str
     authors: list[str] = field(default_factory=list)
@@ -256,6 +269,7 @@ class Candidate:
     source_apis: list[str] = field(default_factory=list)
     source_ids: dict[str, str] = field(default_factory=dict)
     candidate_pdf_urls: list[str] = field(default_factory=list)
+    candidate_landing_page_urls: list[str] = field(default_factory=list)
     relevance_score: float = 0.0
     source_score: float | None = None
     citation_count: int | None = None
@@ -602,21 +616,74 @@ def dedupe_preserve(values: list[str]) -> list[str]:
     return output
 
 
-def add_url(urls: list[str], value: str | None) -> None:
+def clean_url(value: str | None) -> str | None:
     if not value:
+        return None
+    url = html.unescape(str(value)).strip().strip("\"'")
+    url = url.replace("\\/", "/")
+    url = re.sub(r"\\u002[fF]", "/", url)
+    url = re.sub(r"\\u0026", "&", url, flags=re.IGNORECASE)
+    url = re.sub(r"\\u003[dD]", "=", url)
+    url = re.sub(r"\\u003[fF]", "?", url)
+    url = url.strip().rstrip(".,;)")
+    return url or None
+
+
+def add_url(urls: list[str], value: str | None) -> None:
+    url = clean_url(value)
+    if not url:
         return
-    url = html.unescape(str(value)).strip()
     if not re.match(r"^https?://", url, flags=re.IGNORECASE):
         return
     if url.lower() not in {existing.lower() for existing in urls}:
         urls.append(url)
 
 
+def add_absolute_url(urls: list[str], value: str | None, base_url: str) -> None:
+    url = clean_url(value)
+    if not url:
+        return
+    absolute = urllib.parse.urljoin(base_url, url)
+    add_url(urls, absolute)
+
+
+PDF_URL_PATH_HINTS = (
+    "/pdf",
+    "pdf/",
+    "article-pdf",
+    "chapter-pdf",
+    "full/pdf",
+    "content/pdf",
+    "doi/pdf",
+    "download",
+    "viewcontent",
+    "fulltext",
+)
+
+
+def has_pdf_file_hint(url: str | None) -> bool:
+    if not url:
+        return False
+    parsed = urllib.parse.urlparse(url)
+    path = urllib.parse.unquote(parsed.path.lower())
+    return path.endswith(".pdf") or ".pdf" in path
+
+
 def looks_like_pdf_url(url: str | None) -> bool:
     if not url:
         return False
     parsed = urllib.parse.urlparse(url)
-    return parsed.path.lower().endswith(".pdf") or ".pdf" in parsed.path.lower()
+    path = urllib.parse.unquote(parsed.path.lower())
+    query = urllib.parse.unquote(parsed.query.lower())
+    if has_pdf_file_hint(url):
+        return True
+    if any(hint in path for hint in PDF_URL_PATH_HINTS):
+        return True
+    if "pdf" in query and any(
+        key in query for key in ("download", "type", "format", "output", "mime", "file")
+    ):
+        return True
+    return False
 
 
 class HttpClient:
@@ -695,6 +762,7 @@ class HttpClient:
                     self._last_request_at = time.monotonic()
                     body = response.read()
                     response_headers = dict(response.headers.items())
+                    body = decode_http_body(body, response_headers)
                     return body, response_headers, response.geturl()
             except urllib.error.HTTPError as exc:
                 self._last_request_at = time.monotonic()
@@ -806,6 +874,30 @@ class HttpClient:
         raise RuntimeError(f"PDF download failed for {url}: {last_error}")
 
 
+def decode_http_body(body: bytes, headers: dict[str, Any]) -> bytes:
+    encoding = str(
+        headers.get("Content-Encoding")
+        or headers.get("content-encoding")
+        or ""
+    ).lower()
+    if not body:
+        return body
+    if "gzip" in encoding:
+        try:
+            return gzip.decompress(body)
+        except OSError:
+            return body
+    if "deflate" in encoding:
+        try:
+            return zlib.decompress(body)
+        except zlib.error:
+            try:
+                return zlib.decompress(body, -zlib.MAX_WBITS)
+            except zlib.error:
+                return body
+    return body
+
+
 def is_pdf_response(content_type: str | None, first_chunk: bytes) -> bool:
     content_type = (content_type or "").lower()
     if first_chunk.startswith(b"%PDF-"):
@@ -820,59 +912,442 @@ def looks_like_html(content: bytes) -> bool:
     return sample.startswith(b"<!doctype html") or sample.startswith(b"<html")
 
 
+PDF_META_NAMES = {
+    "citation_pdf_url",
+    "bepress_citation_pdf_url",
+    "eprints.document_url",
+    "fulltext_pdf",
+    "pdf_url",
+}
+
+
+class PdfLinkParser(HTMLParser):
+    def __init__(self, base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._inspect_tag(tag, attrs)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._inspect_tag(tag, attrs)
+
+    def _inspect_tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attr = {key.lower(): value or "" for key, value in attrs}
+
+        if tag == "meta":
+            name = (
+                attr.get("name")
+                or attr.get("property")
+                or attr.get("itemprop")
+                or ""
+            ).lower()
+            content = attr.get("content")
+            if content and (
+                name in PDF_META_NAMES
+                or "pdf" in name
+                or looks_like_pdf_url(content)
+            ):
+                add_absolute_url(self.urls, content, self.base_url)
+            return
+
+        if tag == "link":
+            href = attr.get("href")
+            rel = attr.get("rel", "").lower()
+            content_type = attr.get("type", "").lower()
+            title = attr.get("title", "").lower()
+            if href and (
+                "pdf" in rel
+                or "pdf" in content_type
+                or "pdf" in title
+                or looks_like_pdf_url(href)
+            ):
+                add_absolute_url(self.urls, href, self.base_url)
+            return
+
+        for key in ("href", "src", "data"):
+            value = attr.get(key)
+            if value and looks_like_pdf_url(value):
+                add_absolute_url(self.urls, value, self.base_url)
+
+        for key, value in attr.items():
+            if not value:
+                continue
+            key_lower = key.lower()
+            if any(hint in key_lower for hint in ("pdf", "download", "fulltext")):
+                if looks_like_pdf_url(value) or re.match(r"^https?://", value):
+                    add_absolute_url(self.urls, value, self.base_url)
+
+
+def extract_pdf_urls_from_text(text: str, base_url: str) -> list[str]:
+    urls: list[str] = []
+    for raw_url in re.findall(r"https?:\\?/\\?/[^\"'<>\\\s]+", text, flags=re.IGNORECASE):
+        if looks_like_pdf_url(raw_url):
+            add_url(urls, raw_url)
+    for match in re.findall(
+        r"""(?ix)
+        ["'](?:pdf[_-]?url|pdfUrl|url_for_pdf|download[_-]?url|fullTextUrl)["']
+        \s*:\s*
+        ["']([^"']+)["']
+        """,
+        text,
+    ):
+        if looks_like_pdf_url(match):
+            add_absolute_url(urls, match, base_url)
+    return urls
+
+
 def extract_pdf_urls_from_html(html_text: str, base_url: str) -> list[str]:
     urls: list[str] = []
-
-    # Direct href="...pdf..." links
-    for match in re.findall(r"href=[\"']([^\"']*\.pdf[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
-        if match:
-            absolute = urllib.parse.urljoin(base_url, match)
-            urls.append(absolute)
-
-    # Meta tags for PDF URLs
-    for match in re.findall(r"<meta[^>]*name=[\"']citation_pdf_url[\"'][^>]*content=[\"']([^\"']*)[\"']", html_text, flags=re.IGNORECASE):
-        if match:
-            absolute = urllib.parse.urljoin(base_url, match)
-            urls.append(absolute)
-
-    # Link rel="alternate" type="application/pdf"
-    for match in re.findall(r"<link[^>]*rel=[\"']alternate[\"'][^>]*type=[\"']application/pdf[\"'][^>]*href=[\"']([^\"']*)[\"']", html_text, flags=re.IGNORECASE):
-        if match:
-            absolute = urllib.parse.urljoin(base_url, match)
-            urls.append(absolute)
-
-    # Iframe src attributes that might point to PDFs
-    for match in re.findall(r"<iframe[^>]*src=[\"']([^\"']*\.pdf[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
-        if match:
-            absolute = urllib.parse.urljoin(base_url, match)
-            urls.append(absolute)
-
-    # A href links that might be PDFs (even if not ending in .pdf, but containing pdf in path)
-    for match in re.findall(r"href=[\"']([^\"']*pdf[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
-        if match and not match.endswith('.pdf'):  # Avoid duplicates
-            absolute = urllib.parse.urljoin(base_url, match)
-            urls.append(absolute)
-
-    # Publisher-specific patterns
-    parsed_base = urllib.parse.urlparse(base_url)
-    if 'ieeexplore.ieee.org' in parsed_base.netloc:
-        # IEEE Xplore: look for specific patterns
-        for match in re.findall(r"href=[\"']([^\"']*download[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
-            if match and 'pdf' in match.lower():
-                absolute = urllib.parse.urljoin(base_url, match)
-                urls.append(absolute)
-    elif 'academic.oup.com' in parsed_base.netloc:
-        # OUP: look for chapter-pdf or similar
-        for match in re.findall(r"href=[\"']([^\"']*chapter-pdf[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
-            absolute = urllib.parse.urljoin(base_url, match)
-            urls.append(absolute)
-    elif 'scholarship.law.umn.edu' in parsed_base.netloc:
-        # UMN scholarship: look for viewcontent
-        for match in re.findall(r"href=[\"']([^\"']*viewcontent[^\"']*)[\"']", html_text, flags=re.IGNORECASE):
-            absolute = urllib.parse.urljoin(base_url, match)
-            urls.append(absolute)
-
+    parser = PdfLinkParser(base_url)
+    try:
+        parser.feed(html_text)
+        urls.extend(parser.urls)
+    except Exception:
+        LOGGER.debug("HTML parser failed while extracting PDF links.", exc_info=True)
+    urls.extend(extract_pdf_urls_from_text(html_text, base_url))
     return dedupe_preserve(urls)
+
+
+def normalize_arxiv_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    identifier = clean_url(value) or str(value).strip()
+    identifier = re.sub(r"^https?://arxiv\.org/(?:abs|pdf)/", "", identifier, flags=re.IGNORECASE)
+    identifier = re.sub(r"^arxiv:\s*", "", identifier, flags=re.IGNORECASE)
+    identifier = identifier.strip().strip("/")
+    identifier = re.sub(r"\.pdf$", "", identifier, flags=re.IGNORECASE)
+    if not identifier:
+        return None
+    if re.match(r"^\d{4}\.\d{4,5}(?:v\d+)?$", identifier, flags=re.IGNORECASE):
+        return identifier
+    if re.match(r"^[a-z][a-z.-]+/\d{7}(?:v\d+)?$", identifier, flags=re.IGNORECASE):
+        return identifier
+    return None
+
+
+def normalize_acl_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    identifier = clean_url(value) or str(value).strip()
+    identifier = re.sub(
+        r"^https?://(?:www\.)?aclanthology\.org/", "",
+        identifier,
+        flags=re.IGNORECASE,
+    )
+    identifier = identifier.strip().strip("/")
+    identifier = re.sub(r"\.pdf$", "", identifier, flags=re.IGNORECASE)
+    if re.match(r"^[a-z]\d{2}-\d{4}$", identifier, flags=re.IGNORECASE):
+        return identifier
+    if re.match(r"^\d{4}\.[a-z0-9-]+\.\d+$", identifier, flags=re.IGNORECASE):
+        return identifier
+    return None
+
+
+def normalize_pmcid(value: str | None) -> str | None:
+    if not value:
+        return None
+    identifier = str(value).strip()
+    identifier = re.sub(r"^pmcid:\s*", "", identifier, flags=re.IGNORECASE)
+    identifier = re.sub(
+        r"^https?://(?:www\.)?(?:ncbi\.nlm\.nih\.gov/pmc|pmc\.ncbi\.nlm\.nih\.gov/articles)/",
+        "",
+        identifier,
+        flags=re.IGNORECASE,
+    )
+    identifier = identifier.strip().strip("/")
+    match = re.search(r"(PMC\d+)", identifier, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
+def add_identifier_pdf_urls(urls: list[str], identifier: str | None, kind: str | None = None) -> None:
+    if not identifier:
+        return
+    kind_lower = (kind or "").lower()
+    if kind_lower in {"arxiv", "arxiv_id"} or "arxiv" in str(identifier).lower():
+        arxiv_id = normalize_arxiv_id(identifier)
+        if arxiv_id:
+            add_url(urls, f"https://arxiv.org/pdf/{urllib.parse.quote(arxiv_id, safe='/')}.pdf")
+    if kind_lower in {"acl", "acl_id"}:
+        acl_id = normalize_acl_id(identifier)
+        if acl_id:
+            add_url(urls, f"https://aclanthology.org/{acl_id}.pdf")
+    if kind_lower in {"pmc", "pmcid", "pubmedcentral"} or str(identifier).upper().startswith("PMC"):
+        pmcid = normalize_pmcid(identifier)
+        if pmcid:
+            add_url(urls, f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/")
+            add_url(urls, f"https://europepmc.org/articles/{pmcid}?pdf=render")
+
+
+def add_doi_pdf_urls(urls: list[str], doi: str | None) -> None:
+    if not doi:
+        return
+    doi_lower = doi.lower()
+    if doi_lower.startswith("10.48550/arxiv."):
+        add_identifier_pdf_urls(urls, doi_lower.split("arxiv.", 1)[1], kind="arxiv")
+    if doi_lower.startswith("10.18653/v1/"):
+        add_identifier_pdf_urls(urls, doi.split("/", 2)[2], kind="acl")
+
+
+def inferred_pdf_urls(candidate: Candidate) -> list[str]:
+    urls: list[str] = []
+    add_doi_pdf_urls(urls, candidate.doi)
+    for key, value in candidate.source_ids.items():
+        key_lower = key.lower()
+        if "arxiv" in key_lower:
+            add_identifier_pdf_urls(urls, value, kind="arxiv")
+        elif "acl" in key_lower:
+            add_identifier_pdf_urls(urls, value, kind="acl")
+        elif "pmc" in key_lower or "pubmedcentral" in key_lower:
+            add_identifier_pdf_urls(urls, value, kind="pmc")
+    return dedupe_preserve(urls)
+
+
+def quote_search_phrase(value: str) -> str:
+    escaped = value.replace('"', " ").strip()
+    return f'"{normalize_whitespace(escaped)}"'
+
+
+def build_web_pdf_queries(candidate: Candidate, max_queries: int = 3) -> list[str]:
+    queries: list[str] = []
+    if candidate.doi:
+        queries.append(f'{quote_search_phrase(candidate.doi)} pdf')
+    title = normalize_whitespace(candidate.title)
+    if title:
+        quoted_title = quote_search_phrase(title)
+        queries.append(f"{quoted_title} filetype:pdf")
+        queries.append(f"{quoted_title} pdf")
+        if candidate.authors:
+            queries.append(f"{quoted_title} {quote_search_phrase(candidate.authors[0])} pdf")
+    return dedupe_preserve(queries)[: max(max_queries, 0)]
+
+
+def web_result_matches_candidate(candidate: Candidate, result: WebSearchResult) -> bool:
+    if candidate.doi:
+        needle = candidate.doi.lower()
+        haystack = " ".join(
+            part for part in [result.url, result.title or "", result.snippet or ""] if part
+        ).lower()
+        if needle in haystack:
+            return True
+
+    candidate_tokens = set(content_tokens(candidate.title))
+    if not candidate_tokens:
+        return True
+    result_text = " ".join(
+        part for part in [result.title or "", result.snippet or "", result.url] if part
+    )
+    result_tokens = set(content_tokens(urllib.parse.unquote(result_text)))
+    overlap = candidate_tokens & result_tokens
+    required = max(2, min(5, math.ceil(len(candidate_tokens) * 0.4)))
+    if len(overlap) >= required:
+        return True
+    return result.rank <= 2 and bool(overlap)
+
+
+class WebSearchProvider:
+    name = "base"
+
+    def search(self, query: str, max_results: int) -> list[WebSearchResult]:
+        raise NotImplementedError
+
+
+class BraveSearchProvider(WebSearchProvider):
+    name = "brave"
+
+    def __init__(
+        self,
+        http: HttpClient,
+        api_key: str,
+        country: str = "us",
+        language: str = "en",
+    ) -> None:
+        self.http = http
+        self.api_key = api_key
+        self.country = country
+        self.language = language
+
+    def search(self, query: str, max_results: int) -> list[WebSearchResult]:
+        data = self.http.get_json(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={
+                "q": query,
+                "count": min(max(max_results, 1), 20),
+                "country": self.country,
+                "search_lang": self.language,
+            },
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": self.api_key,
+            },
+        )
+        results: list[WebSearchResult] = []
+        for idx, item in enumerate(((data.get("web") or {}).get("results") or []), start=1):
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url")
+            if not url:
+                continue
+            results.append(
+                WebSearchResult(
+                    source=self.name,
+                    query=query,
+                    rank=idx,
+                    url=str(url),
+                    title=strip_markup(item.get("title")),
+                    snippet=strip_markup(item.get("description")),
+                )
+            )
+        return results
+
+
+class SerpApiSearchProvider(WebSearchProvider):
+    name = "serpapi"
+
+    def __init__(
+        self,
+        http: HttpClient,
+        api_key: str,
+        engine: str = "google",
+    ) -> None:
+        self.http = http
+        self.api_key = api_key
+        self.engine = engine
+
+    def search(self, query: str, max_results: int) -> list[WebSearchResult]:
+        data = self.http.get_json(
+            "https://serpapi.com/search.json",
+            params={
+                "engine": self.engine,
+                "q": query,
+                "num": min(max(max_results, 1), 20),
+                "api_key": self.api_key,
+            },
+            headers={"Accept": "application/json"},
+        )
+        results: list[WebSearchResult] = []
+        for idx, item in enumerate(data.get("organic_results") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            url = item.get("link") or item.get("redirect_link")
+            if not url:
+                continue
+            results.append(
+                WebSearchResult(
+                    source=self.name,
+                    query=query,
+                    rank=safe_int(item.get("position")) or idx,
+                    url=str(url),
+                    title=strip_markup(item.get("title")),
+                    snippet=strip_markup(item.get("snippet")),
+                )
+            )
+        return results
+
+
+class WebPdfSearcher:
+    def __init__(
+        self,
+        providers: list[WebSearchProvider],
+        max_results: int = 5,
+        queries_per_candidate: int = 3,
+    ) -> None:
+        self.providers = providers
+        self.max_results = max_results
+        self.queries_per_candidate = queries_per_candidate
+        self._cache: dict[tuple[str, str], list[WebSearchResult]] = {}
+
+    def resolve(self, candidate: Candidate) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+        pdf_urls: list[str] = []
+        landing_page_urls: list[str] = []
+        attempts: list[dict[str, Any]] = []
+        queries = build_web_pdf_queries(candidate, self.queries_per_candidate)
+        if not queries:
+            return pdf_urls, landing_page_urls, attempts
+
+        for provider in self.providers:
+            for query in queries:
+                cache_key = (provider.name, query)
+                try:
+                    if cache_key not in self._cache:
+                        self._cache[cache_key] = provider.search(query, self.max_results)
+                    results = self._cache[cache_key]
+                    accepted = 0
+                    for result in results:
+                        if not web_result_matches_candidate(candidate, result):
+                            continue
+                        accepted += 1
+                        if looks_like_pdf_url(result.url):
+                            add_url(pdf_urls, result.url)
+                        else:
+                            add_url(landing_page_urls, result.url)
+                    attempts.append(
+                        {
+                            "source": f"web_search:{provider.name}",
+                            "status": "resolved" if accepted else "no_matching_result",
+                            "query": query,
+                            "result_count": len(results),
+                            "accepted_count": accepted,
+                        }
+                    )
+                except Exception as exc:  # pragma: no cover - network defensive path
+                    attempts.append(
+                        {
+                            "source": f"web_search:{provider.name}",
+                            "status": "error",
+                            "query": query,
+                            "reason": str(exc),
+                        }
+                    )
+        return pdf_urls, landing_page_urls, attempts
+
+
+def build_web_pdf_searcher(config: dict[str, Any], http: HttpClient) -> WebPdfSearcher | None:
+    raw_sources = config.get("web_search_sources") or []
+    if isinstance(raw_sources, str):
+        raw_sources = parse_sources(raw_sources)
+    sources = [normalize_source_name(str(source)) for source in raw_sources]
+    providers: list[WebSearchProvider] = []
+    for source in sources:
+        if source == "brave":
+            api_key = config.get("brave_search_api_key") or os.getenv("BRAVE_SEARCH_API_KEY")
+            if api_key:
+                providers.append(
+                    BraveSearchProvider(
+                        http,
+                        api_key=str(api_key),
+                        country=str(config.get("web_search_country") or "us"),
+                        language=str(config.get("web_search_language") or "en"),
+                    )
+                )
+            else:
+                LOGGER.warning("Skipping Brave web search; no BRAVE_SEARCH_API_KEY configured.")
+        elif source == "serpapi":
+            api_key = config.get("serpapi_api_key") or os.getenv("SERPAPI_API_KEY")
+            if api_key:
+                providers.append(
+                    SerpApiSearchProvider(
+                        http,
+                        api_key=str(api_key),
+                        engine=str(config.get("serpapi_engine") or "google"),
+                    )
+                )
+            else:
+                LOGGER.warning("Skipping SerpAPI web search; no SERPAPI_API_KEY configured.")
+        else:
+            raise ValueError(f"Unknown web search source: {source}")
+
+    if not providers:
+        return None
+    return WebPdfSearcher(
+        providers,
+        max_results=int(config.get("web_search_max_results") or 5),
+        queries_per_candidate=int(config.get("web_search_queries_per_candidate") or 3),
+    )
 
 
 class SearchClient:
@@ -936,6 +1411,7 @@ class OpenAlexClient(SearchClient):
             venue = host_venue.get("display_name")
 
         pdf_urls: list[str] = []
+        landing_urls: list[str] = []
         add_url(pdf_urls, primary_location.get("pdf_url"))
         open_access = item.get("open_access") or {}
         oa_url = open_access.get("oa_url")
@@ -944,11 +1420,24 @@ class OpenAlexClient(SearchClient):
         )
         if looks_like_pdf_url(oa_url):
             add_url(pdf_urls, oa_url)
-        elif oa_url and not landing_page:
-            landing_page = oa_url
+        elif oa_url:
+            add_url(landing_urls, oa_url)
+            if not landing_page:
+                landing_page = oa_url
+        add_url(landing_urls, landing_page)
         for location in ensure_list(item.get("locations")):
             if isinstance(location, dict):
                 add_url(pdf_urls, location.get("pdf_url"))
+                add_url(landing_urls, location.get("landing_page_url"))
+        doi = normalize_doi(item.get("doi"))
+        add_doi_pdf_urls(pdf_urls, doi)
+        ids = item.get("ids") or {}
+        source_ids = {self.name: str(item.get("id"))} if item.get("id") else {}
+        if isinstance(ids, dict):
+            for key, value in ids.items():
+                if value:
+                    source_ids[f"{self.name}:{key}"] = str(value)
+                    add_identifier_pdf_urls(pdf_urls, str(value), kind=str(key))
 
         authors = []
         for authorship in ensure_list(item.get("authorships")):
@@ -960,13 +1449,14 @@ class OpenAlexClient(SearchClient):
             title=title,
             authors=dedupe_preserve(authors),
             year=safe_int(item.get("publication_year")),
-            doi=normalize_doi(item.get("doi")),
+            doi=doi,
             abstract=reconstruct_openalex_abstract(item.get("abstract_inverted_index")),
             venue=venue,
             landing_page_url=landing_page,
             source_apis=[self.name],
-            source_ids={self.name: str(item.get("id"))} if item.get("id") else {},
-            candidate_pdf_urls=pdf_urls,
+            source_ids=source_ids,
+            candidate_pdf_urls=dedupe_preserve(pdf_urls),
+            candidate_landing_page_urls=landing_urls,
             source_score=safe_float(item.get("relevance_score")),
             citation_count=safe_int(item.get("cited_by_count")),
             discovered_via=[
@@ -1049,15 +1539,28 @@ class SemanticScholarClient(SearchClient):
             return None
         external_ids = item.get("externalIds") or {}
         pdf_urls: list[str] = []
+        landing_urls: list[str] = []
         open_pdf = item.get("openAccessPdf") or {}
         if isinstance(open_pdf, dict):
             add_url(pdf_urls, open_pdf.get("url"))
+            if not has_pdf_file_hint(open_pdf.get("url")):
+                add_url(landing_urls, open_pdf.get("url"))
+        add_url(landing_urls, item.get("url"))
+        if isinstance(external_ids, dict):
+            add_doi_pdf_urls(pdf_urls, normalize_doi(external_ids.get("DOI")))
+            for key, value in external_ids.items():
+                add_identifier_pdf_urls(pdf_urls, str(value), kind=str(key))
         authors = [
             author["name"]
             for author in ensure_list(item.get("authors"))
             if isinstance(author, dict) and author.get("name")
         ]
         paper_id = item.get("paperId")
+        source_ids = {self.name: str(paper_id)} if paper_id else {}
+        if isinstance(external_ids, dict):
+            for key, value in external_ids.items():
+                if value:
+                    source_ids[f"{self.name}:{key}"] = str(value)
         return Candidate(
             title=title,
             authors=dedupe_preserve(authors),
@@ -1067,8 +1570,9 @@ class SemanticScholarClient(SearchClient):
             venue=item.get("venue"),
             landing_page_url=item.get("url"),
             source_apis=[self.name],
-            source_ids={self.name: str(paper_id)} if paper_id else {},
-            candidate_pdf_urls=pdf_urls,
+            source_ids=source_ids,
+            candidate_pdf_urls=dedupe_preserve(pdf_urls),
+            candidate_landing_page_urls=landing_urls,
             citation_count=safe_int(item.get("citationCount")),
             discovered_via=[
                 {
@@ -1126,6 +1630,7 @@ class CrossrefClient(SearchClient):
         if not title:
             return None
         pdf_urls: list[str] = []
+        landing_urls: list[str] = []
         for link in ensure_list(item.get("link")):
             if not isinstance(link, dict):
                 continue
@@ -1133,6 +1638,8 @@ class CrossrefClient(SearchClient):
             url = link.get("URL")
             if "pdf" in content_type or looks_like_pdf_url(url):
                 add_url(pdf_urls, url)
+            elif url:
+                add_url(landing_urls, url)
 
         authors: list[str] = []
         for author in ensure_list(item.get("author")):
@@ -1146,6 +1653,8 @@ class CrossrefClient(SearchClient):
                 authors.append(name)
 
         doi = normalize_doi(item.get("DOI"))
+        add_doi_pdf_urls(pdf_urls, doi)
+        add_url(landing_urls, item.get("URL") or doi_to_url(doi))
         return Candidate(
             title=title,
             authors=dedupe_preserve(authors),
@@ -1156,7 +1665,8 @@ class CrossrefClient(SearchClient):
             landing_page_url=item.get("URL") or doi_to_url(doi),
             source_apis=[self.name],
             source_ids={self.name: doi} if doi else {},
-            candidate_pdf_urls=pdf_urls,
+            candidate_pdf_urls=dedupe_preserve(pdf_urls),
+            candidate_landing_page_urls=landing_urls,
             source_score=safe_float(item.get("score")),
             discovered_via=[
                 {
@@ -1218,6 +1728,7 @@ class EuropePmcClient(SearchClient):
         if not title:
             return None
         pdf_urls: list[str] = []
+        landing_urls: list[str] = []
         full_text_list = (item.get("fullTextUrlList") or {}).get("fullTextUrl")
         for full_text in ensure_list(full_text_list):
             if not isinstance(full_text, dict):
@@ -1226,6 +1737,8 @@ class EuropePmcClient(SearchClient):
             style = str(full_text.get("documentStyle") or "").lower()
             if style == "pdf" or looks_like_pdf_url(url):
                 add_url(pdf_urls, url)
+            else:
+                add_url(landing_urls, url)
 
         authors = parse_europe_pmc_authors(item.get("authorString"))
         source = item.get("source")
@@ -1233,12 +1746,17 @@ class EuropePmcClient(SearchClient):
         landing_page = doi_to_url(normalize_doi(item.get("doi")))
         if not landing_page and source and source_id:
             landing_page = f"https://europepmc.org/article/{source}/{source_id}"
+        add_url(landing_urls, landing_page)
+        doi = normalize_doi(item.get("doi"))
+        add_doi_pdf_urls(pdf_urls, doi)
+        if source and source.upper() == "PMC":
+            add_identifier_pdf_urls(pdf_urls, str(source_id), kind="pmc")
 
         return Candidate(
             title=title,
             authors=authors,
             year=safe_int(item.get("pubYear")),
-            doi=normalize_doi(item.get("doi")),
+            doi=doi,
             abstract=strip_markup(item.get("abstractText")),
             venue=item.get("journalTitle"),
             landing_page_url=landing_page,
@@ -1246,7 +1764,8 @@ class EuropePmcClient(SearchClient):
             source_ids={self.name: f"{source}:{source_id}"}
             if source and source_id
             else {},
-            candidate_pdf_urls=pdf_urls,
+            candidate_pdf_urls=dedupe_preserve(pdf_urls),
+            candidate_landing_page_urls=landing_urls,
             citation_count=safe_int(item.get("citedByCount")),
             discovered_via=[
                 {
@@ -1346,6 +1865,9 @@ def merge_candidate_into(target: Candidate, incoming: Candidate) -> None:
     target.candidate_pdf_urls = dedupe_preserve(
         target.candidate_pdf_urls + incoming.candidate_pdf_urls
     )
+    target.candidate_landing_page_urls = dedupe_preserve(
+        target.candidate_landing_page_urls + incoming.candidate_landing_page_urls
+    )
     target.matched_keywords = dedupe_preserve(
         target.matched_keywords + incoming.matched_keywords
     )
@@ -1400,7 +1922,7 @@ def rank_candidates(candidates: list[Candidate], terms: ExtractedTerms) -> list[
         if candidate.year:
             age = max(current_year - candidate.year, 0)
             score += max(0.0, 0.08 - age * 0.005)
-        if candidate.candidate_pdf_urls:
+        if candidate.candidate_pdf_urls or candidate.candidate_landing_page_urls:
             score += 0.1
         if candidate.doi:
             score += 0.03
@@ -1413,27 +1935,50 @@ def rank_candidates(candidates: list[Candidate], terms: ExtractedTerms) -> list[
 
 
 class PdfResolver:
-    def __init__(self, http: HttpClient, unpaywall_email: str | None = None) -> None:
+    def __init__(
+        self,
+        http: HttpClient,
+        unpaywall_email: str | None = None,
+        web_searcher: WebPdfSearcher | None = None,
+    ) -> None:
         self.http = http
         self.unpaywall_email = unpaywall_email
+        self.web_searcher = web_searcher
 
-    def resolve(self, candidate: Candidate) -> list[str]:
+    def resolve(self, candidate: Candidate, use_web_search: bool = True) -> list[str]:
         urls: list[str] = []
+        landing_pages: list[str] = []
         attempts: list[dict[str, Any]] = []
         for url in candidate.candidate_pdf_urls:
             add_url(urls, url)
+            if not has_pdf_file_hint(url):
+                add_url(landing_pages, url)
             attempts.append({"source": "source_metadata", "status": "candidate", "url": url})
+
+        for url in inferred_pdf_urls(candidate):
+            add_url(urls, url)
+            attempts.append({"source": "identifier", "status": "candidate", "url": url})
+
+        for url in candidate.candidate_landing_page_urls:
+            add_url(landing_pages, url)
+        add_url(landing_pages, candidate.landing_page_url)
+        add_url(landing_pages, doi_to_url(candidate.doi))
 
         if candidate.doi and self.unpaywall_email:
             try:
-                unpaywall_urls = self._resolve_unpaywall(candidate.doi)
-                for url in unpaywall_urls:
+                unpaywall_pdf_urls, unpaywall_landing_urls = self._resolve_unpaywall(candidate.doi)
+                for url in unpaywall_pdf_urls:
                     add_url(urls, url)
+                for url in unpaywall_landing_urls:
+                    add_url(landing_pages, url)
                 attempts.append(
                     {
                         "source": "unpaywall",
-                        "status": "resolved" if unpaywall_urls else "no_pdf_url",
-                        "url_count": len(unpaywall_urls),
+                        "status": "resolved"
+                        if unpaywall_pdf_urls or unpaywall_landing_urls
+                        else "no_pdf_url",
+                        "url_count": len(unpaywall_pdf_urls),
+                        "landing_page_count": len(unpaywall_landing_urls),
                     }
                 )
             except Exception as exc:  # pragma: no cover - network defensive path
@@ -1449,9 +1994,17 @@ class PdfResolver:
                 }
             )
 
-        if candidate.landing_page_url:
+        if self.web_searcher and use_web_search:
+            web_pdf_urls, web_landing_pages, web_attempts = self.web_searcher.resolve(candidate)
+            for url in web_pdf_urls:
+                add_url(urls, url)
+            for url in web_landing_pages:
+                add_url(landing_pages, url)
+            attempts.extend(web_attempts)
+
+        for landing_page_url in landing_pages:
             try:
-                landing_urls = self._resolve_landing_page(candidate.landing_page_url)
+                landing_urls = self._resolve_landing_page(landing_page_url)
                 for url in landing_urls:
                     add_url(urls, url)
                 attempts.append(
@@ -1459,7 +2012,7 @@ class PdfResolver:
                         "source": "landing_page",
                         "status": "resolved" if landing_urls else "no_pdf_url",
                         "url_count": len(landing_urls),
-                        "landing_page_url": candidate.landing_page_url,
+                        "landing_page_url": landing_page_url,
                     }
                 )
             except Exception as exc:  # pragma: no cover - network defensive path
@@ -1468,26 +2021,28 @@ class PdfResolver:
                         "source": "landing_page",
                         "status": "error",
                         "reason": str(exc),
-                        "landing_page_url": candidate.landing_page_url,
+                        "landing_page_url": landing_page_url,
                     }
                 )
 
         candidate.pdf_resolution = {
             "resolved_at": utc_now(),
             "urls": urls,
+            "landing_page_urls": landing_pages,
             "attempts": attempts,
         }
         return urls
 
-    def _resolve_unpaywall(self, doi: str) -> list[str]:
+    def _resolve_unpaywall(self, doi: str) -> tuple[list[str], list[str]]:
         encoded_doi = urllib.parse.quote(doi, safe="/")
         data = self.http.get_json(
             f"https://api.unpaywall.org/v2/{encoded_doi}",
             params={"email": self.unpaywall_email},
         )
         urls: list[str] = []
+        landing_page_urls: list[str] = []
         if data.get("is_oa") is False:
-            return urls
+            return urls, landing_page_urls
         locations = [data.get("best_oa_location")] + ensure_list(data.get("oa_locations"))
         for location in locations:
             if not isinstance(location, dict):
@@ -1496,7 +2051,10 @@ class PdfResolver:
             fallback = location.get("url")
             if looks_like_pdf_url(fallback):
                 add_url(urls, fallback)
-        return urls
+            else:
+                add_url(landing_page_urls, fallback)
+            add_url(landing_page_urls, location.get("url_for_landing_page"))
+        return urls, landing_page_urls
 
     def _resolve_landing_page(self, landing_page_url: str) -> list[str]:
         headers = {
@@ -1511,17 +2069,20 @@ class PdfResolver:
             "Sec-Fetch-Site": "none",
             "Cache-Control": "max-age=0",
         }
-        body, _, _ = self.http.request_bytes(
+        body, headers, final_url = self.http.request_bytes(
             landing_page_url,
             headers=headers,
         )
         if not body:
             return []
+        content_type = str(headers.get("Content-Type") or headers.get("content-type") or "")
+        if is_pdf_response(content_type, body[:8192]):
+            return [final_url]
         try:
             html_text = body.decode("utf-8", errors="replace")
         except Exception:
             html_text = body.decode("latin-1", errors="replace")
-        return extract_pdf_urls_from_html(html_text, landing_page_url)
+        return extract_pdf_urls_from_html(html_text, final_url or landing_page_url)
 
 
 class PdfDownloader:
@@ -1738,6 +2299,8 @@ def write_csv_report(path: Path, candidates: list[Candidate]) -> None:
         "relevance_score",
         "landing_page_url",
         "candidate_pdf_urls",
+        "candidate_landing_page_urls",
+        "resolved_pdf_urls",
         "matched_keywords",
         "download_status",
         "download_path",
@@ -1757,6 +2320,12 @@ def write_csv_report(path: Path, candidates: list[Candidate]) -> None:
                     "relevance_score": candidate.relevance_score,
                     "landing_page_url": candidate.landing_page_url or "",
                     "candidate_pdf_urls": "; ".join(candidate.candidate_pdf_urls),
+                    "candidate_landing_page_urls": "; ".join(
+                        candidate.candidate_landing_page_urls
+                    ),
+                    "resolved_pdf_urls": "; ".join(
+                        candidate.pdf_resolution.get("urls", [])
+                    ),
                     "matched_keywords": "; ".join(candidate.matched_keywords),
                     "download_status": candidate.download.get("status", ""),
                     "download_path": candidate.download.get("path", ""),
@@ -1817,10 +2386,181 @@ def config_fingerprint(path: Path, text: str) -> dict[str, Any]:
     }
 
 
+def resolve_candidates_json_path(config: dict[str, Any], logs_dir: Path) -> Path:
+    raw_path = config.get("candidates_json") or logs_dir / "candidates.json"
+    return Path(raw_path).expanduser()
+
+
+def search_query_from_dict(raw: dict[str, Any]) -> SearchQuery | None:
+    text = normalize_whitespace(str(raw.get("text") or ""))
+    if not text:
+        return None
+    terms = raw.get("terms") or []
+    if isinstance(terms, str):
+        terms = content_tokens(terms)
+    elif isinstance(terms, list):
+        terms = [str(term).strip() for term in terms if str(term).strip()]
+    else:
+        terms = []
+    return SearchQuery(
+        bucket=str(raw.get("bucket") or "cached").strip() or "cached",
+        text=text,
+        terms=terms,
+    )
+
+
+def candidate_from_dict(raw: dict[str, Any]) -> Candidate:
+    allowed = {field.name for field in dataclasses.fields(Candidate)}
+    kwargs = {key: value for key, value in raw.items() if key in allowed}
+    title = normalize_whitespace(str(kwargs.get("title") or ""))
+    if not title:
+        raise ValueError("Cached candidate is missing a title.")
+    kwargs["title"] = title
+
+    for key in [
+        "authors",
+        "source_apis",
+        "candidate_pdf_urls",
+        "candidate_landing_page_urls",
+        "matched_keywords",
+    ]:
+        value = kwargs.get(key)
+        if isinstance(value, list):
+            kwargs[key] = [str(item) for item in value if str(item).strip()]
+        elif value:
+            kwargs[key] = [str(value)]
+        else:
+            kwargs[key] = []
+
+    if not isinstance(kwargs.get("source_ids"), dict):
+        kwargs["source_ids"] = {}
+    else:
+        kwargs["source_ids"] = {
+            str(key): str(value)
+            for key, value in kwargs["source_ids"].items()
+            if value is not None
+        }
+
+    for key in ["pdf_resolution", "download"]:
+        if not isinstance(kwargs.get(key), dict):
+            kwargs[key] = {}
+
+    discovered_via = kwargs.get("discovered_via")
+    if isinstance(discovered_via, list):
+        kwargs["discovered_via"] = [
+            item for item in discovered_via if isinstance(item, dict)
+        ]
+    else:
+        kwargs["discovered_via"] = []
+
+    kwargs["doi"] = normalize_doi(kwargs.get("doi"))
+    kwargs["abstract"] = strip_markup(kwargs.get("abstract"))
+    kwargs["venue"] = strip_markup(kwargs.get("venue"))
+    kwargs["landing_page_url"] = clean_url(kwargs.get("landing_page_url"))
+    kwargs["year"] = safe_int(kwargs.get("year"))
+    kwargs["relevance_score"] = safe_float(kwargs.get("relevance_score")) or 0.0
+    kwargs["source_score"] = safe_float(kwargs.get("source_score"))
+    kwargs["citation_count"] = safe_int(kwargs.get("citation_count"))
+    return Candidate(**kwargs)
+
+
+def load_candidate_cache(path: Path) -> dict[str, Any] | None:
+    if not path.exists() or not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        return None
+    raw = json.loads(text)
+    if isinstance(raw, list):
+        raw_candidates = raw
+        payload: dict[str, Any] = {"candidates": raw_candidates}
+    elif isinstance(raw, dict):
+        raw_candidates = raw.get("candidates") or []
+        payload = raw
+    else:
+        raise ValueError(f"Candidate cache must contain an object or list: {path}")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        return None
+
+    candidates: list[Candidate] = []
+    for idx, item in enumerate(raw_candidates, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Candidate cache item {idx} must be an object.")
+        candidates.append(candidate_from_dict(item))
+    if not candidates:
+        return None
+
+    cached_queries: list[SearchQuery] = []
+    for item in payload.get("queries") or []:
+        if isinstance(item, dict):
+            query = search_query_from_dict(item)
+            if query:
+                cached_queries.append(query)
+
+    keyword_counts: dict[str, Counter[str]] = {}
+    raw_keyword_counts = payload.get("keyword_search_counts") or {}
+    if isinstance(raw_keyword_counts, dict):
+        for source, counts in raw_keyword_counts.items():
+            if isinstance(counts, dict):
+                keyword_counts[str(source)] = Counter(
+                    {
+                        str(keyword): int(count)
+                        for keyword, count in counts.items()
+                        if safe_int(count) is not None
+                    }
+                )
+
+    search_errors = payload.get("search_errors") or []
+    if not isinstance(search_errors, list):
+        search_errors = []
+
+    return {
+        "path": str(path),
+        "generated_at": payload.get("generated_at"),
+        "candidates": candidates,
+        "queries": cached_queries,
+        "search_errors": search_errors,
+        "keyword_search_counts": keyword_counts,
+        "candidate_count": len(candidates),
+    }
+
+
+def write_candidate_cache(
+    path: Path,
+    *,
+    draft_path: Path,
+    draft_text: str,
+    config: dict[str, Any],
+    extracted: ExtractedTerms,
+    queries: list[SearchQuery],
+    search_errors: list[dict[str, Any]],
+    keyword_search_counts: dict[str, Counter[str]],
+    candidates: list[Candidate],
+) -> None:
+    payload = {
+        "project": "LitHarvest",
+        "version": VERSION,
+        "generated_at": utc_now(),
+        "stage": "post_search_pre_download",
+        "draft": config_fingerprint(draft_path, draft_text),
+        "config": redacted_config(config),
+        "extracted_terms": dataclasses.asdict(extracted),
+        "queries": [dataclasses.asdict(query) for query in queries],
+        "search_errors": search_errors,
+        "keyword_search_counts": {
+            source: dict(counter) for source, counter in keyword_search_counts.items()
+        },
+        "candidate_count": len(candidates),
+        "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
+    }
+    write_json(path, payload)
+
+
 def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     draft_path = Path(config["draft"]).expanduser()
     output_dir = Path(config["output"]).expanduser()
     logs_dir = Path(config.get("logs") or output_dir / "logs").expanduser()
+    candidates_json_path = resolve_candidates_json_path(config, logs_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1839,6 +2579,10 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     candidates: list[Candidate] = []
     keyword_search_counts: dict[str, Counter[str]] = {}
     keyword_lookup = {normalize_title(keyword): keyword for keyword in extracted.keywords}
+    candidate_cache: dict[str, Any] = {
+        "path": str(candidates_json_path),
+        "status": "not_used",
+    }
     if not config.get("dry_run"):
         http = HttpClient(
             timeout=float(config["timeout"]),
@@ -1847,48 +2591,94 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             rate_limit_delay=float(config["rate_limit_delay"]),
             email=config.get("email"),
         )
-        clients = build_clients(config, http)
-        for query in queries:
-            for client in clients:
-                try:
-                    LOGGER.info("Searching %s for %r", client.name, query.text)
-                    results = client.search(
-                        query,
-                        top_k=int(config["top_k_per_query"]),
-                        year_from=config.get("year_from"),
-                        year_to=config.get("year_to"),
-                    )
-                    LOGGER.info("%s returned %d candidates.", client.name, len(results))
-                    for candidate in results:
-                        candidate.matched_keywords = candidate_matches_keywords(candidate, extracted.keywords)
-                    query_keywords: set[str] = set()
-                    normalized_query_text = normalize_title(query.text)
-                    if normalized_query_text in keyword_lookup:
-                        query_keywords.add(keyword_lookup[normalized_query_text])
-                    for term in query.terms:
-                        normalized_term = normalize_title(term)
-                        if normalized_term in keyword_lookup:
-                            query_keywords.add(keyword_lookup[normalized_term])
-                    for keyword in query_keywords:
-                        keyword_search_counts.setdefault(client.name, Counter())[keyword] += len(results)
-                    candidates.extend(results)
-                except Exception as exc:
-                    LOGGER.warning("%s search failed for %r: %s", client.name, query.text, exc)
-                    search_errors.append(
-                        {
-                            "source": client.name,
-                            "query": query.text,
-                            "bucket": query.bucket,
-                            "reason": str(exc),
-                        }
-                    )
 
-        candidates = rank_candidates(merge_candidates(candidates), extracted)
+        cached = None
+        if not config.get("refresh_candidates"):
+            cached = load_candidate_cache(candidates_json_path)
+        if cached:
+            candidates = cached["candidates"]
+            if cached["queries"]:
+                queries = cached["queries"]
+            search_errors = cached["search_errors"]
+            keyword_search_counts = cached["keyword_search_counts"]
+            candidate_cache = {
+                "path": str(candidates_json_path),
+                "status": "loaded",
+                "generated_at": cached.get("generated_at"),
+                "candidate_count": len(candidates),
+            }
+            LOGGER.info(
+                "Loaded %d candidates from %s; skipping metadata search.",
+                len(candidates),
+                candidates_json_path,
+            )
+        else:
+            clients = build_clients(config, http)
+            for query in queries:
+                for client in clients:
+                    try:
+                        LOGGER.info("Searching %s for %r", client.name, query.text)
+                        results = client.search(
+                            query,
+                            top_k=int(config["top_k_per_query"]),
+                            year_from=config.get("year_from"),
+                            year_to=config.get("year_to"),
+                        )
+                        LOGGER.info("%s returned %d candidates.", client.name, len(results))
+                        for candidate in results:
+                            candidate.matched_keywords = candidate_matches_keywords(candidate, extracted.keywords)
+                        query_keywords: set[str] = set()
+                        normalized_query_text = normalize_title(query.text)
+                        if normalized_query_text in keyword_lookup:
+                            query_keywords.add(keyword_lookup[normalized_query_text])
+                        for term in query.terms:
+                            normalized_term = normalize_title(term)
+                            if normalized_term in keyword_lookup:
+                                query_keywords.add(keyword_lookup[normalized_term])
+                        for keyword in query_keywords:
+                            keyword_search_counts.setdefault(client.name, Counter())[keyword] += len(results)
+                        candidates.extend(results)
+                    except Exception as exc:
+                        LOGGER.warning("%s search failed for %r: %s", client.name, query.text, exc)
+                        search_errors.append(
+                            {
+                                "source": client.name,
+                                "query": query.text,
+                                "bucket": query.bucket,
+                                "reason": str(exc),
+                            }
+                        )
+
+            candidates = rank_candidates(merge_candidates(candidates), extracted)
+            write_candidate_cache(
+                candidates_json_path,
+                draft_path=draft_path,
+                draft_text=draft_text,
+                config=config,
+                extracted=extracted,
+                queries=queries,
+                search_errors=search_errors,
+                keyword_search_counts=keyword_search_counts,
+                candidates=candidates,
+            )
+            candidate_cache = {
+                "path": str(candidates_json_path),
+                "status": "saved",
+                "candidate_count": len(candidates),
+            }
+            LOGGER.info(
+                "Saved %d post-search candidates to %s before PDF download.",
+                len(candidates),
+                candidates_json_path,
+            )
+
+        web_searcher = build_web_pdf_searcher(config, http)
         resolver = PdfResolver(
             http,
             unpaywall_email=config.get("unpaywall_email")
             or os.getenv("UNPAYWALL_EMAIL")
             or config.get("email"),
+            web_searcher=web_searcher,
         )
         downloader = PdfDownloader(
             http,
@@ -1906,6 +2696,11 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         else:
             download_limit = config.get("max_downloads")
             max_downloads = int(download_limit) if download_limit is not None else None
+            web_limit = config.get("web_search_max_candidates")
+            max_web_search_candidates = (
+                int(web_limit) if web_limit is not None else None
+            )
+            web_search_count = 0
             downloaded_count = 0
             for candidate in candidates:
                 if max_downloads is not None and downloaded_count >= max_downloads:
@@ -1914,7 +2709,17 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                         "reason": "max_downloads limit reached",
                     }
                     continue
-                urls = resolver.resolve(candidate)
+                use_web_search = bool(web_searcher)
+                if max_web_search_candidates == 0:
+                    use_web_search = False
+                elif (
+                    max_web_search_candidates is not None
+                    and web_search_count >= max_web_search_candidates
+                ):
+                    use_web_search = False
+                if use_web_search:
+                    web_search_count += 1
+                urls = resolver.resolve(candidate, use_web_search=use_web_search)
                 result = downloader.download(candidate, urls)
                 if is_saved_document_status(result.get("status")):
                     downloaded_count += 1
@@ -1923,6 +2728,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                     LOGGER.info("No document saved for: %s", candidate.title)
     else:
         LOGGER.info("Dry run requested; no API searches or downloads were attempted.")
+        candidate_cache["status"] = "not_used_dry_run"
 
     downloads = [candidate.download for candidate in candidates if candidate.download]
     failures = [
@@ -1947,6 +2753,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "extracted_terms": dataclasses.asdict(extracted),
         "queries": [dataclasses.asdict(query) for query in queries],
         "search_errors": search_errors,
+        "candidate_cache": candidate_cache,
         "candidate_count": len(candidates),
         "downloaded_count": sum(
             1
@@ -1961,6 +2768,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     download_log = {
         "project": "LitHarvest",
         "generated_at": utc_now(),
+        "candidate_cache": candidate_cache,
         "downloads": downloads,
         "failed_downloads": failures,
         "search_errors": search_errors,
@@ -1981,6 +2789,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "manifest": manifest,
         "manifest_path": str(manifest_path),
         "download_log_path": str(download_log_path),
+        "candidates_json_path": str(candidates_json_path),
     }
 
 
@@ -1993,6 +2802,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "email": os.getenv("LITHARVEST_EMAIL"),
     "unpaywall_email": os.getenv("UNPAYWALL_EMAIL"),
     "semantic_scholar_api_key": os.getenv("SEMANTIC_SCHOLAR_API_KEY"),
+    "web_search_sources": [],
+    "web_search_max_candidates": 100,
+    "web_search_max_results": 5,
+    "web_search_queries_per_candidate": 3,
+    "web_search_country": "us",
+    "web_search_language": "en",
+    "brave_search_api_key": os.getenv("BRAVE_SEARCH_API_KEY"),
+    "serpapi_api_key": os.getenv("SERPAPI_API_KEY"),
+    "serpapi_engine": "google",
     "timeout": 20.0,
     "retries": 2,
     "backoff": 1.5,
@@ -2000,6 +2818,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_pdf_mb": 80,
     "max_downloads": 50,
     "logs": None,
+    "candidates_json": None,
+    "refresh_candidates": False,
     "metadata_only": False,
     "force_download": False,
     "csv_report": False,
@@ -2016,6 +2836,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--draft", help="Path to the input draft text or markdown file.")
     parser.add_argument("--output", help="Folder where downloaded PDFs should be stored.")
     parser.add_argument("--logs", help="Folder for manifest.json and download_log.json.")
+    parser.add_argument(
+        "--candidates-json",
+        help="Post-search candidate checkpoint JSON. Defaults to logs/candidates.json.",
+    )
     parser.add_argument("--config", help="Optional JSON config file.")
     parser.add_argument("--max-queries", type=int, help="Maximum search queries to generate.")
     parser.add_argument(
@@ -2032,6 +2856,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--email", help="Contact email for polite API usage.")
     parser.add_argument("--unpaywall-email", help="Email for Unpaywall DOI lookups.")
     parser.add_argument("--semantic-scholar-api-key", help="Optional Semantic Scholar API key.")
+    parser.add_argument(
+        "--web-search-sources",
+        help="Comma-separated web search fallbacks for PDF discovery: brave,serpapi.",
+    )
+    parser.add_argument(
+        "--web-search-max-candidates",
+        type=int,
+        help="Maximum ranked candidates to enrich with web search; 0 disables web search.",
+    )
+    parser.add_argument(
+        "--web-search-max-results",
+        type=int,
+        help="Maximum web search results to inspect per query.",
+    )
+    parser.add_argument(
+        "--web-search-queries-per-candidate",
+        type=int,
+        help="Maximum web search queries to run per candidate.",
+    )
+    parser.add_argument("--web-search-country", help="Country code for web search providers.")
+    parser.add_argument("--web-search-language", help="Language code for web search providers.")
+    parser.add_argument("--brave-search-api-key", help="Optional Brave Search API key.")
+    parser.add_argument("--serpapi-api-key", help="Optional SerpAPI key.")
+    parser.add_argument("--serpapi-engine", help="SerpAPI engine, default google.")
     parser.add_argument("--timeout", type=float, help="HTTP timeout in seconds.")
     parser.add_argument("--retries", type=int, help="HTTP retry count.")
     parser.add_argument("--backoff", type=float, help="Retry backoff base in seconds.")
@@ -2053,6 +2901,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=None,
         help="Overwrite existing PDFs with the same generated filename.",
+    )
+    parser.add_argument(
+        "--refresh-candidates",
+        action="store_true",
+        default=None,
+        help="Ignore an existing candidates JSON checkpoint and run metadata searches again.",
     )
     parser.add_argument(
         "--csv-report",
@@ -2100,6 +2954,13 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
             normalize_source_name(source) for source in config.get("sources", DEFAULT_SOURCES)
         ]
 
+    if isinstance(config.get("web_search_sources"), str):
+        config["web_search_sources"] = parse_sources(config["web_search_sources"])
+    else:
+        config["web_search_sources"] = [
+            normalize_source_name(source) for source in config.get("web_search_sources", [])
+        ]
+
     if not config.get("draft"):
         raise ValueError("--draft is required unless provided in --config.")
     if not config.get("output"):
@@ -2113,6 +2974,12 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--top-k-per-query must be at least 1.")
     if int(config["max_pdf_mb"]) < 1:
         raise ValueError("--max-pdf-mb must be at least 1.")
+    if int(config["web_search_max_candidates"]) < 0:
+        raise ValueError("--web-search-max-candidates must be at least 0.")
+    if int(config["web_search_max_results"]) < 1:
+        raise ValueError("--web-search-max-results must be at least 1.")
+    if int(config["web_search_queries_per_candidate"]) < 1:
+        raise ValueError("--web-search-queries-per-candidate must be at least 1.")
     return config
 
 

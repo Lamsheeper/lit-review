@@ -161,6 +161,8 @@ Important config fields:
 - `draft`: input draft path
 - `output`: folder for downloaded PDFs
 - `logs`: folder for `manifest.json`, `download_log.json`, and optional reports
+- `candidates_json`: post-search checkpoint path, defaulting to `logs/candidates.json`
+- `refresh_candidates`: ignore an existing candidate checkpoint and run searches again
 - `max_queries`: maximum number of search queries generated from the draft
 - `extra_queries`: optional hand-curated seed queries searched before generated draft queries
 - `top_k_per_query`: maximum results per source per query
@@ -169,6 +171,12 @@ Important config fields:
 - `email`: contact email for polite API usage
 - `unpaywall_email`: email required for Unpaywall DOI lookups
 - `semantic_scholar_api_key`: optional Semantic Scholar API key
+- `web_search_sources`: optional PDF web-search fallbacks, such as `brave` or `serpapi`
+- `web_search_max_candidates`: maximum ranked candidates to enrich with web search
+- `web_search_max_results`: maximum web results to inspect per web query
+- `web_search_queries_per_candidate`: maximum exact-title/DOI web queries per candidate
+- `brave_search_api_key`: optional Brave Search API key
+- `serpapi_api_key`: optional SerpAPI key for Google-style search results
 - `max_pdf_mb`: maximum accepted PDF size
 - `max_downloads`: maximum successful PDF downloads
 - `metadata_only`: search without downloading PDFs
@@ -207,6 +215,42 @@ uv run lit-harvest \
   --max-downloads 10
 ```
 
+Enable web-search PDF fallback:
+
+```bash
+BRAVE_SEARCH_API_KEY=... uv run lit-harvest \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --web-search-sources brave \
+  --web-search-max-candidates 100
+```
+
+For Google-style result pages through SerpAPI:
+
+```bash
+SERPAPI_API_KEY=... uv run lit-harvest \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --web-search-sources serpapi
+```
+
+Reuse a completed candidate search and retry downloads:
+
+```bash
+uv run lit-harvest \
+  --config config.local.json
+```
+
+If `logs/candidates.json` already contains candidates, LitHarvest skips metadata
+search and continues with PDF resolution/download. To force a fresh candidate
+search:
+
+```bash
+uv run lit-harvest \
+  --config config.local.json \
+  --refresh-candidates
+```
+
 Increase network tolerance:
 
 ```bash
@@ -237,6 +281,7 @@ uv run lit-harvest \
 - extracted title, headings, keywords, noun phrases, and domain terms
 - generated search queries
 - all discovered candidates
+- candidate checkpoint status and path
 - source metadata, DOI, authors, venue, year, abstract, URLs, and scores
 - deduplication and merged-source evidence
 - PDF resolution attempts
@@ -251,6 +296,7 @@ uv run lit-harvest \
 
 Optional reports:
 
+- `candidates.json` with the post-search, pre-download candidate checkpoint
 - `candidates.csv` with a spreadsheet-friendly candidate summary
 - `candidates.bib` with a lightweight BibTeX export
 

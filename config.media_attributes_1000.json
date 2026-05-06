@@ -3,7 +3,7 @@
   "output": "./collected_media_attribute_papers_v2",
   "logs": "./collected_media_attribute_papers_v2/logs",
   "max_queries": 100,
-  "top_k_per_query": 10,
+  "top_k_per_query": 20,
   "sources": [
     "openalex",
     "semantic_scholar",
