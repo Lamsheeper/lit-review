@@ -2,9 +2,12 @@ import unittest
 
 from pathlib import Path
 import tempfile
+from unittest import mock
 
+import lit_harvest
 from lit_harvest import (
     Candidate,
+    DownloadLogLedger,
     HttpClient,
     PdfDownloader,
     PdfResolver,
@@ -17,6 +20,8 @@ from lit_harvest import (
     combine_search_queries,
     configured_search_queries,
     candidate_matches_keywords,
+    apply_download_log_resume,
+    download_candidates,
     extract_pdf_urls_from_html,
     extract_keywords,
     inferred_pdf_urls,
@@ -291,6 +296,263 @@ class LitHarvestCoreTests(unittest.TestCase):
         self.assertTrue(result["path"].endswith(".pdf"))
         self.assertTrue(Path(result["path"]).exists())
         self.assertEqual(candidate.download["status"], "abstract_only")
+
+    def test_download_pdf_does_not_retry_html_response(self):
+        class FakeResponse:
+            headers = {"Content-Type": "text/html"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self, size=-1):
+                return b"<html>not a pdf</html>"
+
+            def geturl(self):
+                return "https://example.org/not-pdf"
+
+        destination = Path(tempfile.mkdtemp()) / "paper.pdf"
+        client = HttpClient(retries=4, backoff=0, rate_limit_delay=0)
+
+        with mock.patch("urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+            with self.assertRaises(RuntimeError):
+                client.download_pdf(
+                    "https://example.org/not-pdf",
+                    destination,
+                    max_bytes=1024 * 1024,
+                )
+
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertFalse(destination.exists())
+
+    def test_download_candidates_runs_multiple_candidates(self):
+        class FakeResolver:
+            web_searcher = None
+
+            def resolve(self, candidate, use_web_search=True):
+                return ["https://example.org/paper.pdf"]
+
+        class FakeDownloader:
+            def __init__(self, output_dir):
+                self.output_dir = output_dir
+                self.force_download = False
+
+            def download(self, candidate, urls):
+                result = {
+                    "status": "downloaded",
+                    "url": urls[0],
+                    "filename": f"{candidate.title}.pdf",
+                    "attempts": [{"url": urls[0], "status": "downloaded"}],
+                }
+                candidate.download = result
+                return result
+
+        candidates = [Candidate(title=f"Paper {idx}") for idx in range(4)]
+
+        count = download_candidates(
+            candidates,
+            resolver=FakeResolver(),
+            downloader=FakeDownloader(Path(tempfile.mkdtemp())),
+            max_downloads=None,
+            max_web_search_candidates=None,
+            download_workers=2,
+        )
+
+        self.assertEqual(count, 4)
+        self.assertTrue(all(candidate.download["status"] == "downloaded" for candidate in candidates))
+
+    def test_download_candidates_preflights_existing_files(self):
+        class FailingResolver:
+            web_searcher = None
+
+            def resolve(self, candidate, use_web_search=True):
+                raise AssertionError("existing files should not be resolved")
+
+        class FakeDownloader:
+            def __init__(self, output_dir):
+                self.output_dir = output_dir
+                self.force_download = False
+
+            def download(self, candidate, urls):
+                raise AssertionError("existing files should not be downloaded")
+
+        output_dir = Path(tempfile.mkdtemp())
+        candidate = Candidate(title="Already Saved", authors=["Ada Lovelace"], year=2024)
+        existing_path = output_dir / build_pdf_filename(candidate)
+        existing_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+        count = download_candidates(
+            [candidate],
+            resolver=FailingResolver(),
+            downloader=FakeDownloader(output_dir),
+            max_downloads=None,
+            max_web_search_candidates=None,
+            download_workers=4,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(candidate.download["status"], "already_exists")
+        self.assertEqual(candidate.download["path"], str(existing_path))
+
+    def test_download_candidates_updates_download_log_after_each_candidate(self):
+        class FakeResolver:
+            web_searcher = None
+
+            def resolve(self, candidate, use_web_search=True):
+                return ["https://example.org/paper.pdf"]
+
+        class FakeDownloader:
+            def __init__(self, output_dir):
+                self.output_dir = output_dir
+                self.force_download = False
+
+            def download(self, candidate, urls):
+                result = {
+                    "status": "downloaded",
+                    "url": urls[0],
+                    "filename": build_pdf_filename(candidate),
+                    "attempts": [{"url": urls[0], "status": "downloaded"}],
+                }
+                candidate.download = result
+                return result
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        log_path = tmp_dir / "logs" / "download_log.json"
+        ledger = DownloadLogLedger(log_path, candidate_cache={}, search_errors=[])
+        candidates = [Candidate(title="First Paper"), Candidate(title="Second Paper")]
+
+        count = download_candidates(
+            candidates,
+            resolver=FakeResolver(),
+            downloader=FakeDownloader(tmp_dir),
+            max_downloads=None,
+            max_web_search_candidates=None,
+            download_workers=1,
+            ledger=ledger,
+        )
+
+        self.assertEqual(count, 2)
+        self.assertTrue(log_path.exists())
+        loaded = DownloadLogLedger(log_path, candidate_cache={}, search_errors=[])
+        loaded.load()
+        self.assertIsNotNone(loaded.record_for_candidate(candidates[0]))
+        self.assertIsNotNone(loaded.record_for_candidate(candidates[1]))
+
+    def test_download_log_resume_skips_failed_candidates(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        log_path = tmp_dir / "logs" / "download_log.json"
+        candidate = Candidate(title="Failed Paper", doi="10.1000/fail")
+        ledger = DownloadLogLedger(log_path, candidate_cache={}, search_errors=[])
+        candidate.download = {
+            "status": "failed",
+            "filename": build_pdf_filename(candidate),
+            "reason": "previous failure",
+            "attempts": [],
+        }
+        ledger.record(candidate, candidate.download)
+
+        fresh = Candidate(title="Failed Paper", doi="10.1000/fail")
+        loaded = DownloadLogLedger(log_path, candidate_cache={}, search_errors=[])
+        loaded.load()
+        apply_download_log_resume(
+            [fresh],
+            loaded,
+            PdfDownloader(HttpClient(), tmp_dir),
+            retry_failed_downloads=False,
+        )
+
+        self.assertEqual(fresh.download["status"], "failed")
+        self.assertEqual(fresh.download["reason"], "previous failure")
+
+    def test_progress_total_excludes_download_log_resumed_candidates(self):
+        class FakeResolver:
+            web_searcher = None
+
+            def resolve(self, candidate, use_web_search=True):
+                return ["https://example.org/paper.pdf"]
+
+        class FakeDownloader:
+            def __init__(self, output_dir):
+                self.output_dir = output_dir
+                self.force_download = False
+
+            def download(self, candidate, urls):
+                result = {
+                    "status": "downloaded",
+                    "url": urls[0],
+                    "filename": build_pdf_filename(candidate),
+                    "attempts": [{"url": urls[0], "status": "downloaded"}],
+                }
+                candidate.download = result
+                return result
+
+        class FakeProgress:
+            instances = []
+
+            def __init__(self, total, **kwargs):
+                self.total = total
+                self.enabled = False
+                self.current_values = []
+                self.candidate_lengths = []
+                self.advances = 0
+                FakeProgress.instances.append(self)
+
+            def set_current(self, current, candidates, force=False):
+                self.current_values.append(current)
+                self.candidate_lengths.append(len(candidates))
+
+            def advance(self, candidates, step=1):
+                self.advances += step
+                self.candidate_lengths.append(len(candidates))
+
+            def done(self, candidates):
+                self.candidate_lengths.append(len(candidates))
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        log_path = tmp_dir / "logs" / "download_log.json"
+        previous = Candidate(title="Failed Paper", doi="10.1000/fail")
+        ledger = DownloadLogLedger(log_path, candidate_cache={}, search_errors=[])
+        previous.download = {
+            "status": "failed",
+            "filename": build_pdf_filename(previous),
+            "reason": "previous failure",
+            "attempts": [],
+        }
+        ledger.record(previous, previous.download)
+
+        resumed = Candidate(title="Failed Paper", doi="10.1000/fail")
+        fresh = Candidate(title="Fresh Paper", doi="10.1000/fresh")
+        loaded = DownloadLogLedger(log_path, candidate_cache={}, search_errors=[])
+        loaded.load()
+        candidates = [resumed, fresh]
+        apply_download_log_resume(
+            candidates,
+            loaded,
+            PdfDownloader(HttpClient(), tmp_dir),
+            retry_failed_downloads=False,
+        )
+
+        with mock.patch.object(lit_harvest, "ProgressReporter", FakeProgress):
+            count = download_candidates(
+                candidates,
+                resolver=FakeResolver(),
+                downloader=FakeDownloader(tmp_dir),
+                max_downloads=None,
+                max_web_search_candidates=None,
+                download_workers=1,
+                ledger=loaded,
+                progress_enabled=True,
+            )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(FakeProgress.instances[0].total, 1)
+        self.assertEqual(FakeProgress.instances[0].current_values[0], 0)
+        self.assertTrue(
+            all(length == 1 for length in FakeProgress.instances[0].candidate_lengths)
+        )
+        self.assertEqual(FakeProgress.instances[0].advances, 1)
 
     def test_saved_document_status_includes_abstract_fallbacks(self):
         self.assertTrue(is_saved_document_status("downloaded"))

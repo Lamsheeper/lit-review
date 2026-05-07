@@ -19,12 +19,15 @@ import logging
 import math
 import os
 import re
+import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -686,6 +689,10 @@ def looks_like_pdf_url(url: str | None) -> bool:
     return False
 
 
+class NonRetryableDownloadError(RuntimeError):
+    """Raised when another attempt at the same URL cannot turn it into a PDF."""
+
+
 class HttpClient:
     def __init__(
         self,
@@ -701,6 +708,7 @@ class HttpClient:
         self.rate_limit_delay = rate_limit_delay
         self.email = email
         self._last_request_at = 0.0
+        self._rate_lock = threading.Lock()
 
     @property
     def user_agent(self) -> str:
@@ -726,12 +734,15 @@ class HttpClient:
         return headers
 
     def _wait_for_rate_limit(self) -> None:
-        if self.rate_limit_delay <= 0:
-            return
-        elapsed = time.monotonic() - self._last_request_at
-        remaining = self.rate_limit_delay - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
+        with self._rate_lock:
+            if self.rate_limit_delay <= 0:
+                self._last_request_at = time.monotonic()
+                return
+            elapsed = time.monotonic() - self._last_request_at
+            remaining = self.rate_limit_delay - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_request_at = time.monotonic()
 
     def _retry_sleep(self, attempt: int, headers: dict[str, Any] | None = None) -> None:
         retry_after = None
@@ -814,7 +825,7 @@ class HttpClient:
                     content_type = response.headers.get("Content-Type", "")
                     content_length = safe_int(response.headers.get("Content-Length"))
                     if content_length is not None and content_length > max_bytes:
-                        raise RuntimeError(
+                        raise NonRetryableDownloadError(
                             f"PDF is larger than limit: {content_length} bytes > {max_bytes} bytes"
                         )
 
@@ -826,7 +837,7 @@ class HttpClient:
                         first_chunk = response.read(8192)
                         if not is_pdf_response(content_type, first_chunk):
                             preview = first_chunk[:80].decode("utf-8", errors="replace")
-                            raise RuntimeError(
+                            raise NonRetryableDownloadError(
                                 f"URL did not return a PDF; content-type={content_type!r}; "
                                 f"preview={preview!r}"
                             )
@@ -838,7 +849,7 @@ class HttpClient:
                                 break
                             total += len(chunk)
                             if total > max_bytes:
-                                raise RuntimeError(
+                                raise NonRetryableDownloadError(
                                     f"PDF exceeded limit while downloading: {total} bytes"
                                 )
                             handle.write(chunk)
@@ -862,6 +873,11 @@ class HttpClient:
                     continue
                 detail = exc.read(200).decode("utf-8", errors="replace")
                 raise RuntimeError(f"HTTP {exc.code} while downloading PDF: {detail}") from exc
+            except NonRetryableDownloadError as exc:
+                self._last_request_at = time.monotonic()
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                raise RuntimeError(f"PDF download failed for {url}: {exc}") from exc
             except (urllib.error.URLError, RuntimeError) as exc:
                 self._last_request_at = time.monotonic()
                 last_error = exc
@@ -1260,6 +1276,7 @@ class WebPdfSearcher:
         self.max_results = max_results
         self.queries_per_candidate = queries_per_candidate
         self._cache: dict[tuple[str, str], list[WebSearchResult]] = {}
+        self._cache_lock = threading.Lock()
 
     def resolve(self, candidate: Candidate) -> tuple[list[str], list[str], list[dict[str, Any]]]:
         pdf_urls: list[str] = []
@@ -1273,9 +1290,12 @@ class WebPdfSearcher:
             for query in queries:
                 cache_key = (provider.name, query)
                 try:
-                    if cache_key not in self._cache:
-                        self._cache[cache_key] = provider.search(query, self.max_results)
-                    results = self._cache[cache_key]
+                    with self._cache_lock:
+                        results = self._cache.get(cache_key)
+                    if results is None:
+                        fresh_results = provider.search(query, self.max_results)
+                        with self._cache_lock:
+                            results = self._cache.setdefault(cache_key, fresh_results)
                     accepted = 0
                     for result in results:
                         if not web_result_matches_candidate(candidate, result):
@@ -2231,8 +2251,366 @@ class PdfDownloader:
         return destination.stat().st_size
 
 
+def should_use_web_search_for_candidate(
+    web_searcher: WebPdfSearcher | None,
+    max_web_search_candidates: int | None,
+    web_search_count: int,
+) -> bool:
+    if not web_searcher:
+        return False
+    if max_web_search_candidates == 0:
+        return False
+    if (
+        max_web_search_candidates is not None
+        and web_search_count >= max_web_search_candidates
+    ):
+        return False
+    return True
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:d}:{secs:02d}"
+
+
+def download_status_counts(candidates: list[Candidate]) -> Counter[str]:
+    return Counter(
+        str(candidate.download.get("status") or "pending")
+        for candidate in candidates
+    )
+
+
+class ProgressReporter:
+    def __init__(
+        self,
+        total: int,
+        *,
+        enabled: bool = True,
+        label: str = "Candidates",
+        min_interval: float = 0.5,
+    ) -> None:
+        self.total = max(total, 0)
+        self.enabled = enabled and self.total > 0 and sys.stderr.isatty()
+        self.label = label
+        self.min_interval = min_interval
+        self.started_at = time.monotonic()
+        self.current = 0
+        self._last_render_at = 0.0
+        self._line_length = 0
+
+    def set_current(
+        self,
+        current: int,
+        candidates: list[Candidate],
+        *,
+        force: bool = False,
+    ) -> None:
+        self.current = max(0, min(current, self.total))
+        self.render(candidates, force=force)
+
+    def advance(self, candidates: list[Candidate], step: int = 1) -> None:
+        self.current = max(0, min(self.current + step, self.total))
+        self.render(candidates)
+
+    def render(self, candidates: list[Candidate], *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and self.current < self.total and now - self._last_render_at < self.min_interval:
+            return
+        self._last_render_at = now
+        elapsed = max(now - self.started_at, 0.001)
+        rate = self.current / elapsed
+        remaining = self.total - self.current
+        eta = remaining / rate if rate > 0 else 0
+        percent = (self.current / self.total * 100.0) if self.total else 100.0
+        counts = download_status_counts(candidates)
+        summary_parts = []
+        for key in ["downloaded", "already_exists", "abstract_only", "failed", "not_attempted"]:
+            count = counts.get(key, 0)
+            if count:
+                summary_parts.append(f"{key}={count}")
+        summary = " ".join(summary_parts) if summary_parts else "pending"
+        line = (
+            f"{self.label}: {self.current}/{self.total} "
+            f"({percent:5.1f}%) | {rate * 60:5.1f}/min | "
+            f"elapsed {format_duration(elapsed)} | ETA {format_duration(eta)} | {summary}"
+        )
+        padding = " " * max(0, self._line_length - len(line))
+        sys.stderr.write("\r" + line + padding)
+        sys.stderr.flush()
+        self._line_length = len(line)
+
+    def clear(self) -> None:
+        if not self.enabled or not self._line_length:
+            return
+        sys.stderr.write("\r" + " " * self._line_length + "\r")
+        sys.stderr.flush()
+        self._line_length = 0
+
+    def done(self, candidates: list[Candidate]) -> None:
+        if not self.enabled:
+            return
+        self.current = self.total
+        self.render(candidates, force=True)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        self._line_length = 0
+
+
+def resolve_and_download_candidate(
+    candidate: Candidate,
+    resolver: PdfResolver,
+    downloader: PdfDownloader,
+    use_web_search: bool,
+) -> dict[str, Any]:
+    try:
+        urls = resolver.resolve(candidate, use_web_search=use_web_search)
+        return downloader.download(candidate, urls)
+    except Exception as exc:  # pragma: no cover - defensive worker boundary
+        result = {
+            "status": "failed",
+            "filename": build_pdf_filename(candidate),
+            "attempts": [],
+            "reason": str(exc),
+        }
+        candidate.download = result
+        return result
+
+
+def mark_downloads_not_attempted(
+    candidates: list[Candidate],
+    reason: str,
+    ledger: DownloadLogLedger | None = None,
+) -> None:
+    records: list[tuple[Candidate, dict[str, Any]]] = []
+    for candidate in candidates:
+        candidate.download = {
+            "status": "not_attempted",
+            "reason": reason,
+            "filename": build_pdf_filename(candidate),
+        }
+        records.append((candidate, candidate.download))
+    if ledger:
+        ledger.record_many(records)
+
+
+def log_download_result(
+    result: dict[str, Any],
+    candidate: Candidate,
+    progress: ProgressReporter | None = None,
+) -> None:
+    if progress and progress.enabled:
+        LOGGER.debug("Document %s: %s", result.get("status"), candidate.title)
+        return
+    if is_saved_document_status(result.get("status")):
+        LOGGER.info("Document %s: %s", result["status"], candidate.title)
+    else:
+        LOGGER.info("No document saved for: %s", candidate.title)
+
+
+def mark_existing_downloads(
+    candidates: list[Candidate],
+    downloader: PdfDownloader,
+    ledger: DownloadLogLedger | None = None,
+) -> int:
+    if downloader.force_download:
+        return 0
+    existing_count = 0
+    records: list[tuple[Candidate, dict[str, Any]]] = []
+    for candidate in candidates:
+        if is_terminal_download_status(candidate.download.get("status")):
+            continue
+        filename = build_pdf_filename(candidate)
+        destination = downloader.output_dir / filename
+        if not destination.exists():
+            continue
+        result = {
+            "status": "already_exists",
+            "path": str(destination),
+            "filename": filename,
+            "attempts": [],
+        }
+        candidate.download = result
+        records.append((candidate, result))
+        existing_count += 1
+    if ledger:
+        ledger.record_many(records)
+    if existing_count:
+        LOGGER.info("Preflight found %d existing documents; skipping resolution.", existing_count)
+    return existing_count
+
+
+def download_log_resume_indices(
+    candidates: list[Candidate],
+    ledger: DownloadLogLedger | None,
+) -> set[int]:
+    if not ledger:
+        return set()
+    indices: set[int] = set()
+    for idx, candidate in enumerate(candidates):
+        if not is_processed_download_status(candidate.download.get("status")):
+            continue
+        if ledger.record_for_candidate(candidate):
+            indices.add(idx)
+    return indices
+
+
+def download_candidates(
+    candidates: list[Candidate],
+    *,
+    resolver: PdfResolver,
+    downloader: PdfDownloader,
+    max_downloads: int | None,
+    max_web_search_candidates: int | None,
+    download_workers: int,
+    ledger: DownloadLogLedger | None = None,
+    progress_enabled: bool = True,
+) -> int:
+    resume_indices = download_log_resume_indices(candidates, ledger)
+    mark_existing_downloads(candidates, downloader, ledger=ledger)
+    downloaded_count = sum(
+        1
+        for candidate in candidates
+        if is_saved_document_status(candidate.download.get("status"))
+    )
+    web_search_count = 0
+    worker_count = max(1, download_workers)
+    pending_candidates = [
+        candidate
+        for candidate in candidates
+        if not is_terminal_download_status(candidate.download.get("status"))
+    ]
+    progress_candidates = [
+        candidate for idx, candidate in enumerate(candidates) if idx not in resume_indices
+    ]
+    progress = ProgressReporter(
+        len(progress_candidates),
+        enabled=progress_enabled,
+        label="PDF candidates",
+    )
+    progress.set_current(
+        sum(
+            1
+            for candidate in progress_candidates
+            if is_processed_download_status(candidate.download.get("status"))
+        ),
+        progress_candidates,
+        force=True,
+    )
+
+    if worker_count == 1:
+        for idx, candidate in enumerate(pending_candidates):
+            if max_downloads is not None and downloaded_count >= max_downloads:
+                mark_downloads_not_attempted(
+                    pending_candidates[idx:],
+                    "max_downloads limit reached",
+                    ledger=ledger,
+                )
+                progress.set_current(progress.total, progress_candidates, force=True)
+                break
+            use_web_search = should_use_web_search_for_candidate(
+                resolver.web_searcher,
+                max_web_search_candidates,
+                web_search_count,
+            )
+            if use_web_search:
+                web_search_count += 1
+            result = resolve_and_download_candidate(
+                candidate,
+                resolver,
+                downloader,
+                use_web_search,
+            )
+            if is_saved_document_status(result.get("status")):
+                downloaded_count += 1
+            log_download_result(result, candidate, progress)
+            if ledger:
+                ledger.record(candidate, result)
+            progress.advance(progress_candidates)
+        progress.done(progress_candidates)
+        return downloaded_count
+
+    LOGGER.info("Downloading documents with %d workers.", worker_count)
+    next_index = 0
+    pending: dict[Future, Candidate] = {}
+
+    def submit_until_full(executor: ThreadPoolExecutor) -> None:
+        nonlocal next_index, web_search_count
+        while len(pending) < worker_count and next_index < len(pending_candidates):
+            if max_downloads is not None and downloaded_count >= max_downloads:
+                return
+            candidate = pending_candidates[next_index]
+            next_index += 1
+            use_web_search = should_use_web_search_for_candidate(
+                resolver.web_searcher,
+                max_web_search_candidates,
+                web_search_count,
+            )
+            if use_web_search:
+                web_search_count += 1
+            future = executor.submit(
+                resolve_and_download_candidate,
+                candidate,
+                resolver,
+                downloader,
+                use_web_search,
+            )
+            pending[future] = candidate
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        submit_until_full(executor)
+        while pending:
+            done, _ = wait(set(pending), return_when=FIRST_COMPLETED)
+            for future in done:
+                candidate = pending.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - executor defensive path
+                    result = {
+                        "status": "failed",
+                        "filename": build_pdf_filename(candidate),
+                        "attempts": [],
+                        "reason": str(exc),
+                    }
+                    candidate.download = result
+                if is_saved_document_status(result.get("status")):
+                    downloaded_count += 1
+                log_download_result(result, candidate, progress)
+                if ledger:
+                    ledger.record(candidate, result)
+                progress.advance(progress_candidates)
+            submit_until_full(executor)
+
+    if (
+        max_downloads is not None
+        and downloaded_count >= max_downloads
+        and next_index < len(pending_candidates)
+    ):
+        mark_downloads_not_attempted(
+            pending_candidates[next_index:],
+            "max_downloads limit reached",
+            ledger=ledger,
+        )
+        progress.set_current(progress.total, progress_candidates, force=True)
+    progress.done(progress_candidates)
+    return downloaded_count
+
+
 def is_saved_document_status(status: str | None) -> bool:
     return status in {"downloaded", "already_exists", "abstract_only"}
+
+
+def is_terminal_download_status(status: str | None) -> bool:
+    return is_saved_document_status(status) or status == "failed"
+
+
+def is_processed_download_status(status: str | None) -> bool:
+    return is_terminal_download_status(status) or status == "not_attempted"
 
 
 def build_pdf_filename(candidate: Candidate) -> str:
@@ -2285,6 +2663,230 @@ def slugify(value: str | None, max_length: int = 80) -> str:
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def candidate_download_identity(candidate: Candidate) -> str:
+    if candidate.doi:
+        return f"doi:{candidate.doi}"
+    title = normalize_title(candidate.title)
+    return f"title:{title}|year:{candidate.year or ''}"
+
+
+def download_log_record(candidate: Candidate, download: dict[str, Any]) -> dict[str, Any]:
+    filename = str(download.get("filename") or build_pdf_filename(candidate))
+    download_copy = dict(download)
+    download_copy["filename"] = filename
+    status = str(download_copy.get("status") or "")
+    return {
+        "key": filename,
+        "identity": candidate_download_identity(candidate),
+        "filename": filename,
+        "title": candidate.title,
+        "doi": candidate.doi,
+        "year": candidate.year,
+        "status": status,
+        "path": download_copy.get("path", ""),
+        "reason": download_copy.get("reason", ""),
+        "updated_at": utc_now(),
+        "download": download_copy,
+    }
+
+
+def normalize_download_log_record(raw: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    download = raw.get("download") if isinstance(raw.get("download"), dict) else dict(raw)
+    status = str(raw.get("status") or download.get("status") or "")
+    filename = str(raw.get("filename") or download.get("filename") or "")
+    title = str(raw.get("title") or "")
+    doi = normalize_doi(raw.get("doi") or download.get("doi"))
+    identity = str(raw.get("identity") or "")
+    if not identity:
+        if doi:
+            identity = f"doi:{doi}"
+        elif title:
+            identity = f"title:{normalize_title(title)}|year:{raw.get('year') or ''}"
+    if not filename and not identity:
+        return None
+    download["status"] = status
+    if filename:
+        download["filename"] = filename
+    return {
+        "key": str(raw.get("key") or filename or identity),
+        "identity": identity,
+        "filename": filename,
+        "title": title,
+        "doi": doi,
+        "year": safe_int(raw.get("year")),
+        "status": status,
+        "path": raw.get("path") or download.get("path", ""),
+        "reason": raw.get("reason") or download.get("reason", ""),
+        "updated_at": raw.get("updated_at") or raw.get("generated_at") or "",
+        "download": download,
+    }
+
+
+def download_log_payload(
+    records: list[dict[str, Any]],
+    *,
+    candidate_cache: dict[str, Any],
+    search_errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    downloads = [record["download"] for record in records if record.get("download")]
+    failed_downloads = [
+        {
+            "title": record.get("title", ""),
+            "doi": record.get("doi"),
+            "filename": record.get("filename", ""),
+            "reason": record.get("reason") or (record.get("download") or {}).get("reason") or "failed",
+            "attempts": (record.get("download") or {}).get("attempts", []),
+        }
+        for record in records
+        if record.get("status") == "failed"
+    ]
+    return {
+        "project": "LitHarvest",
+        "generated_at": utc_now(),
+        "candidate_cache": candidate_cache,
+        "records": records,
+        "downloads": downloads,
+        "failed_downloads": failed_downloads,
+        "search_errors": search_errors,
+    }
+
+
+class DownloadLogLedger:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        candidate_cache: dict[str, Any],
+        search_errors: list[dict[str, Any]],
+    ) -> None:
+        self.path = path
+        self.candidate_cache = candidate_cache
+        self.search_errors = search_errors
+        self.records_by_key: dict[str, dict[str, Any]] = {}
+        self.records_by_filename: dict[str, dict[str, Any]] = {}
+        self.records_by_identity: dict[str, dict[str, Any]] = {}
+
+    def load(self) -> None:
+        if not self.path.exists() or not self.path.is_file():
+            return
+        text = self.path.read_text(encoding="utf-8")
+        if not text.strip():
+            return
+        raw = json.loads(text)
+        if not isinstance(raw, dict):
+            return
+        for item in raw.get("records") or []:
+            record = normalize_download_log_record(item)
+            if record:
+                self._store(record)
+        if self.records_by_key:
+            return
+        for item in raw.get("downloads") or []:
+            if isinstance(item, dict):
+                record = normalize_download_log_record(item)
+                if record:
+                    self._store(record)
+        for item in raw.get("failed_downloads") or []:
+            if isinstance(item, dict):
+                failed = dict(item)
+                failed["status"] = "failed"
+                failed["download"] = {
+                    "status": "failed",
+                    "filename": failed.get("filename", ""),
+                    "attempts": failed.get("attempts", []),
+                    "reason": failed.get("reason", "failed"),
+                }
+                record = normalize_download_log_record(failed)
+                if record:
+                    self._store(record)
+
+    def _store(self, record: dict[str, Any]) -> None:
+        key = str(record.get("key") or record.get("filename") or record.get("identity"))
+        if not key:
+            return
+        record["key"] = key
+        self.records_by_key[key] = record
+        filename = record.get("filename")
+        if filename:
+            self.records_by_filename[str(filename)] = record
+        identity = record.get("identity")
+        if identity:
+            self.records_by_identity[str(identity)] = record
+
+    def record_for_candidate(self, candidate: Candidate) -> dict[str, Any] | None:
+        filename = build_pdf_filename(candidate)
+        return self.records_by_filename.get(filename) or self.records_by_identity.get(
+            candidate_download_identity(candidate)
+        )
+
+    def record(self, candidate: Candidate, download: dict[str, Any]) -> None:
+        self._store(download_log_record(candidate, download))
+        self.write()
+
+    def record_many(self, items: list[tuple[Candidate, dict[str, Any]]]) -> None:
+        for candidate, download in items:
+            self._store(download_log_record(candidate, download))
+        if items:
+            self.write()
+
+    def write(self) -> None:
+        write_json(
+            self.path,
+            download_log_payload(
+                list(self.records_by_key.values()),
+                candidate_cache=self.candidate_cache,
+                search_errors=self.search_errors,
+            ),
+        )
+
+
+def apply_download_log_resume(
+    candidates: list[Candidate],
+    ledger: DownloadLogLedger,
+    downloader: PdfDownloader,
+    *,
+    retry_failed_downloads: bool = False,
+) -> dict[str, int]:
+    skipped_saved = 0
+    skipped_failed = 0
+    for candidate in candidates:
+        record = ledger.record_for_candidate(candidate)
+        if not record:
+            continue
+        status = record.get("status")
+        download = dict(record.get("download") or {})
+        filename = str(download.get("filename") or record.get("filename") or build_pdf_filename(candidate))
+        expected_path = downloader.output_dir / filename
+        if is_saved_document_status(status):
+            raw_path = download.get("path") or record.get("path")
+            saved_path = Path(raw_path).expanduser() if raw_path else expected_path
+            if not saved_path.exists() and expected_path.exists():
+                saved_path = expected_path
+            if not saved_path.exists():
+                continue
+            download["status"] = status
+            download["filename"] = filename
+            download["path"] = str(saved_path)
+            candidate.download = download
+            skipped_saved += 1
+        elif status == "failed" and not retry_failed_downloads:
+            download["status"] = "failed"
+            download["filename"] = filename
+            download["reason"] = download.get("reason") or record.get("reason") or "Previous download failed."
+            download.setdefault("attempts", [])
+            candidate.download = download
+            skipped_failed += 1
+    if skipped_saved or skipped_failed:
+        LOGGER.info(
+            "Download log resume skipped %d saved and %d failed candidates.",
+            skipped_saved,
+            skipped_failed,
+        )
+    return {"saved": skipped_saved, "failed": skipped_failed}
 
 
 def write_csv_report(path: Path, candidates: list[Candidate]) -> None:
@@ -2563,6 +3165,8 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     candidates_json_path = resolve_candidates_json_path(config, logs_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = logs_dir / "manifest.json"
+    download_log_path = logs_dir / "download_log.json"
 
     draft_text = read_text_file(draft_path)
     extracted = extract_keywords(draft_text)
@@ -2686,13 +3290,30 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             max_pdf_mb=int(config["max_pdf_mb"]),
             force_download=bool(config.get("force_download")),
         )
+        download_ledger = DownloadLogLedger(
+            download_log_path,
+            candidate_cache=candidate_cache,
+            search_errors=search_errors,
+        )
+        download_ledger.load()
+        if not config.get("force_download"):
+            apply_download_log_resume(
+                candidates,
+                download_ledger,
+                downloader,
+                retry_failed_downloads=bool(config.get("retry_failed_downloads")),
+            )
 
         if config.get("metadata_only"):
             for candidate in candidates:
                 candidate.download = {
                     "status": "not_attempted",
                     "reason": "metadata_only mode",
+                    "filename": build_pdf_filename(candidate),
                 }
+            download_ledger.record_many(
+                [(candidate, candidate.download) for candidate in candidates]
+            )
         else:
             download_limit = config.get("max_downloads")
             max_downloads = int(download_limit) if download_limit is not None else None
@@ -2700,41 +3321,31 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             max_web_search_candidates = (
                 int(web_limit) if web_limit is not None else None
             )
-            web_search_count = 0
-            downloaded_count = 0
-            for candidate in candidates:
-                if max_downloads is not None and downloaded_count >= max_downloads:
-                    candidate.download = {
-                        "status": "not_attempted",
-                        "reason": "max_downloads limit reached",
-                    }
-                    continue
-                use_web_search = bool(web_searcher)
-                if max_web_search_candidates == 0:
-                    use_web_search = False
-                elif (
-                    max_web_search_candidates is not None
-                    and web_search_count >= max_web_search_candidates
-                ):
-                    use_web_search = False
-                if use_web_search:
-                    web_search_count += 1
-                urls = resolver.resolve(candidate, use_web_search=use_web_search)
-                result = downloader.download(candidate, urls)
-                if is_saved_document_status(result.get("status")):
-                    downloaded_count += 1
-                    LOGGER.info("Document %s: %s", result["status"], candidate.title)
-                else:
-                    LOGGER.info("No document saved for: %s", candidate.title)
+            download_candidates(
+                candidates,
+                resolver=resolver,
+                downloader=downloader,
+                max_downloads=max_downloads,
+                max_web_search_candidates=max_web_search_candidates,
+                download_workers=int(config.get("download_workers") or 1),
+                ledger=download_ledger,
+                progress_enabled=bool(config.get("progress")),
+            )
     else:
         LOGGER.info("Dry run requested; no API searches or downloads were attempted.")
         candidate_cache["status"] = "not_used_dry_run"
 
-    downloads = [candidate.download for candidate in candidates if candidate.download]
+    download_records = [
+        download_log_record(candidate, candidate.download)
+        for candidate in candidates
+        if candidate.download
+    ]
+    downloads = [record["download"] for record in download_records]
     failures = [
         {
             "title": candidate.title,
             "doi": candidate.doi,
+            "filename": candidate.download.get("filename", build_pdf_filename(candidate)),
             "reason": candidate.download.get("reason")
             or candidate.download.get("status")
             or "No download attempted.",
@@ -2765,17 +3376,13 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         },
         "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
     }
-    download_log = {
-        "project": "LitHarvest",
-        "generated_at": utc_now(),
-        "candidate_cache": candidate_cache,
-        "downloads": downloads,
-        "failed_downloads": failures,
-        "search_errors": search_errors,
-    }
+    download_log = download_log_payload(
+        download_records,
+        candidate_cache=candidate_cache,
+        search_errors=search_errors,
+    )
+    download_log["failed_downloads"] = failures
 
-    manifest_path = logs_dir / "manifest.json"
-    download_log_path = logs_dir / "download_log.json"
     write_json(manifest_path, manifest)
     write_json(download_log_path, download_log)
     if config.get("csv_report"):
@@ -2815,11 +3422,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "retries": 2,
     "backoff": 1.5,
     "rate_limit_delay": 0.1,
+    "download_workers": 1,
     "max_pdf_mb": 80,
     "max_downloads": 50,
     "logs": None,
     "candidates_json": None,
     "refresh_candidates": False,
+    "retry_failed_downloads": False,
+    "progress": True,
     "metadata_only": False,
     "force_download": False,
     "csv_report": False,
@@ -2888,6 +3498,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         help="Minimum delay between outbound HTTP requests.",
     )
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        help="Number of candidates to resolve/download in parallel.",
+    )
     parser.add_argument("--max-pdf-mb", type=int, help="Maximum accepted PDF size in MB.")
     parser.add_argument("--max-downloads", type=int, help="Maximum successful PDF downloads.")
     parser.add_argument(
@@ -2907,6 +3522,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=None,
         help="Ignore an existing candidates JSON checkpoint and run metadata searches again.",
+    )
+    parser.add_argument(
+        "--retry-failed-downloads",
+        action="store_true",
+        default=None,
+        help="Retry candidates marked failed in the existing download log.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        default=None,
+        help="Disable the download progress meter.",
     )
     parser.add_argument(
         "--csv-report",
@@ -2972,6 +3600,8 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-queries must be at least 1.")
     if int(config["top_k_per_query"]) < 1:
         raise ValueError("--top-k-per-query must be at least 1.")
+    if int(config["download_workers"]) < 1:
+        raise ValueError("--download-workers must be at least 1.")
     if int(config["max_pdf_mb"]) < 1:
         raise ValueError("--max-pdf-mb must be at least 1.")
     if int(config["web_search_max_candidates"]) < 0:
