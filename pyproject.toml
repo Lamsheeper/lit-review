@@ -21,7 +21,7 @@ lit-harvest = "lit_harvest:main"
 lit-synthesize = "lit_synthesize:main"
 
 [tool.setuptools]
-py-modules = ["lit_harvest", "lit_synthesize"]
+py-modules = ["lit_harvest", "lit_pdf_service", "lit_synthesize"]
 
 [tool.uv]
 package = true
