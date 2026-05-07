@@ -187,3 +187,41 @@ Return results as structured markdown or JSON with the format:
   "examples": [],
   "notes": "..."
 }
+```
+
+# Prioritization Criteria
+
+Prioritize:
+1. Frequently recurring features across papers
+2. Features used in existing NLP datasets/benchmarks
+3. Features used in propaganda or persuasion detection
+4. Features with operationalizable definitions
+5. Fine-grained taxonomies over vague labels
+6. Cross-lingual or cross-cultural applicability
+7. Explicit distinctions between rhetoric, morality, and emotion
+
+---
+
+# Important Constraints
+
+- Do not merge persuasion techniques, moral framing, and emotional targeting into one category.
+- Preserve distinctions between:
+  - rhetorical mechanism,
+  - moral appeal,
+  - emotional outcome.
+- Prefer academically grounded terminology over informal internet terminology.
+- Include disagreements or taxonomy conflicts across papers when relevant.
+- Preserve hierarchical structure when possible.
+
+---
+
+# End Goal
+
+Produce a consolidated persuasion attribute taxonomy suitable for:
+- dataset annotation,
+- computational persuasion analysis,
+- LLM evaluation,
+- cross-cultural narrative analysis,
+- propaganda detection,
+- institutional trust analysis,
+- media framing research.
