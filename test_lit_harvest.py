@@ -25,6 +25,7 @@ from lit_harvest import (
     extract_pdf_urls_from_html,
     extract_keywords,
     inferred_pdf_urls,
+    is_full_document_status,
     is_saved_document_status,
     load_candidate_cache,
     merge_candidates,
@@ -466,6 +467,131 @@ class LitHarvestCoreTests(unittest.TestCase):
         self.assertEqual(fresh.download["status"], "failed")
         self.assertEqual(fresh.download["reason"], "previous failure")
 
+    def test_download_log_resume_retries_abstract_only_candidates(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        log_path = tmp_dir / "logs" / "download_log.json"
+        candidate = Candidate(title="Abstract Paper", doi="10.1000/abstract")
+        existing_path = tmp_dir / build_pdf_filename(candidate)
+        existing_path.write_bytes(b"%PDF-1.4\nabstract fallback\n%%EOF\n")
+        ledger = DownloadLogLedger(log_path, candidate_cache={}, search_errors=[])
+        candidate.download = {
+            "status": "abstract_only",
+            "filename": build_pdf_filename(candidate),
+            "path": str(existing_path),
+            "attempts": [],
+        }
+        ledger.record(candidate, candidate.download)
+
+        fresh = Candidate(title="Abstract Paper", doi="10.1000/abstract")
+        loaded = DownloadLogLedger(log_path, candidate_cache={}, search_errors=[])
+        loaded.load()
+        result = apply_download_log_resume(
+            [fresh],
+            loaded,
+            PdfDownloader(HttpClient(), tmp_dir),
+            retry_failed_downloads=False,
+        )
+
+        self.assertEqual(result["abstract_only_retry"], 1)
+        self.assertEqual(fresh.download["status"], "retry_abstract_only")
+
+    def test_download_candidates_retries_abstract_only_even_if_file_exists(self):
+        class FakeResolver:
+            web_searcher = None
+
+            def resolve(self, candidate, use_web_search=True):
+                return ["https://example.org/full.pdf"]
+
+        class FakeDownloader:
+            def __init__(self, output_dir):
+                self.output_dir = output_dir
+                self.force_download = False
+                self.calls = 0
+
+            def download(self, candidate, urls):
+                self.calls += 1
+                result = {
+                    "status": "downloaded",
+                    "url": urls[0],
+                    "filename": build_pdf_filename(candidate),
+                    "attempts": [{"url": urls[0], "status": "downloaded"}],
+                }
+                candidate.download = result
+                return result
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        candidate = Candidate(title="Abstract Paper", doi="10.1000/abstract")
+        existing_path = tmp_dir / build_pdf_filename(candidate)
+        existing_path.write_bytes(b"%PDF-1.4\nabstract fallback\n%%EOF\n")
+        candidate.download = {
+            "status": "retry_abstract_only",
+            "filename": build_pdf_filename(candidate),
+            "path": str(existing_path),
+        }
+        downloader = FakeDownloader(tmp_dir)
+
+        count = download_candidates(
+            [candidate],
+            resolver=FakeResolver(),
+            downloader=downloader,
+            max_downloads=None,
+            max_web_search_candidates=None,
+            download_workers=1,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(downloader.calls, 1)
+        self.assertEqual(candidate.download["status"], "downloaded")
+
+    def test_abstract_only_does_not_count_toward_max_downloads(self):
+        class FakeResolver:
+            web_searcher = None
+
+            def resolve(self, candidate, use_web_search=True):
+                return ["https://example.org/paper.pdf"]
+
+        class FakeDownloader:
+            def __init__(self, output_dir):
+                self.output_dir = output_dir
+                self.force_download = False
+
+            def download(self, candidate, urls):
+                if candidate.title == "Abstract Only":
+                    result = {
+                        "status": "abstract_only",
+                        "filename": build_pdf_filename(candidate),
+                        "attempts": [{"source": "abstract_fallback", "status": "generated"}],
+                    }
+                else:
+                    result = {
+                        "status": "downloaded",
+                        "url": urls[0],
+                        "filename": build_pdf_filename(candidate),
+                        "attempts": [{"url": urls[0], "status": "downloaded"}],
+                    }
+                candidate.download = result
+                return result
+
+        candidates = [
+            Candidate(title="Abstract Only"),
+            Candidate(title="Full Text"),
+            Candidate(title="After Limit"),
+        ]
+
+        count = download_candidates(
+            candidates,
+            resolver=FakeResolver(),
+            downloader=FakeDownloader(Path(tempfile.mkdtemp())),
+            max_downloads=1,
+            max_web_search_candidates=None,
+            download_workers=1,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(candidates[0].download["status"], "abstract_only")
+        self.assertEqual(candidates[1].download["status"], "downloaded")
+        self.assertEqual(candidates[2].download["status"], "not_attempted")
+
     def test_progress_total_excludes_download_log_resumed_candidates(self):
         class FakeResolver:
             web_searcher = None
@@ -559,6 +685,9 @@ class LitHarvestCoreTests(unittest.TestCase):
         self.assertTrue(is_saved_document_status("already_exists"))
         self.assertTrue(is_saved_document_status("abstract_only"))
         self.assertFalse(is_saved_document_status("failed"))
+        self.assertTrue(is_full_document_status("downloaded"))
+        self.assertTrue(is_full_document_status("already_exists"))
+        self.assertFalse(is_full_document_status("abstract_only"))
 
     def test_configured_queries_precede_generated_queries(self):
         configured = configured_search_queries(

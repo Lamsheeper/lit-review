@@ -2122,7 +2122,8 @@ class PdfDownloader:
         filename = build_pdf_filename(candidate)
         destination = self.output_dir / filename
         attempts: list[dict[str, Any]] = []
-        if destination.exists() and not self.force_download:
+        retrying_abstract_only = candidate.download.get("status") == "retry_abstract_only"
+        if destination.exists() and not self.force_download and not retrying_abstract_only:
             result = {
                 "status": "already_exists",
                 "path": str(destination),
@@ -2425,6 +2426,8 @@ def mark_existing_downloads(
     for candidate in candidates:
         if is_terminal_download_status(candidate.download.get("status")):
             continue
+        if candidate.download.get("status") == "retry_abstract_only":
+            continue
         filename = build_pdf_filename(candidate)
         destination = downloader.output_dir / filename
         if not destination.exists():
@@ -2476,7 +2479,7 @@ def download_candidates(
     downloaded_count = sum(
         1
         for candidate in candidates
-        if is_saved_document_status(candidate.download.get("status"))
+        if is_full_document_status(candidate.download.get("status"))
     )
     web_search_count = 0
     worker_count = max(1, download_workers)
@@ -2526,7 +2529,7 @@ def download_candidates(
                 downloader,
                 use_web_search,
             )
-            if is_saved_document_status(result.get("status")):
+            if is_full_document_status(result.get("status")):
                 downloaded_count += 1
             log_download_result(result, candidate, progress)
             if ledger:
@@ -2578,7 +2581,7 @@ def download_candidates(
                         "reason": str(exc),
                     }
                     candidate.download = result
-                if is_saved_document_status(result.get("status")):
+                if is_full_document_status(result.get("status")):
                     downloaded_count += 1
                 log_download_result(result, candidate, progress)
                 if ledger:
@@ -2603,6 +2606,10 @@ def download_candidates(
 
 def is_saved_document_status(status: str | None) -> bool:
     return status in {"downloaded", "already_exists", "abstract_only"}
+
+
+def is_full_document_status(status: str | None) -> bool:
+    return status in {"downloaded", "already_exists"}
 
 
 def is_terminal_download_status(status: str | None) -> bool:
@@ -2853,6 +2860,7 @@ def apply_download_log_resume(
 ) -> dict[str, int]:
     skipped_saved = 0
     skipped_failed = 0
+    retry_abstract_only = 0
     for candidate in candidates:
         record = ledger.record_for_candidate(candidate)
         if not record:
@@ -2861,7 +2869,7 @@ def apply_download_log_resume(
         download = dict(record.get("download") or {})
         filename = str(download.get("filename") or record.get("filename") or build_pdf_filename(candidate))
         expected_path = downloader.output_dir / filename
-        if is_saved_document_status(status):
+        if is_full_document_status(status):
             raw_path = download.get("path") or record.get("path")
             saved_path = Path(raw_path).expanduser() if raw_path else expected_path
             if not saved_path.exists() and expected_path.exists():
@@ -2873,6 +2881,14 @@ def apply_download_log_resume(
             download["path"] = str(saved_path)
             candidate.download = download
             skipped_saved += 1
+        elif status == "abstract_only":
+            candidate.download = {
+                "status": "retry_abstract_only",
+                "filename": filename,
+                "path": str(expected_path),
+                "reason": "Previous run only saved an abstract fallback; retrying full PDF.",
+            }
+            retry_abstract_only += 1
         elif status == "failed" and not retry_failed_downloads:
             download["status"] = "failed"
             download["filename"] = filename
@@ -2880,13 +2896,18 @@ def apply_download_log_resume(
             download.setdefault("attempts", [])
             candidate.download = download
             skipped_failed += 1
-    if skipped_saved or skipped_failed:
+    if skipped_saved or skipped_failed or retry_abstract_only:
         LOGGER.info(
-            "Download log resume skipped %d saved and %d failed candidates.",
+            "Download log resume skipped %d saved and %d failed candidates; retrying %d abstract-only candidates.",
             skipped_saved,
             skipped_failed,
+            retry_abstract_only,
         )
-    return {"saved": skipped_saved, "failed": skipped_failed}
+    return {
+        "saved": skipped_saved,
+        "failed": skipped_failed,
+        "abstract_only_retry": retry_abstract_only,
+    }
 
 
 def write_csv_report(path: Path, candidates: list[Candidate]) -> None:

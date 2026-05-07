@@ -10,10 +10,16 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+except ImportError:  # pragma: no cover - optional progress dependency fallback
+    _tqdm = None
 
 try:
     from lit_harvest import slugify
@@ -38,6 +44,29 @@ DEFAULT_CHUNK_WORDS = 700
 DEFAULT_OVERLAP_WORDS = 80
 DEFAULT_MIN_CHUNK_WORDS = 40
 PAGE_HEADING_RE = re.compile(r"^## Page\s+(\d+)\s*$", re.MULTILINE)
+
+
+def tqdm_iter(
+    iterable: Any,
+    *,
+    desc: str,
+    unit: str,
+    total: int | None = None,
+    leave: bool = False,
+    position: int = 0,
+) -> Any:
+    if _tqdm is None:
+        return iterable
+    return _tqdm(
+        iterable,
+        desc=desc,
+        unit=unit,
+        total=total,
+        leave=leave,
+        position=position,
+        dynamic_ncols=True,
+        disable=not sys.stderr.isatty(),
+    )
 
 
 @dataclass
@@ -247,9 +276,17 @@ def extract_with_pymupdf(pdf_path: Path) -> list[str]:
         raise MissingExtractor("PyMuPDF is not installed.") from exc
 
     pages: list[str] = []
-    with fitz.open(str(pdf_path)) as document:  # pragma: no cover - optional package path
-        for page in document:
-            pages.append(normalize_text(page.get_text("text") or ""))
+    show_errors = fitz.TOOLS.mupdf_display_errors()
+    show_warnings = fitz.TOOLS.mupdf_display_warnings()
+    fitz.TOOLS.mupdf_display_errors(False)
+    fitz.TOOLS.mupdf_display_warnings(False)
+    try:
+        with fitz.open(str(pdf_path)) as document:  # pragma: no cover - optional package path
+            for page in document:
+                pages.append(normalize_text(page.get_text("text") or ""))
+    finally:
+        fitz.TOOLS.mupdf_display_errors(show_errors)
+        fitz.TOOLS.mupdf_display_warnings(show_warnings)
     return pages
 
 
@@ -467,7 +504,13 @@ class PdfConversionChunkingService:
         papers_md_dir.mkdir(parents=True, exist_ok=True)
 
         converted: list[PaperRecord] = []
-        for record in records:
+        for record in tqdm_iter(
+            records,
+            desc="Converting PDFs to Markdown",
+            unit="pdf",
+            total=len(records),
+            leave=True,
+        ):
             pdf_path = Path(record.pdf_path)
             md_path = papers_md_dir / f"{record.paper_id}.md"
             record.md_path = str(md_path)
@@ -481,7 +524,6 @@ class PdfConversionChunkingService:
                 continue
 
             try:
-                self.logger.info("Converting %s", pdf_path)
                 pages = self.extract_pdf_pages(pdf_path, extractor=extractor)
                 md_path.write_text(self.render_paper_markdown(record, pages), encoding="utf-8")
                 text_pages = sum(1 for page in pages if page.strip())
@@ -493,7 +535,6 @@ class PdfConversionChunkingService:
                     "text_page_count": text_pages,
                 }
             except Exception as exc:
-                self.logger.warning("Could not convert %s: %s", pdf_path, exc)
                 record.md_path = None
                 record.conversion = {
                     "status": "failed",
@@ -502,6 +543,9 @@ class PdfConversionChunkingService:
                 }
             converted.append(record)
 
+        failed_count = sum(
+            1 for record in converted if record.conversion.get("status") == "failed"
+        )
         payload = {
             "project": self.project,
             "version": self.version,
@@ -515,12 +559,18 @@ class PdfConversionChunkingService:
                 for record in converted
                 if record.conversion.get("status") in {"converted", "already_exists", "no_text"}
             ),
-            "failed_count": sum(
-                1 for record in converted if record.conversion.get("status") == "failed"
-            ),
+            "failed_count": failed_count,
             "papers": [dataclasses.asdict(record) for record in converted],
         }
-        write_json(out_dir / "paper_index.json", payload)
+        paper_index_path = out_dir / "paper_index.json"
+        write_json(paper_index_path, payload)
+        if failed_count:
+            self.logger.warning(
+                "Could not convert %d/%d papers; details written to %s",
+                failed_count,
+                len(converted),
+                paper_index_path,
+            )
         return payload
 
     def split_markdown_pages(self, markdown: str) -> list[tuple[int | None, str]]:

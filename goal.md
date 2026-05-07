@@ -170,11 +170,8 @@ For every extracted feature/category:
 - Parent category if hierarchical
 - Example phrases if available
 
----
 
-# Output Structure
-
-Return results as structured markdown or JSON with the format:
+Return a copyable JSON within the report markdown file with the format:
 
 ```json
 {
