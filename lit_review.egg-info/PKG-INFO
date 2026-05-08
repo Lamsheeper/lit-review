@@ -92,6 +92,16 @@ collected_papers/
     └── download_log.json
 ```
 
+Create a compact source/outcome summary from an existing logs folder:
+
+```bash
+python3 lit_log_summary.py ./collected_papers/logs \
+  --output ./collected_papers/logs/service_summary.json
+```
+
+If the project is installed as a package, the same command is available as
+`lit-log-summary`.
+
 ## Safe First Run
 
 Use `--dry-run` to test draft parsing and query generation without making API
