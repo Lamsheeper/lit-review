@@ -8,4 +8,6 @@ logs/
 review_runs/
 *.pdf
 *_configs
+extract_configs/
+!extract_configs/*.json
 collected_*

@@ -1,4 +1,5 @@
 README.md
+lit_extract.py
 lit_harvest.py
 lit_log_summary.py
 lit_pdf_service.py
