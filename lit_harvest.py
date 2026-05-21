@@ -2112,11 +2112,13 @@ class PdfDownloader:
         output_dir: Path,
         max_pdf_mb: int = 80,
         force_download: bool = False,
+        abstract_fallback: bool = True,
     ) -> None:
         self.http = http
         self.output_dir = output_dir
         self.max_bytes = max_pdf_mb * 1024 * 1024
         self.force_download = force_download
+        self.abstract_fallback = abstract_fallback
 
     def download(self, candidate: Candidate, urls: list[str]) -> dict[str, Any]:
         filename = build_pdf_filename(candidate)
@@ -2143,7 +2145,7 @@ class PdfDownloader:
             except Exception as exc:  # pragma: no cover - network defensive path
                 attempts.append({"url": url, "status": "failed", "reason": str(exc)})
 
-        if candidate.abstract:
+        if self.abstract_fallback and candidate.abstract:
             try:
                 bytes_written = self._write_abstract_pdf(
                     destination,
@@ -3310,6 +3312,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             output_dir=output_dir,
             max_pdf_mb=int(config["max_pdf_mb"]),
             force_download=bool(config.get("force_download")),
+            abstract_fallback=not bool(config.get("no_abstract")),
         )
         download_ledger = DownloadLogLedger(
             download_log_path,
@@ -3453,6 +3456,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "progress": True,
     "metadata_only": False,
     "force_download": False,
+    "no_abstract": False,
     "csv_report": False,
     "bibtex": False,
     "dry_run": False,
@@ -3537,6 +3541,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=None,
         help="Overwrite existing PDFs with the same generated filename.",
+    )
+    parser.add_argument(
+        "--no-abstract",
+        action="store_true",
+        default=None,
+        help="Disable abstract-only PDF fallback when no full PDF can be downloaded.",
     )
     parser.add_argument(
         "--refresh-candidates",

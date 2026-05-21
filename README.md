@@ -114,6 +114,16 @@ uv run lit-harvest \
   --email you@example.com
 ```
 
+Use `--no-abstract` to skip the abstract-only PDF fallback when no full PDF is
+available:
+
+```bash
+uv run lit-harvest \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --no-abstract
+```
+
 ## Recommended Full Run
 
 For better open-access PDF resolution, provide an Unpaywall email. Semantic
@@ -193,6 +203,7 @@ Important config fields:
 - `max_pdf_mb`: maximum accepted PDF size
 - `max_downloads`: maximum successful PDF downloads
 - `metadata_only`: search without downloading PDFs
+- `no_abstract`: skip abstract-only fallback PDFs when no full PDF is available
 - `csv_report`: write `candidates.csv`
 - `bibtex`: write `candidates.bib`
 

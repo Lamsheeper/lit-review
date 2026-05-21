@@ -23,6 +23,8 @@ from lit_extract import (
     parse_args,
     run_curation,
     run_extraction,
+    run_final_curation,
+    select_top_curated_features_by_category,
     title_relevance_score,
     write_artifacts,
 )
@@ -524,11 +526,14 @@ class LitExtractTests(unittest.TestCase):
 
             self.assertEqual(len(client.calls), 1)
             self.assertEqual(trace["outputs"]["curated_features"], 1)
+            self.assertEqual(trace["outputs"]["final_curated_features_top100_by_category"], 1)
             self.assertEqual(trace["outputs"]["curated_feature_members"], 2)
             self.assertEqual(trace["outputs"]["rejected_features"], 0)
             for name in [
                 "curated_features.jsonl",
                 "curated_features.csv",
+                "final_curated_features_top100_by_category.jsonl",
+                "final_curated_features_top100_by_category.csv",
                 "curated_feature_members.jsonl",
                 "curated_feature_members.csv",
                 "rejected_features.jsonl",
@@ -536,6 +541,160 @@ class LitExtractTests(unittest.TestCase):
                 "curation_trace.json",
             ]:
                 self.assertTrue((input_dir / name).exists(), name)
+
+    def test_final_curated_export_keeps_top_100_per_category(self):
+        curated = [
+            {
+                "category": "persuasion",
+                "feature_name": f"Persuasion {idx:03d}",
+                "paper_count": idx,
+                "mention_count": idx,
+            }
+            for idx in range(1, 121)
+        ]
+        curated.extend(
+            [
+                {
+                    "category": "moral_framing",
+                    "feature_name": "Moral top",
+                    "paper_count": 5,
+                    "mention_count": 6,
+                },
+                {
+                    "category": "moral_framing",
+                    "feature_name": "Moral tie winner",
+                    "paper_count": 4,
+                    "mention_count": 10,
+                },
+                {
+                    "category": "moral_framing",
+                    "feature_name": "Moral tie loser",
+                    "paper_count": 4,
+                    "mention_count": 2,
+                },
+            ]
+        )
+
+        final_rows = select_top_curated_features_by_category(curated)
+        persuasion = [row for row in final_rows if row["category"] == "persuasion"]
+        moral = [row for row in final_rows if row["category"] == "moral_framing"]
+
+        self.assertEqual(len(persuasion), 100)
+        self.assertEqual(persuasion[0]["paper_count"], 120)
+        self.assertEqual(persuasion[-1]["paper_count"], 21)
+        self.assertEqual([row["feature_name"] for row in moral], [
+            "Moral top",
+            "Moral tie winner",
+            "Moral tie loser",
+        ])
+
+    def test_run_final_curation_writes_llm_top_features(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            input_dir = root / "extract"
+            input_dir.mkdir()
+            write_jsonl(
+                input_dir / "curated_features.jsonl",
+                [
+                    feature_row(
+                        "persuasion",
+                        "Loaded Language",
+                        paper_ids=["p1", "p2", "p3"],
+                        mention_count=3,
+                    ),
+                    feature_row(
+                        "persuasion",
+                        "Loaded Languages",
+                        paper_ids=["p4"],
+                        mention_count=1,
+                    ),
+                    feature_row(
+                        "moral_framing",
+                        "Care Harm",
+                        paper_ids=["p5", "p6"],
+                        mention_count=2,
+                    ),
+                ],
+            )
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "feature_key": "persuasion::loaded language",
+                                    "action": "keep_as_canonical",
+                                    "canonical_feature_name": "Loaded Language",
+                                    "canonical_normalized_feature_name": "loaded language",
+                                    "curation_confidence": 0.95,
+                                },
+                                {
+                                    "feature_key": "persuasion::loaded languages",
+                                    "action": "merge_into_canonical",
+                                    "canonical_feature_name": "Loaded Language",
+                                    "canonical_normalized_feature_name": "loaded language",
+                                    "curation_confidence": 0.9,
+                                },
+                            ]
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "feature_key": "moral_framing::care harm",
+                                    "action": "keep_as_canonical",
+                                    "canonical_feature_name": "Care/Harm",
+                                    "canonical_normalized_feature_name": "care harm",
+                                    "curation_confidence": 0.9,
+                                }
+                            ]
+                        }
+                    ),
+                ]
+            )
+
+            trace = run_final_curation(
+                input_dir=input_dir,
+                output_dir=input_dir,
+                api_key=None,
+                model="final-model",
+                base_url="https://example.test/v1",
+                api_provider="openai",
+                reasoning_effort=None,
+                merge_style="moderate",
+                target_per_category=1,
+                candidate_pool_per_category=0,
+                force=True,
+                dry_run=False,
+                temperature=0.0,
+                max_tokens=1000,
+                show_progress=False,
+                client=client,
+            )
+
+            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(trace["outputs"]["final_curated_features_llm_top100_by_category"], 2)
+            self.assertEqual(trace["outputs"]["final_curated_feature_members_llm"], 3)
+            for name in [
+                "final_curated_features_llm_top100_by_category.jsonl",
+                "final_curated_features_llm_top100_by_category.csv",
+                "final_curated_feature_members_llm.jsonl",
+                "final_rejected_features_llm.jsonl",
+                "final_curation_trace.json",
+            ]:
+                self.assertTrue((input_dir / name).exists(), name)
+
+            final_rows = [
+                json.loads(line)
+                for line in (input_dir / "final_curated_features_llm_top100_by_category.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(final_rows[0]["category"], "persuasion")
+            self.assertEqual(final_rows[0]["feature_name"], "Loaded Language")
+            self.assertEqual(final_rows[0]["paper_count"], 4)
 
     def test_run_curation_resume_skips_completed_batches(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1247,6 +1406,44 @@ class LitExtractTests(unittest.TestCase):
             self.assertEqual(args.model, "gemini-3-pro-preview")
             self.assertEqual(args.batch_features, 40)
             self.assertEqual(args.merge_style, "moderate")
+
+    def test_config_file_supports_finalize_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "finalize_gemini.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "command": "finalize",
+                        "input_dir": "review_runs/media_attributes_v3/feature_extract_pdf",
+                        "output_dir": "review_runs/media_attributes_v3/feature_extract_pdf",
+                        "goal": "goal.md",
+                        "api_key_env": "GEMINI_API_KEY",
+                        "model": "gemini-3-pro-preview",
+                        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                        "api_provider": "gemini",
+                        "reasoning_effort": "high",
+                        "target_per_category": 100,
+                        "candidate_pool_per_category": 0,
+                        "merge_style": "moderate",
+                        "temperature": 0.0,
+                        "max_tokens": 30000,
+                        "timeout": 600,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-secret"}):
+                args = parse_args(["--config", str(config_path)])
+
+            self.assertEqual(args.command, "finalize")
+            self.assertEqual(args.api_key, "test-secret")
+            self.assertEqual(args.model, "gemini-3-pro-preview")
+            self.assertEqual(args.api_provider, "gemini")
+            self.assertEqual(args.target_per_category, 100)
+            self.assertEqual(args.candidate_pool_per_category, 0)
+            self.assertEqual(args.max_tokens, 30000)
+            self.assertEqual(args.timeout, 600.0)
 
 
 if __name__ == "__main__":

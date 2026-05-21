@@ -298,6 +298,25 @@ class LitHarvestCoreTests(unittest.TestCase):
         self.assertTrue(Path(result["path"]).exists())
         self.assertEqual(candidate.download["status"], "abstract_only")
 
+    def test_download_skips_abstract_fallback_when_disabled(self):
+        candidate = Candidate(
+            title="No Abstract Fallback Paper",
+            authors=["Test Author"],
+            abstract="This is the abstract text.",
+        )
+        downloader = PdfDownloader(
+            HttpClient(),
+            Path(tempfile.mkdtemp()),
+            abstract_fallback=False,
+        )
+
+        result = downloader.download(candidate, [])
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "No candidate PDF URL available.")
+        self.assertEqual(result["attempts"], [])
+        self.assertEqual(candidate.download["status"], "failed")
+
     def test_download_pdf_does_not_retry_html_response(self):
         class FakeResponse:
             headers = {"Content-Type": "text/html"}
@@ -711,6 +730,14 @@ class LitHarvestCoreTests(unittest.TestCase):
             "propaganda technique classification rhetorical strategy taxonomy",
         )
         self.assertLessEqual(len(combined), 3)
+
+    def test_no_abstract_cli_sets_config_flag(self):
+        args = lit_harvest.parse_args(
+            ["--draft", "draft.md", "--output", "papers", "--no-abstract"]
+        )
+        config = lit_harvest.load_config(args)
+
+        self.assertTrue(config["no_abstract"])
 
 
 if __name__ == "__main__":

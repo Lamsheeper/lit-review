@@ -43,7 +43,9 @@ LOGGER = logging.getLogger("litextract")
 PDF_INPUT_MAX_BYTES = 50 * 1024 * 1024
 
 CATEGORIES = {"persuasion", "moral_framing", "sentiment_affect"}
+CATEGORY_EXPORT_ORDER = ["persuasion", "moral_framing", "sentiment_affect"]
 EVIDENCE_TYPES = {"definition", "taxonomy_row", "example", "named_mention"}
+FINAL_FEATURES_PER_CATEGORY = 100
 TITLE_RANK_RULES = [
     (r"\btaxonom(?:y|ies)\b", 14),
     (r"\bclassification\b", 5),
@@ -100,6 +102,7 @@ CONFIG_ARG_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("max_features_per_pdf", "--max-features-per-pdf"),
         ("max_chunk_chars", "--max-chunk-chars"),
         ("temperature", "--temperature"),
+        ("timeout", "--timeout"),
         ("force", "--force"),
         ("dry_run", "--dry-run"),
         ("verbose", "--verbose"),
@@ -116,6 +119,27 @@ CONFIG_ARG_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("batch_features", "--batch-features"),
         ("merge_style", "--merge-style"),
         ("temperature", "--temperature"),
+        ("timeout", "--timeout"),
+        ("force", "--force"),
+        ("dry_run", "--dry-run"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
+    "finalize": [
+        ("input_dir", "--input-dir"),
+        ("output_dir", "--output-dir"),
+        ("goal", "--goal"),
+        ("api_key", "--api-key"),
+        ("model", "--model"),
+        ("base_url", "--base-url"),
+        ("api_provider", "--api-provider"),
+        ("reasoning_effort", "--reasoning-effort"),
+        ("target_per_category", "--target-per-category"),
+        ("candidate_pool_per_category", "--candidate-pool-per-category"),
+        ("merge_style", "--merge-style"),
+        ("temperature", "--temperature"),
+        ("max_tokens", "--max-tokens"),
+        ("timeout", "--timeout"),
         ("force", "--force"),
         ("dry_run", "--dry-run"),
         ("verbose", "--verbose"),
@@ -336,6 +360,18 @@ class CurationStats:
     repaired_json_count: int = 0
 
 
+@dataclass
+class FinalCurationStats:
+    feature_count: int = 0
+    category_count: int = 0
+    candidate_feature_count: int = 0
+    completed_category_count: int = 0
+    skipped_category_count: int = 0
+    failed_category_count: int = 0
+    decision_count: int = 0
+    repaired_json_count: int = 0
+
+
 class NullProgress:
     def __enter__(self) -> "NullProgress":
         return self
@@ -374,6 +410,10 @@ def title_score_progress(total: int, show: bool) -> Any:
 
 def curation_progress(total: int, show: bool) -> Any:
     return progress_bar(total=total, desc="Curating features", unit="feature", show=show)
+
+
+def final_curation_progress(total: int, show: bool) -> Any:
+    return progress_bar(total=total, desc="Finalizing features", unit="feature", show=show)
 
 
 def clean_api_key(api_key: str) -> str:
@@ -594,6 +634,38 @@ class GeminiGenerateContentClient:
             return text.strip()
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Unexpected Gemini API response: {data}") from exc
+
+
+def make_llm_client(
+    *,
+    api_key: str,
+    model: str,
+    base_url: str,
+    reasoning_effort: str | None,
+    api_provider: str = "auto",
+    input_mode: str = "text",
+    timeout: float | None = None,
+) -> Any:
+    client_timeout = 120.0 if timeout is None else max(1.0, float(timeout))
+    if should_use_gemini_native_client(
+        api_provider=api_provider,
+        base_url=base_url,
+        input_mode=input_mode,
+    ):
+        return GeminiGenerateContentClient(
+            api_key=clean_api_key(api_key),
+            model=model,
+            base_url=base_url,
+            reasoning_effort=reasoning_effort,
+            timeout=client_timeout,
+        )
+    return ChatCompletionClient(
+        api_key=clean_api_key(api_key),
+        model=model,
+        base_url=base_url,
+        reasoning_effort=reasoning_effort,
+        timeout=client_timeout,
+    )
 
 
 def normalize_feature_name(value: str | None) -> str:
@@ -1724,6 +1796,13 @@ def load_feature_rows(input_dir: Path) -> list[dict[str, Any]]:
     return [ensure_feature_identity(row) for row in read_jsonl(features_path)]
 
 
+def load_curated_feature_rows(input_dir: Path) -> list[dict[str, Any]]:
+    features_path = input_dir / "curated_features.jsonl"
+    if not features_path.exists():
+        raise FileNotFoundError(f"curated_features.jsonl does not exist: {features_path}")
+    return [ensure_feature_identity(row) for row in read_jsonl(features_path)]
+
+
 def curation_batch_id(category: str, batch_index: int, rows: list[dict[str, Any]]) -> str:
     digest_source = "\n".join(str(row.get("feature_key") or feature_key(row)) for row in rows)
     digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:10]
@@ -1836,6 +1915,69 @@ Curation rules:
 - Reject features that are off-goal, overly broad, non-taxonomic, or artifacts of
   extraction noise.
 - Keep useful canonical features even when their evidence is imperfect.
+- Every input feature_key must appear exactly once in decisions.
+
+INPUT
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+"""
+
+
+def build_final_curation_prompt(
+    *,
+    features: list[dict[str, Any]],
+    category: str,
+    goal_text: str,
+    merge_style: str,
+    target_per_category: int,
+) -> str:
+    goal_section = (
+        f"\nGOAL / TAXONOMY CONTEXT\n{goal_text}\n"
+        if goal_text.strip()
+        else "\nGOAL / TAXONOMY CONTEXT\nNo external goal file was provided.\n"
+    )
+    payload = {
+        "category": category,
+        "merge_style": merge_style,
+        "target_unique_features": target_per_category,
+        "features_ranked_by_paper_count": [
+            {
+                "rank": idx,
+                **compact_feature_for_prompt(row),
+            }
+            for idx, row in enumerate(features, start=1)
+        ],
+    }
+    return f"""Final-curate ranked taxonomy features for a publication-ready export.
+{goal_section}
+
+Return strict JSON only with this shape:
+{{
+  "decisions": [
+    {{
+      "feature_key": "category::normalized feature name from input",
+      "action": "keep_as_canonical | merge_into_canonical | reject",
+      "canonical_feature_name": "canonical display name, empty for reject",
+      "canonical_normalized_feature_name": "normalized canonical name, empty for reject",
+      "rejection_reason": "reason if rejected, otherwise empty",
+      "curation_confidence": 0.0,
+      "notes": "short explanation"
+    }}
+  ]
+}}
+
+Final curation rules:
+- Work only within the input category: {category}.
+- Input features are already sorted by descending paper_count, then mention_count.
+- Use merge style {merge_style}. Merge aliases, spelling variants, plural/singular
+  variants, and near-duplicate labels that clearly describe the same taxonomy role.
+- Reject off-goal, overly broad, non-taxonomic, ambiguous, or artifact-like labels.
+- Prefer high paper_count features when choosing canonical names, unless a lower
+  ranked label is clearer and supported by the merged evidence.
+- Aim for exactly {target_per_category} unique canonical features when there are
+  at least {target_per_category} valid concepts in the input; never create more
+  than {target_per_category} canonical features.
+- If more than {target_per_category} valid concepts remain, merge or reject the
+  lower-priority ones first.
 - Every input feature_key must appear exactly once in decisions.
 
 INPUT
@@ -2108,20 +2250,128 @@ def build_curation_outputs(
     return curated, members, rejected
 
 
+def curated_feature_sort_key(row: dict[str, Any]) -> tuple[int, int, float, int, str]:
+    try:
+        paper_count = int(row.get("paper_count") or 0)
+    except (TypeError, ValueError):
+        paper_count = 0
+    try:
+        mention_count = int(row.get("mention_count") or 0)
+    except (TypeError, ValueError):
+        mention_count = 0
+    try:
+        confidence = float(row.get("curation_confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    try:
+        member_count = int(row.get("member_count") or 0)
+    except (TypeError, ValueError):
+        member_count = 0
+    return (
+        -paper_count,
+        -mention_count,
+        -confidence,
+        -member_count,
+        str(row.get("feature_name") or "").casefold(),
+    )
+
+
+def select_top_curated_features_by_category(
+    curated: list[dict[str, Any]],
+    per_category: int = FINAL_FEATURES_PER_CATEGORY,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in curated:
+        grouped.setdefault(str(row.get("category") or ""), []).append(row)
+
+    output: list[dict[str, Any]] = []
+    category_order = [
+        *(category for category in CATEGORY_EXPORT_ORDER if category in grouped),
+        *sorted(category for category in grouped if category not in CATEGORY_EXPORT_ORDER),
+    ]
+    for category in category_order:
+        rows = grouped.get(category, [])
+        output.extend(sorted(rows, key=curated_feature_sort_key)[:per_category])
+    return output
+
+
+def final_candidate_categories(
+    curated: list[dict[str, Any]],
+    candidate_pool_per_category: int = 0,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in curated:
+        grouped.setdefault(str(row.get("category") or ""), []).append(row)
+
+    category_order = [
+        *(category for category in CATEGORY_EXPORT_ORDER if category in grouped),
+        *sorted(category for category in grouped if category not in CATEGORY_EXPORT_ORDER),
+    ]
+    categories: list[dict[str, Any]] = []
+    for category in category_order:
+        rows = sorted(grouped.get(category, []), key=curated_feature_sort_key)
+        if candidate_pool_per_category > 0:
+            rows = rows[:candidate_pool_per_category]
+        categories.append({"category": category, "features": rows})
+    return categories
+
+
+def final_curation_category_id(category: str, rows: list[dict[str, Any]]) -> str:
+    digest_source = "\n".join(str(row.get("feature_key") or feature_key(row)) for row in rows)
+    digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:10]
+    return f"{category}:final:{digest}"
+
+
+def write_final_curation_artifacts(
+    output_dir: Path,
+    candidate_features: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    target_per_category: int = FINAL_FEATURES_PER_CATEGORY,
+) -> dict[str, int]:
+    curated, members, rejected = build_curation_outputs(candidate_features, decisions)
+    final_curated = select_top_curated_features_by_category(
+        curated,
+        per_category=target_per_category,
+    )
+    write_jsonl(output_dir / "final_curated_features_llm_top100_by_category.jsonl", final_curated)
+    write_csv(
+        output_dir / "final_curated_features_llm_top100_by_category.csv",
+        final_curated,
+        CURATED_FEATURE_FIELDNAMES,
+    )
+    write_jsonl(output_dir / "final_curated_feature_members_llm.jsonl", members)
+    write_csv(output_dir / "final_curated_feature_members_llm.csv", members, CURATED_MEMBER_FIELDNAMES)
+    write_jsonl(output_dir / "final_rejected_features_llm.jsonl", rejected)
+    write_csv(output_dir / "final_rejected_features_llm.csv", rejected, REJECTED_FEATURE_FIELDNAMES)
+    return {
+        "final_curated_features_llm_top100_by_category": len(final_curated),
+        "final_curated_feature_members_llm": len(members),
+        "final_rejected_features_llm": len(rejected),
+    }
+
+
 def write_curation_artifacts(
     output_dir: Path,
     features: list[dict[str, Any]],
     decisions: list[dict[str, Any]],
 ) -> dict[str, int]:
     curated, members, rejected = build_curation_outputs(features, decisions)
+    final_curated = select_top_curated_features_by_category(curated)
     write_jsonl(output_dir / "curated_features.jsonl", curated)
     write_csv(output_dir / "curated_features.csv", curated, CURATED_FEATURE_FIELDNAMES)
+    write_jsonl(output_dir / "final_curated_features_top100_by_category.jsonl", final_curated)
+    write_csv(
+        output_dir / "final_curated_features_top100_by_category.csv",
+        final_curated,
+        CURATED_FEATURE_FIELDNAMES,
+    )
     write_jsonl(output_dir / "curated_feature_members.jsonl", members)
     write_csv(output_dir / "curated_feature_members.csv", members, CURATED_MEMBER_FIELDNAMES)
     write_jsonl(output_dir / "rejected_features.jsonl", rejected)
     write_csv(output_dir / "rejected_features.csv", rejected, REJECTED_FEATURE_FIELDNAMES)
     return {
         "curated_features": len(curated),
+        "final_curated_features_top100_by_category": len(final_curated),
         "curated_feature_members": len(members),
         "rejected_features": len(rejected),
     }
@@ -2144,6 +2394,8 @@ def remove_curation_outputs(output_dir: Path) -> None:
     for name in [
         "curated_features.jsonl",
         "curated_features.csv",
+        "final_curated_features_top100_by_category.jsonl",
+        "final_curated_features_top100_by_category.csv",
         "curated_feature_members.jsonl",
         "curated_feature_members.csv",
         "rejected_features.jsonl",
@@ -2152,6 +2404,37 @@ def remove_curation_outputs(output_dir: Path) -> None:
         "curation_errors.jsonl",
         "completed_curation_batches.jsonl",
         "curation_batch_decisions.jsonl",
+    ]:
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def completed_final_curation_category_ids(output_dir: Path) -> set[str]:
+    completed: set[str] = set()
+    for row in read_jsonl(output_dir / "completed_final_curation_categories.jsonl"):
+        category_id = str(row.get("category_id") or "")
+        if category_id:
+            completed.add(category_id)
+    return completed
+
+
+def load_existing_final_curation_decisions(output_dir: Path) -> list[dict[str, Any]]:
+    return read_jsonl(output_dir / "final_curation_decisions.jsonl")
+
+
+def remove_final_curation_outputs(output_dir: Path) -> None:
+    for name in [
+        "final_curated_features_llm_top100_by_category.jsonl",
+        "final_curated_features_llm_top100_by_category.csv",
+        "final_curated_feature_members_llm.jsonl",
+        "final_curated_feature_members_llm.csv",
+        "final_rejected_features_llm.jsonl",
+        "final_rejected_features_llm.csv",
+        "final_curation_trace.json",
+        "final_curation_errors.jsonl",
+        "completed_final_curation_categories.jsonl",
+        "final_curation_decisions.jsonl",
     ]:
         path = output_dir / name
         if path.exists():
@@ -2248,6 +2531,7 @@ def run_extraction(
     max_features_per_pdf: int = 40,
     input_mode: str = "chunks",
     temperature: float,
+    timeout: float | None = None,
     show_progress: bool = True,
     client: ChatCompletionClient | None = None,
 ) -> dict[str, Any]:
@@ -2289,24 +2573,15 @@ def run_extraction(
     if client is None:
         if not api_key:
             raise ValueError("An API key is required unless --dry-run is used.")
-        if should_use_gemini_native_client(
-            api_provider=api_provider,
+        client = make_llm_client(
+            api_key=api_key,
+            model=model,
             base_url=base_url,
+            reasoning_effort=reasoning_effort,
+            api_provider=api_provider,
             input_mode=input_mode,
-        ):
-            client = GeminiGenerateContentClient(
-                api_key=clean_api_key(api_key),
-                model=model,
-                base_url=base_url,
-                reasoning_effort=reasoning_effort,
-            )
-        else:
-            client = ChatCompletionClient(
-                api_key=clean_api_key(api_key),
-                model=model,
-                base_url=base_url,
-                reasoning_effort=reasoning_effort,
-            )
+            timeout=timeout,
+        )
 
     stats = ExtractionStats(paper_count=len(papers))
     completed = completed_paper_ids(output_dir)
@@ -2553,6 +2828,7 @@ def run_extraction(
             "max_features_per_chunk": max_features_per_chunk,
             "max_features_per_pdf": max_features_per_pdf,
             "temperature": temperature,
+            "timeout": timeout,
             "force": force,
             "progress": show_progress,
             "paper_ranking": "title_relevance",
@@ -2621,6 +2897,7 @@ def run_curation(
     force: bool,
     dry_run: bool,
     temperature: float,
+    timeout: float | None = None,
     show_progress: bool = True,
     client: ChatCompletionClient | None = None,
 ) -> dict[str, Any]:
@@ -2656,6 +2933,7 @@ def run_curation(
             model=model,
             base_url=base_url,
             reasoning_effort=reasoning_effort,
+            timeout=120.0 if timeout is None else max(1.0, float(timeout)),
         )
 
     completed = completed_curation_batch_ids(output_dir)
@@ -2783,6 +3061,7 @@ def run_curation(
             "batch_features": batch_features,
             "merge_style": merge_style,
             "temperature": temperature,
+            "timeout": timeout,
             "force": force,
             "progress": show_progress,
         },
@@ -2791,6 +3070,292 @@ def run_curation(
         "failures": failures,
     }
     write_json(output_dir / "curation_trace.json", trace)
+    return trace
+
+
+def dry_run_final_curation_trace(
+    *,
+    input_dir: Path,
+    output_dir: Path,
+    curated_features: list[dict[str, Any]],
+    categories: list[dict[str, Any]],
+    model: str,
+    run_id: str,
+    goal_path: str | None,
+    goal_text: str,
+    merge_style: str,
+    target_per_category: int,
+    candidate_pool_per_category: int,
+    max_tokens: int,
+    timeout: float | None,
+) -> dict[str, Any]:
+    candidate_count = sum(len(category["features"]) for category in categories)
+    stats = FinalCurationStats(
+        feature_count=len(curated_features),
+        category_count=len(categories),
+        candidate_feature_count=candidate_count,
+    )
+    trace = {
+        "project": "LitExtract",
+        "version": VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "dry_run": True,
+        "model": model,
+        "input_dir": str(input_dir),
+        "output_dir": str(output_dir),
+        "goal_path": goal_path,
+        "goal_used": bool(goal_text.strip()),
+        "config": {
+            "merge_style": merge_style,
+            "target_per_category": target_per_category,
+            "candidate_pool_per_category": candidate_pool_per_category,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+        },
+        "category_candidates": {
+            str(category["category"]): len(category["features"])
+            for category in categories
+        },
+        "counts": dataclasses.asdict(stats),
+        "outputs": {},
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / "final_curation_trace.json", trace)
+    return trace
+
+
+def run_final_curation(
+    *,
+    input_dir: Path,
+    output_dir: Path,
+    api_key: str | None,
+    model: str,
+    base_url: str,
+    api_provider: str = "auto",
+    reasoning_effort: str | None,
+    merge_style: str,
+    goal_path: Path | None = None,
+    target_per_category: int = FINAL_FEATURES_PER_CATEGORY,
+    candidate_pool_per_category: int = 0,
+    force: bool,
+    dry_run: bool,
+    temperature: float,
+    max_tokens: int,
+    timeout: float | None = None,
+    show_progress: bool = True,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    input_dir = input_dir.expanduser()
+    output_dir = output_dir.expanduser()
+    if api_provider not in {"auto", "openai", "gemini"}:
+        raise ValueError("api_provider must be 'auto', 'openai', or 'gemini'.")
+    target_per_category = max(1, target_per_category)
+    candidate_pool_per_category = max(0, candidate_pool_per_category)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if force:
+        remove_final_curation_outputs(output_dir)
+
+    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    curated_features = load_curated_feature_rows(input_dir)
+    categories = final_candidate_categories(
+        curated_features,
+        candidate_pool_per_category=candidate_pool_per_category,
+    )
+    candidate_features = [
+        row
+        for category in categories
+        for row in category["features"]
+    ]
+    goal_text, resolved_goal_path = load_goal_text(goal_path)
+    if dry_run:
+        return dry_run_final_curation_trace(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            curated_features=curated_features,
+            categories=categories,
+            model=model,
+            run_id=run_id,
+            goal_path=resolved_goal_path,
+            goal_text=goal_text,
+            merge_style=merge_style,
+            target_per_category=target_per_category,
+            candidate_pool_per_category=candidate_pool_per_category,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+    if client is None:
+        if not api_key:
+            raise ValueError("An API key is required unless --dry-run is used.")
+        client = make_llm_client(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            reasoning_effort=reasoning_effort,
+            api_provider=api_provider,
+            input_mode="text",
+            timeout=timeout,
+        )
+
+    completed = completed_final_curation_category_ids(output_dir)
+    decisions = load_existing_final_curation_decisions(output_dir)
+    stats = FinalCurationStats(
+        feature_count=len(curated_features),
+        category_count=len(categories),
+        candidate_feature_count=len(candidate_features),
+    )
+    output_counts = write_final_curation_artifacts(
+        output_dir,
+        candidate_features,
+        decisions,
+        target_per_category=target_per_category,
+    )
+    failures: list[dict[str, Any]] = []
+    pending_feature_count = sum(
+        len(category["features"])
+        for category in categories
+        if final_curation_category_id(str(category["category"]), category["features"]) not in completed
+    )
+
+    with final_curation_progress(total=pending_feature_count, show=show_progress) as progress:
+        for category_payload in categories:
+            category = str(category_payload["category"])
+            category_rows = list(category_payload["features"])
+            category_id = final_curation_category_id(category, category_rows)
+            if category_id in completed:
+                stats.skipped_category_count += 1
+                continue
+
+            raw_response = ""
+            try:
+                raw_response = client.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an evidence-bound final taxonomy curation agent. "
+                                "Return only valid JSON."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": build_final_curation_prompt(
+                                features=category_rows,
+                                category=category,
+                                goal_text=goal_text,
+                                merge_style=merge_style,
+                                target_per_category=target_per_category,
+                            ),
+                        },
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                )
+                raw_decisions, repaired_json = parse_curation_json_with_repair(
+                    raw_response,
+                    client=client,
+                )
+                if repaired_json:
+                    stats.repaired_json_count += 1
+                category_decisions = normalize_curation_decisions(
+                    raw_decisions,
+                    category_rows,
+                    model=model,
+                    run_id=run_id,
+                    curated_at=utc_now(),
+                )
+                for decision in category_decisions:
+                    append_jsonl(
+                        output_dir / "final_curation_decisions.jsonl",
+                        {
+                            **decision,
+                            "category_id": category_id,
+                            "final_category": category,
+                        },
+                    )
+                append_jsonl(
+                    output_dir / "completed_final_curation_categories.jsonl",
+                    {
+                        "category_id": category_id,
+                        "category": category,
+                        "candidate_feature_count": len(category_rows),
+                        "decision_count": len(category_decisions),
+                        "target_per_category": target_per_category,
+                        "run_id": run_id,
+                        "completed_at": utc_now(),
+                    },
+                )
+                completed.add(category_id)
+                decisions.extend(category_decisions)
+                stats.completed_category_count += 1
+                stats.decision_count += len(category_decisions)
+                output_counts = write_final_curation_artifacts(
+                    output_dir,
+                    candidate_features,
+                    decisions,
+                    target_per_category=target_per_category,
+                )
+            except Exception as exc:
+                stats.failed_category_count += 1
+                error_row = {
+                    "category_id": category_id,
+                    "category": category,
+                    "feature_keys": [
+                        str(row.get("feature_key") or feature_key(row))
+                        for row in category_rows
+                    ],
+                    "error": str(exc),
+                    "raw_response_excerpt": raw_response[:2000] if raw_response else "",
+                    "run_id": run_id,
+                    "created_at": utc_now(),
+                }
+                failures.append(error_row)
+                append_jsonl(output_dir / "final_curation_errors.jsonl", error_row)
+                LOGGER.warning("Final curation failed for %s: %s", category, exc)
+            finally:
+                progress.update(len(category_rows))
+
+    errors_path = output_dir / "final_curation_errors.jsonl"
+    if not errors_path.exists():
+        errors_path.write_text("", encoding="utf-8")
+    trace = {
+        "project": "LitExtract",
+        "version": VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "dry_run": False,
+        "model": model,
+        "base_url": base_url,
+        "api_provider": api_provider,
+        "reasoning_effort": reasoning_effort,
+        "input_dir": str(input_dir),
+        "output_dir": str(output_dir),
+        "goal_path": resolved_goal_path,
+        "goal_used": bool(goal_text.strip()),
+        "config": {
+            "merge_style": merge_style,
+            "target_per_category": target_per_category,
+            "candidate_pool_per_category": candidate_pool_per_category,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+            "force": force,
+            "progress": show_progress,
+            "paper_count_sort": "descending",
+        },
+        "category_candidates": {
+            str(category["category"]): len(category["features"])
+            for category in categories
+        },
+        "counts": dataclasses.asdict(stats),
+        "outputs": output_counts,
+        "failures": failures,
+    }
+    write_json(output_dir / "final_curation_trace.json", trace)
     return trace
 
 
@@ -2875,6 +3440,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum characters per chunk included in the LLM prompt.",
     )
     run.add_argument("--temperature", type=float, default=0.0)
+    run.add_argument("--timeout", type=float, help="LLM request timeout in seconds.")
     run.add_argument("--force", action="store_true", help="Overwrite existing extraction outputs.")
     run.add_argument(
         "--dry-run",
@@ -2914,11 +3480,81 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="How aggressively to merge synonym or near-synonym features.",
     )
     curate.add_argument("--temperature", type=float, default=0.0)
+    curate.add_argument("--timeout", type=float, help="LLM request timeout in seconds.")
     curate.add_argument("--force", action="store_true", help="Overwrite existing curation outputs.")
     curate.add_argument(
         "--dry-run",
         action="store_true",
         help="Count features/batches without making LLM calls.",
+    )
+
+    finalize = subparsers.add_parser(
+        "finalize",
+        help="LLM-finalize top curated features by category.",
+    )
+    add_common_args(finalize)
+    finalize.add_argument(
+        "--input-dir",
+        required=True,
+        help="Folder containing curated_features.jsonl.",
+    )
+    finalize.add_argument(
+        "--output-dir",
+        help="Folder for final artifacts. Defaults to --input-dir.",
+    )
+    finalize.add_argument(
+        "--goal",
+        help="Optional goal/taxonomy Markdown file. Defaults to ./goal.md when present.",
+    )
+    finalize.add_argument("--api-key", help="LLM API key. Defaults to env vars.")
+    finalize.add_argument("--model", default=env_model(), help="LLM model name.")
+    finalize.add_argument(
+        "--base-url",
+        default=env_base_url(),
+        help="OpenAI-compatible base URL, or Gemini native v1beta base URL with --api-provider gemini.",
+    )
+    finalize.add_argument(
+        "--api-provider",
+        default="auto",
+        choices=["auto", "openai", "gemini"],
+        help="Transport to use for the final LLM pass.",
+    )
+    finalize.add_argument(
+        "--reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high"],
+        help="OpenAI-compatible reasoning effort/thinking level.",
+    )
+    finalize.add_argument(
+        "--target-per-category",
+        type=int,
+        default=FINAL_FEATURES_PER_CATEGORY,
+        help="Maximum unique final features to keep in each category.",
+    )
+    finalize.add_argument(
+        "--candidate-pool-per-category",
+        type=int,
+        default=0,
+        help="Top ranked candidates per category to send; 0 sends all curated candidates.",
+    )
+    finalize.add_argument(
+        "--merge-style",
+        default="moderate",
+        choices=["conservative", "moderate", "aggressive"],
+        help="How aggressively to merge synonym or near-synonym features.",
+    )
+    finalize.add_argument("--temperature", type=float, default=0.0)
+    finalize.add_argument(
+        "--max-tokens",
+        type=int,
+        default=30000,
+        help="Maximum output tokens for each category-level finalization request.",
+    )
+    finalize.add_argument("--timeout", type=float, help="LLM request timeout in seconds.")
+    finalize.add_argument("--force", action="store_true", help="Overwrite existing final outputs.")
+    finalize.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count category candidates without making LLM calls.",
     )
     return parser.parse_args(argv)
 
@@ -3011,6 +3647,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_features_per_pdf=args.max_features_per_pdf,
                 input_mode=args.input_mode,
                 temperature=args.temperature,
+                timeout=args.timeout,
                 show_progress=not args.quiet,
             )
             print(Path(args.output_dir) / "extraction_trace.json")
@@ -3037,6 +3674,7 @@ def main(argv: list[str] | None = None) -> int:
                 force=args.force,
                 dry_run=args.dry_run,
                 temperature=args.temperature,
+                timeout=args.timeout,
                 show_progress=not args.quiet,
             )
             print(output_dir / "curation_trace.json")
@@ -3045,6 +3683,36 @@ def main(argv: list[str] | None = None) -> int:
                 trace.get("outputs", {}).get("curated_features", 0),
                 trace.get("outputs", {}).get("curated_feature_members", 0),
                 trace.get("outputs", {}).get("rejected_features", 0),
+            )
+            return 0
+        if args.command == "finalize":
+            api_key = args.api_key or env_api_key()
+            output_dir = Path(args.output_dir) if args.output_dir else Path(args.input_dir)
+            trace = run_final_curation(
+                input_dir=Path(args.input_dir),
+                output_dir=output_dir,
+                api_key=api_key,
+                model=args.model,
+                base_url=args.base_url,
+                api_provider=args.api_provider,
+                reasoning_effort=args.reasoning_effort,
+                merge_style=args.merge_style,
+                goal_path=Path(args.goal) if args.goal else None,
+                target_per_category=args.target_per_category,
+                candidate_pool_per_category=args.candidate_pool_per_category,
+                force=args.force,
+                dry_run=args.dry_run,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
+                show_progress=not args.quiet,
+            )
+            print(output_dir / "final_curation_trace.json")
+            LOGGER.info(
+                "Final curation complete: %d final features, %d member mappings, %d rejected.",
+                trace.get("outputs", {}).get("final_curated_features_llm_top100_by_category", 0),
+                trace.get("outputs", {}).get("final_curated_feature_members_llm", 0),
+                trace.get("outputs", {}).get("final_rejected_features_llm", 0),
             )
             return 0
     except Exception as exc:
