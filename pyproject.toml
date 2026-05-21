@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "pypdf>=5.0.0",
     "PyMuPDF>=1.24.0",
+    "tqdm>=4.66.0",
 ]
 
 [project.optional-dependencies]
@@ -18,10 +19,12 @@ dev = []
 
 [project.scripts]
 lit-harvest = "lit_harvest:main"
+lit-extract = "lit_extract:main"
+lit-log-summary = "lit_log_summary:main"
 lit-synthesize = "lit_synthesize:main"
 
 [tool.setuptools]
-py-modules = ["lit_harvest", "lit_synthesize"]
+py-modules = ["lit_extract", "lit_harvest", "lit_log_summary", "lit_pdf_service", "lit_synthesize"]
 
 [tool.uv]
 package = true

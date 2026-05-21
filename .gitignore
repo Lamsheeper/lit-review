@@ -1,4 +1,5 @@
 __pycache__/
+.DS_Store
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
@@ -8,4 +9,6 @@ logs/
 review_runs/
 *.pdf
 *_configs
+extract_configs/
+!extract_configs/*.json
 collected_*

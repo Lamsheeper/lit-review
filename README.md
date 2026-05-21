@@ -82,6 +82,16 @@ collected_papers/
     └── download_log.json
 ```
 
+Create a compact source/outcome summary from an existing logs folder:
+
+```bash
+python3 lit_log_summary.py ./collected_papers/logs \
+  --output ./collected_papers/logs/service_summary.json
+```
+
+If the project is installed as a package, the same command is available as
+`lit-log-summary`.
+
 ## Safe First Run
 
 Use `--dry-run` to test draft parsing and query generation without making API
@@ -103,6 +113,16 @@ uv run lit-harvest \
   --output ./collected_papers \
   --metadata-only \
   --email you@example.com
+```
+
+Use `--no-abstract` to skip the abstract-only PDF fallback when no full PDF is
+available:
+
+```bash
+uv run lit-harvest \
+  --draft ./seed_paper.md \
+  --output ./collected_papers \
+  --no-abstract
 ```
 
 ## Citation-Seed Harvest
@@ -198,6 +218,7 @@ Important config fields:
 - `logs`: folder for `manifest.json`, `download_log.json`, and optional reports
 - `candidates_json`: post-search checkpoint path, defaulting to `logs/candidates.json`
 - `refresh_candidates`: ignore an existing candidate checkpoint and run searches again
+- `retry_failed_downloads`: retry candidates marked failed in `download_log.json`
 - `max_queries`: maximum number of search queries generated from the draft
 - `extra_queries`: optional hand-curated seed queries searched before generated draft queries
 - `top_k_per_query`: maximum results per source per query
@@ -212,9 +233,12 @@ Important config fields:
 - `web_search_queries_per_candidate`: maximum exact-title/DOI web queries per candidate
 - `brave_search_api_key`: optional Brave Search API key
 - `serpapi_api_key`: optional SerpAPI key for Google-style search results
+- `download_workers`: number of candidates to resolve/download in parallel
+- `progress`: show a terminal progress meter during PDF download
 - `max_pdf_mb`: maximum accepted PDF size
 - `max_downloads`: maximum successful PDF downloads
 - `metadata_only`: search without downloading PDFs
+- `no_abstract`: skip abstract-only fallback PDFs when no full PDF is available
 - `csv_report`: write `candidates.csv`
 - `bibtex`: write `candidates.bib`
 
@@ -277,13 +301,23 @@ uv run lit-harvest \
 ```
 
 If `logs/candidates.json` already contains candidates, LitHarvest skips metadata
-search and continues with PDF resolution/download. To force a fresh candidate
-search:
+search and continues with PDF resolution/download. During download, LitHarvest
+also updates `logs/download_log.json` after each candidate completes. On rerun,
+saved documents and prior failures in that log are skipped so interrupted runs do
+not start from scratch. To force a fresh candidate search:
 
 ```bash
 uv run lit-harvest \
   --config config.local.json \
   --refresh-candidates
+```
+
+To retry prior failed downloads:
+
+```bash
+uv run lit-harvest \
+  --config config.local.json \
+  --retry-failed-downloads
 ```
 
 Increase network tolerance:
@@ -297,6 +331,22 @@ uv run lit-harvest \
   --backoff 2 \
   --rate-limit-delay 0.25
 ```
+
+Speed up PDF retries/downloads:
+
+```bash
+uv run lit-harvest \
+  --config config.local.json \
+  --download-workers 8 \
+  --timeout 12 \
+  --retries 1 \
+  --backoff 1
+```
+
+The download phase shows a terminal progress meter with processed candidates,
+rate, elapsed time, ETA, and status counts. Candidates already skipped from the
+download log are excluded from the active progress total. Disable it with
+`--no-progress`.
 
 Show detailed logs:
 
@@ -324,6 +374,7 @@ uv run lit-harvest \
 
 `download_log.json` contains a smaller download-focused record:
 
+- resumable per-candidate records keyed by filename/title/DOI
 - successful downloads
 - failed downloads and reasons
 - per-URL download attempts

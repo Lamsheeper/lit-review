@@ -1,3 +1,5 @@
 [console_scripts]
+lit-extract = lit_extract:main
 lit-harvest = lit_harvest:main
+lit-log-summary = lit_log_summary:main
 lit-synthesize = lit_synthesize:main

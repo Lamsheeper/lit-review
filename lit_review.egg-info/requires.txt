@@ -1,4 +1,5 @@
 pypdf>=5.0.0
 PyMuPDF>=1.24.0
+tqdm>=4.66.0
 
 [dev]

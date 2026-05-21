@@ -9,11 +9,16 @@ from unittest import mock
 
 from lit_synthesize import (
     build_index,
+    ChatResult,
     collect_paper_records,
     convert_pdfs_to_markdown,
+    llm_plan_goal,
+    llm_plan_taxonomy_goal,
     main,
     parse_args,
     search_index,
+    taxonomy_plan_goal,
+    write_llm_report,
     write_report,
 )
 
@@ -306,6 +311,252 @@ propaganda analysis and persuasion taxonomy validation.
             self.assertEqual(args.command, "write")
             self.assertEqual(args.api_key, "test-secret")
             self.assertEqual(args.model, "gemini-3-flash-preview")
+
+    def test_llm_plan_goal_repairs_malformed_json(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    '{"title": "Broken Plan", "questions": ["What is framing?", "unterminated]',
+                    json.dumps(
+                        {
+                            "title": "Repaired Plan",
+                            "questions": ["What is framing?", "What is stance?"],
+                            "outline": ["Evidence Map"],
+                        }
+                    ),
+                ]
+
+            def chat(self, messages, temperature=0.2, max_tokens=None, response_format=None):
+                self.calls.append(
+                    {
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "response_format": response_format,
+                    }
+                )
+                return self.responses.pop(0)
+
+        client = FakeClient()
+
+        with self.assertLogs("litsynth", level="WARNING"):
+            plan = llm_plan_goal(
+                "Build a persuasion taxonomy.",
+                client=client,
+                max_questions=1,
+            )
+
+        self.assertEqual(plan["title"], "Repaired Plan")
+        self.assertEqual(plan["questions"], ["What is framing?"])
+        self.assertEqual(plan["outline"], ["Evidence Map"])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0]["response_format"], {"type": "json_object"})
+        self.assertEqual(client.calls[1]["response_format"], {"type": "json_object"})
+
+    def test_write_llm_report_generates_sections_separately(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def chat(self, messages, temperature=0.2, max_tokens=None, response_format=None):
+                self.calls.append(
+                    {
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "response_format": response_format,
+                    }
+                )
+                return f"## Generated Section {len(self.calls)}\n\nClaim [paper1:p1:c1]."
+
+            def chat_result(
+                self,
+                messages,
+                temperature=0.2,
+                max_tokens=None,
+                response_format=None,
+            ):
+                return ChatResult(
+                    content=self.chat(messages, temperature, max_tokens, response_format),
+                    finish_reason="stop",
+                )
+
+        with tempfile.TemporaryDirectory() as temp:
+            output_path = Path(temp) / "report.md"
+            client = FakeClient()
+            report = write_llm_report(
+                goal_text="Build a persuasion taxonomy.",
+                plan={
+                    "title": "Taxonomy Report",
+                    "questions": ["What is persuasion?"],
+                    "outline": [
+                        "1. Introduction",
+                        "1.1 Scope",
+                        "2. Moral Framing",
+                    ],
+                },
+                evidence=[
+                    {
+                        "chunk_id": "paper1:p1:c1",
+                        "title": "Persuasion Paper",
+                        "year": 2024,
+                        "pages": [1],
+                        "question": "What is persuasion?",
+                        "text": "Persuasion techniques include fear appeals.",
+                        "score": -1.0,
+                    },
+                    {
+                        "chunk_id": "paper1:p2:c1",
+                        "title": "Moral Paper",
+                        "year": 2024,
+                        "pages": [2],
+                        "question": "What is moral framing?",
+                        "text": "Moral framing includes care and fairness.",
+                        "score": -2.0,
+                    },
+                ],
+                client=client,
+                output_path=output_path,
+                section_evidence=1,
+            )
+
+        self.assertTrue(report.startswith("# Taxonomy Report"))
+        self.assertEqual(len(client.calls), 3)
+        self.assertIn("Generated Section 1", report)
+        self.assertIn("Generated Section 2", report)
+        self.assertIn("Generated Section 3", report)
+        self.assertIn("Evidence Gaps", client.calls[2]["messages"][1]["content"])
+
+    def test_taxonomy_plan_uses_taxonomy_specific_outline(self):
+        plan = taxonomy_plan_goal(
+            "Extract a persuasion taxonomy with moral framing and emotional targeting.",
+            max_questions=4,
+        )
+
+        self.assertEqual(plan["mode"], "taxonomy")
+        self.assertEqual(len(plan["questions"]), 4)
+        outline = "\n".join(plan["outline"])
+        self.assertIn("Category 1: Persuasion Techniques", outline)
+        self.assertIn("Category 2: Moral Framing", outline)
+        self.assertIn("Category 3: Emotional and Affective Targeting", outline)
+
+    def test_llm_taxonomy_plan_uses_model_questions_with_fixed_outline(self):
+        class FakeClient:
+            def chat(self, messages, temperature=0.2, max_tokens=None, response_format=None):
+                return json.dumps(
+                    {
+                        "questions": [
+                            "What named propaganda techniques recur across datasets?",
+                            "How are moral frames operationalized?",
+                        ]
+                    }
+                )
+
+        plan = llm_plan_taxonomy_goal(
+            "Extract a persuasion taxonomy with moral framing and emotional targeting.",
+            client=FakeClient(),
+            max_questions=3,
+        )
+
+        self.assertEqual(plan["question_source"], "llm")
+        self.assertEqual(
+            plan["questions"][0],
+            "What named propaganda techniques recur across datasets?",
+        )
+        outline = "\n".join(plan["outline"])
+        self.assertIn("Category 1: Persuasion Techniques", outline)
+
+    def test_taxonomy_section_prompt_requests_feature_table(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def chat(self, messages, temperature=0.2, max_tokens=None, response_format=None):
+                self.calls.append(messages[1]["content"])
+                return "## Category 1: Persuasion Techniques\n\n| Feature name | Evidence |\n|---|---|\n"
+
+            def chat_result(
+                self,
+                messages,
+                temperature=0.2,
+                max_tokens=None,
+                response_format=None,
+            ):
+                return ChatResult(
+                    content=self.chat(messages, temperature, max_tokens, response_format),
+                    finish_reason="stop",
+                )
+
+        with tempfile.TemporaryDirectory() as temp:
+            client = FakeClient()
+            write_llm_report(
+                goal_text="Extract a persuasion taxonomy.",
+                plan={
+                    "title": "Taxonomy",
+                    "questions": ["What persuasion techniques are used?"],
+                    "outline": ["2. Category 1: Persuasion Techniques"],
+                },
+                evidence=[
+                    {
+                        "chunk_id": "paper1:p1:c1",
+                        "title": "Persuasion Paper",
+                        "year": 2024,
+                        "pages": [1],
+                        "question": "What persuasion techniques are used?",
+                        "text": "Loaded language is a propaganda technique.",
+                        "score": -1.0,
+                    }
+                ],
+                client=client,
+                output_path=Path(temp) / "report.md",
+            )
+
+        self.assertIn("Build a taxonomy table for persuasion techniques", client.calls[0])
+        self.assertIn("Parent group", client.calls[0])
+        self.assertIn("Feature name", client.calls[0])
+
+    def test_write_llm_report_continues_truncated_sections(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_result(self, messages, temperature=0.2, max_tokens=None, response_format=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ChatResult(
+                        content="## 1. Taxonomy Design Principles\n\n- Partial",
+                        finish_reason="length",
+                    )
+                return ChatResult(content="- continued [paper1:p1:c1].", finish_reason="stop")
+
+        with tempfile.TemporaryDirectory() as temp:
+            client = FakeClient()
+            report = write_llm_report(
+                goal_text="Extract a persuasion taxonomy.",
+                plan={
+                    "title": "Taxonomy",
+                    "questions": ["What evidence exists?"],
+                    "outline": ["1. Taxonomy Design Principles"],
+                },
+                evidence=[
+                    {
+                        "chunk_id": "paper1:p1:c1",
+                        "title": "Persuasion Paper",
+                        "year": 2024,
+                        "pages": [1],
+                        "question": "What evidence exists?",
+                        "text": "Taxonomies require operational boundaries.",
+                        "score": -1.0,
+                    }
+                ],
+                client=client,
+                output_path=Path(temp) / "report.md",
+            )
+
+        self.assertEqual(client.calls, 3)
+        self.assertIn("Partial", report)
+        self.assertIn("continued", report)
 
 
 if __name__ == "__main__":

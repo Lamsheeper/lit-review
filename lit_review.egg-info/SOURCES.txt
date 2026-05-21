@@ -1,5 +1,8 @@
 README.md
+lit_extract.py
 lit_harvest.py
+lit_log_summary.py
+lit_pdf_service.py
 lit_synthesize.py
 pyproject.toml
 lit_review.egg-info/PKG-INFO
