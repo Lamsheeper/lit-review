@@ -2,6 +2,7 @@ import unittest
 
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
 
 from lit_harvest import (
     Candidate,
@@ -12,18 +13,27 @@ from lit_harvest import (
     WebSearchProvider,
     WebSearchResult,
     build_pdf_filename,
+    build_direct_pdf_citation_content,
+    build_pymupdf_markdown_citation_content,
     build_search_queries,
     build_web_pdf_queries,
     combine_search_queries,
     configured_search_queries,
     candidate_matches_keywords,
+    candidates_from_citation_extractions,
+    citation_match_reason,
+    extracted_reference_to_candidate,
     extract_pdf_urls_from_html,
     extract_keywords,
     inferred_pdf_urls,
     is_saved_document_status,
     load_candidate_cache,
+    load_config,
     merge_candidates,
     normalize_doi,
+    parse_args,
+    parse_citation_llm_json,
+    validate_citation_bibliography,
     write_candidate_cache,
 )
 
@@ -320,6 +330,208 @@ class LitHarvestCoreTests(unittest.TestCase):
             "propaganda technique classification rhetorical strategy taxonomy",
         )
         self.assertLessEqual(len(combined), 3)
+
+    def test_citation_schema_validation_and_malformed_json(self):
+        valid = {
+            "paper_id": "seed",
+            "references": [
+                {
+                    "ref_id": "R001",
+                    "raw_reference": "Ada Lovelace. A Study. 2024.",
+                    "authors": ["Ada Lovelace"],
+                    "title": "A Study",
+                    "year": 2024,
+                    "venue": "Journal",
+                    "doi": "10.1000/test",
+                    "arxiv_id": None,
+                    "url": None,
+                }
+            ],
+        }
+
+        self.assertEqual(validate_citation_bibliography(valid), [])
+        parsed, errors = parse_citation_llm_json("{not json", "seed")
+
+        self.assertEqual(parsed, {"paper_id": "seed", "references": []})
+        self.assertTrue(errors)
+
+    def test_direct_pdf_citation_content_uses_pdf_file_input(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        pdf_path = tmp_dir / "core.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 test")
+
+        content, metadata = build_direct_pdf_citation_content(pdf_path, "core")
+
+        self.assertEqual(content[0]["type"], "input_text")
+        self.assertEqual(content[1]["type"], "input_file")
+        self.assertEqual(content[1]["filename"], "core.pdf")
+        self.assertEqual(content[1]["file_data"], "JVBERi0xLjQgdGVzdA==")
+        self.assertEqual(metadata["pdf_bytes"], len(b"%PDF-1.4 test"))
+
+    def test_pymupdf_markdown_citation_content_truncates_text(self):
+        pdf_path = Path(tempfile.mkdtemp()) / "core.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 test")
+
+        with patch(
+            "lit_harvest.extract_pdf_text_for_citations",
+            return_value=("Reference text that should be truncated", 3),
+        ):
+            content, metadata = build_pymupdf_markdown_citation_content(
+                pdf_path,
+                "core",
+                max_text_chars=14,
+            )
+
+        self.assertEqual(content[0]["type"], "input_text")
+        self.assertIn("truncated to 14 characters", content[0]["text"])
+        self.assertIn("Reference text", content[0]["text"])
+        self.assertEqual(metadata["num_pages"], 3)
+        self.assertTrue(metadata["text_truncated"])
+
+    def test_extracted_reference_to_candidate_handles_identifiers_and_url(self):
+        reference = {
+            "ref_id": "R001",
+            "raw_reference": "Lovelace A. A Study. 2024.",
+            "authors": ["Ada Lovelace"],
+            "title": "A Study",
+            "year": 2024,
+            "venue": "Journal",
+            "doi": "https://doi.org/10.1000/TEST.",
+            "arxiv_id": "arXiv:2301.12345",
+            "url": "https://example.org/paper.pdf",
+        }
+
+        candidate = extracted_reference_to_candidate(
+            reference,
+            core_pdf="core.pdf",
+            paper_id="core",
+        )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.title, "A Study")
+        self.assertEqual(candidate.doi, "10.1000/test")
+        self.assertEqual(candidate.source_ids["citation:arxiv"], "2301.12345")
+        self.assertIn("https://example.org/paper.pdf", candidate.candidate_pdf_urls)
+        self.assertEqual(candidate.discovered_via[0]["ref_id"], "R001")
+
+    def test_citation_extractions_dedupe_by_arxiv(self):
+        extraction = {
+            "core_pdf": "core.pdf",
+            "paper_id": "core",
+            "references": [
+                {
+                    "ref_id": "R001",
+                    "raw_reference": "First",
+                    "authors": [],
+                    "title": "One Title",
+                    "year": None,
+                    "venue": None,
+                    "doi": None,
+                    "arxiv_id": "2301.12345",
+                    "url": None,
+                },
+                {
+                    "ref_id": "R002",
+                    "raw_reference": "Second",
+                    "authors": [],
+                    "title": "Different Title",
+                    "year": None,
+                    "venue": None,
+                    "doi": None,
+                    "arxiv_id": "https://arxiv.org/abs/2301.12345",
+                    "url": None,
+                },
+            ],
+        }
+
+        candidates = merge_candidates(candidates_from_citation_extractions([extraction]))
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(len(candidates[0].discovered_via), 2)
+
+    def test_citation_match_reason_accepts_exact_and_rejects_weak_matches(self):
+        seed = Candidate(
+            title="Persuasion Techniques in Propaganda Detection",
+            authors=["Ada Lovelace"],
+            year=2024,
+            doi="10.1000/test",
+        )
+        doi_match = Candidate(
+            title="Other Title",
+            authors=["Different Person"],
+            year=1999,
+            doi="https://doi.org/10.1000/TEST",
+        )
+        title_match = Candidate(
+            title="Persuasion Techniques in Propaganda Detection",
+            authors=[],
+            year=None,
+        )
+        weak_match = Candidate(
+            title="A General Survey of Media",
+            authors=["Ada Lovelace"],
+            year=2024,
+        )
+
+        self.assertEqual(citation_match_reason(seed, doi_match), "doi")
+        self.assertEqual(citation_match_reason(seed, title_match), "title")
+        self.assertIsNone(citation_match_reason(seed, weak_match))
+
+    def test_citation_mode_config_validation(self):
+        args = parse_args(
+            [
+                "--harvest-mode",
+                "citations",
+                "--core-pdf",
+                "seed.pdf",
+                "--output",
+                "out",
+                "--llm-api-key",
+                "secret",
+            ]
+        )
+        config = load_config(args)
+
+        self.assertEqual(config["harvest_mode"], "citations")
+        self.assertEqual(config["core_pdf"], ["seed.pdf"])
+        self.assertFalse(config["allow_abstract_fallback"])
+
+        with self.assertRaises(ValueError):
+            load_config(parse_args(["--harvest-mode", "citations", "--output", "out"]))
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        config_path = tmp_dir / "bad_config.json"
+        config_path.write_text(
+            """{
+              "harvest_mode": "citations",
+              "core_pdf": ["seed.pdf"],
+              "output": "out",
+              "citation_extractor": "pdf_images"
+            }""",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            load_config(parse_args(["--config", str(config_path)]))
+
+    def test_downloader_can_disable_abstract_fallback(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        candidate = Candidate(
+            title="Abstract-Only Paper",
+            authors=["Test Author"],
+            abstract="This is the abstract text.",
+        )
+        downloader = PdfDownloader(
+            HttpClient(),
+            tmp_dir,
+            allow_abstract_fallback=False,
+        )
+
+        result = downloader.download(candidate, [])
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(candidate.download["status"], "failed")
+        self.assertEqual(list(tmp_dir.glob("*.pdf")), [])
 
 
 if __name__ == "__main__":

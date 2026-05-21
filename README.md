@@ -4,10 +4,11 @@ Pipeline for academic literature review.
 
 ## LitHarvest
 
-LitHarvest is a draft-to-PDF literature collection tool. Given a plain-text or
-Markdown draft, it extracts search terms, queries scholarly metadata APIs, finds
-open or directly downloadable PDFs when available, downloads them to a local
-folder, and writes machine-readable logs for downstream processing.
+LitHarvest is a literature collection tool. It can start from a plain-text or
+Markdown draft, extract search terms, query scholarly metadata APIs, and
+download open PDFs. It can also start from a small set of core PDFs, extract
+their reference lists with an LLM, resolve those cited papers through exact
+metadata lookups, and download reachable open PDFs.
 
 LitHarvest does not scrape Google Scholar, bypass paywalls, solve CAPTCHAs, or
 automate browser sessions. It uses API-first sources and only downloads PDFs
@@ -26,7 +27,7 @@ Supported search and resolution sources:
 - Python 3.10 or newer
 - `uv` for project/environment management
 - Internet access for live API searches and PDF downloads
-- A draft file in `.txt` or `.md` format
+- A draft file in `.txt` or `.md` format, or core PDFs for citation-seeded harvests
 
 LitHarvest itself uses only the Python standard library. The `uv` project
 installs `pypdf` so LitSynth can convert PDFs to text Markdown.
@@ -104,6 +105,35 @@ uv run lit-harvest \
   --email you@example.com
 ```
 
+## Citation-Seed Harvest
+
+Use citation mode when you already have core papers as PDFs and want a one-hop
+collection of the papers they cite. Citation extraction uses an LLM, then
+LitHarvest resolves each extracted reference with exact scholarly lookups such
+as OpenAlex before attempting open PDF downloads.
+
+```bash
+uv run python -m lit_harvest \
+  --harvest-mode citations \
+  --core-pdf ./core_papers/paper1.pdf \
+  --core-pdf-dir ./more_core_papers \
+  --citation-extractor direct_pdf \
+  --llm-provider gemini \
+  --output ./citation_collected_papers \
+  --email you@example.com \
+  --unpaywall-email you@example.com
+```
+
+Supported citation extractors are:
+
+- `direct_pdf`: send each core PDF directly to the LLM.
+- `pymupdf_markdown`: extract text with PyMuPDF, then send that text to the LLM.
+
+Citation mode writes extracted reference artifacts under
+`logs/citation_extractions/` and defaults to real PDF downloads only. It will
+not create abstract-only placeholder PDFs unless `--allow-abstract-fallback` is
+set.
+
 ## Recommended Full Run
 
 For better open-access PDF resolution, provide an Unpaywall email. Semantic
@@ -158,7 +188,12 @@ uv run lit-harvest \
 
 Important config fields:
 
+- `harvest_mode`: `draft` or `citations`
 - `draft`: input draft path
+- `core_pdf`: one or more core PDFs for citation mode
+- `core_pdf_dir`: folder of core PDFs for citation mode
+- `citation_extractor`: `direct_pdf` or `pymupdf_markdown`
+- `llm_provider`, `llm_model`, `llm_api_key`: citation extraction LLM settings
 - `output`: folder for downloaded PDFs
 - `logs`: folder for `manifest.json`, `download_log.json`, and optional reports
 - `candidates_json`: post-search checkpoint path, defaulting to `logs/candidates.json`

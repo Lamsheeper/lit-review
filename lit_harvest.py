@@ -9,6 +9,7 @@ APIs expose them, and records every candidate and download outcome.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import dataclasses
 import gzip
@@ -36,6 +37,14 @@ from typing import Any
 VERSION = "0.1.0"
 USER_AGENT_NAME = f"LitHarvest/{VERSION}"
 DEFAULT_SOURCES = ["openalex", "semantic_scholar", "crossref", "europe_pmc"]
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+GEMINI_GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+HARVEST_MODES = ("draft", "citations")
+CITATION_EXTRACTORS = ("direct_pdf", "pymupdf_markdown")
+LLM_PROVIDERS = ("gemini", "openai")
+DEFAULT_LLM_PROVIDER = "gemini"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 LOGGER = logging.getLogger("litharvest")
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*")
@@ -277,6 +286,17 @@ class Candidate:
     pdf_resolution: dict[str, Any] = field(default_factory=dict)
     download: dict[str, Any] = field(default_factory=dict)
     matched_keywords: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CitationLLMCallResult:
+    parsed: dict[str, Any]
+    response: dict[str, Any]
+    raw_text: str
+    input_tokens: int | None
+    output_tokens: int | None
+    schema_valid: bool
+    validation_errors: list[str]
 
 
 def utc_now() -> str:
@@ -1107,6 +1127,486 @@ def inferred_pdf_urls(candidate: Candidate) -> list[str]:
     return dedupe_preserve(urls)
 
 
+CITATION_REFERENCE_KEYS = [
+    "ref_id",
+    "raw_reference",
+    "authors",
+    "title",
+    "year",
+    "venue",
+    "doi",
+    "arxiv_id",
+    "url",
+]
+
+
+def nullable_schema_type(type_name: str) -> dict[str, Any]:
+    return {"anyOf": [{"type": type_name}, {"type": "null"}]}
+
+
+CITATION_BIBLIOGRAPHY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "paper_id": {"type": "string"},
+        "references": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "ref_id": {"type": "string"},
+                    "raw_reference": nullable_schema_type("string"),
+                    "authors": {"type": "array", "items": {"type": "string"}},
+                    "title": nullable_schema_type("string"),
+                    "year": nullable_schema_type("integer"),
+                    "venue": nullable_schema_type("string"),
+                    "doi": nullable_schema_type("string"),
+                    "arxiv_id": nullable_schema_type("string"),
+                    "url": nullable_schema_type("string"),
+                },
+                "required": CITATION_REFERENCE_KEYS,
+            },
+        },
+    },
+    "required": ["paper_id", "references"],
+}
+
+CITATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "name": "citation_extraction",
+    "strict": True,
+    "schema": CITATION_BIBLIOGRAPHY_SCHEMA,
+}
+
+GEMINI_CITATION_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "propertyOrdering": ["paper_id", "references"],
+    "properties": {
+        "paper_id": {"type": "string"},
+        "references": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "propertyOrdering": CITATION_REFERENCE_KEYS,
+                "properties": {
+                    "ref_id": {"type": "string"},
+                    "raw_reference": {"type": ["string", "null"]},
+                    "authors": {"type": "array", "items": {"type": "string"}},
+                    "title": {"type": ["string", "null"]},
+                    "year": {"type": ["integer", "null"]},
+                    "venue": {"type": ["string", "null"]},
+                    "doi": {"type": ["string", "null"]},
+                    "arxiv_id": {"type": ["string", "null"]},
+                    "url": {"type": ["string", "null"]},
+                },
+                "required": CITATION_REFERENCE_KEYS,
+            },
+        },
+    },
+    "required": ["paper_id", "references"],
+}
+
+CITATION_EXTRACTION_PROMPT = """\
+You extract bibliography/reference-list entries from academic papers.
+
+Rules:
+- Return only JSON matching the requested schema.
+- Extract entries from the bibliography, references, or works-cited section.
+- Do not use Semantic Scholar, Crossref, OpenAlex, DBLP, search engines, or any external citation database.
+- Use only the supplied PDF or extracted page text.
+- Use null for unknown scalar fields and [] for unknown authors.
+- Preserve the raw reference text as faithfully as possible in raw_reference.
+- Use stable reference IDs R001, R002, R003, ... in document order.
+- Do not include in-text citations unless they are part of the reference list.
+"""
+
+
+def safe_pdf_stem(path: Path) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", path.stem).strip("._-")
+    return stem or "paper"
+
+
+def make_citation_user_prompt(paper_id: str, source_description: str) -> str:
+    return (
+        f"paper_id: {paper_id}\n"
+        f"source: {source_description}\n\n"
+        "Extract the bibliography/reference list for this paper into the JSON schema."
+    )
+
+
+def empty_citation_bibliography(paper_id: str) -> dict[str, Any]:
+    return {"paper_id": paper_id, "references": []}
+
+
+def validate_citation_bibliography(data: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return ["top-level output must be an object"]
+
+    extra_top_level = sorted(set(data) - {"paper_id", "references"})
+    if extra_top_level:
+        errors.append(f"top-level output has extra keys: {', '.join(extra_top_level)}")
+
+    if not isinstance(data.get("paper_id"), str):
+        errors.append("paper_id must be a string")
+
+    references = data.get("references")
+    if not isinstance(references, list):
+        errors.append("references must be a list")
+        return errors
+
+    nullable_strings = {"raw_reference", "title", "venue", "doi", "arxiv_id", "url"}
+    for index, reference in enumerate(references):
+        prefix = f"references[{index}]"
+        if not isinstance(reference, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        extra_keys = sorted(set(reference) - set(CITATION_REFERENCE_KEYS))
+        if extra_keys:
+            errors.append(f"{prefix} has extra keys: {', '.join(extra_keys)}")
+        missing = [key for key in CITATION_REFERENCE_KEYS if key not in reference]
+        if missing:
+            errors.append(f"{prefix} missing keys: {', '.join(missing)}")
+
+        if not isinstance(reference.get("ref_id"), str):
+            errors.append(f"{prefix}.ref_id must be a string")
+
+        authors = reference.get("authors")
+        if not isinstance(authors, list) or not all(isinstance(author, str) for author in authors):
+            errors.append(f"{prefix}.authors must be a list of strings")
+
+        year = reference.get("year")
+        if year is not None and (not isinstance(year, int) or isinstance(year, bool)):
+            errors.append(f"{prefix}.year must be an integer or null")
+
+        for key in nullable_strings:
+            value = reference.get(key)
+            if value is not None and not isinstance(value, str):
+                errors.append(f"{prefix}.{key} must be a string or null")
+
+    return errors
+
+
+def parse_citation_llm_json(raw_text: str, paper_id: str) -> tuple[dict[str, Any], list[str]]:
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return empty_citation_bibliography(paper_id), [f"model output was not valid JSON: {exc}"]
+
+    errors = validate_citation_bibliography(parsed)
+    if errors:
+        return parsed if isinstance(parsed, dict) else empty_citation_bibliography(paper_id), errors
+    return parsed, []
+
+
+def llm_provider_default_model(provider: str) -> str:
+    if provider == "gemini":
+        return DEFAULT_GEMINI_MODEL
+    if provider == "openai":
+        return DEFAULT_OPENAI_MODEL
+    raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+def llm_provider_env_api_key(provider: str) -> str | None:
+    if provider == "gemini":
+        return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if provider == "openai":
+        return os.getenv("OPENAI_API_KEY")
+    raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+def retry_after_delay(exc: urllib.error.HTTPError, fallback: float) -> float:
+    retry_after = exc.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(float(retry_after), fallback)
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def post_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float,
+    retries: int,
+    sleep_seconds: float,
+) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    request_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT_NAME,
+    }
+    request_headers.update(headers)
+
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            error_body = exc.read().decode("utf-8", errors="replace")
+            if exc.code in {429, 500, 502, 503, 504} and attempt < retries:
+                time.sleep(retry_after_delay(exc, sleep_seconds * (attempt + 1)))
+                continue
+            raise RuntimeError(f"LLM request failed ({exc.code}): {error_body}") from exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(sleep_seconds * (attempt + 1))
+                continue
+            raise RuntimeError(f"LLM request failed: {exc}") from exc
+
+    raise RuntimeError(f"LLM request failed: {last_error}")
+
+
+def extract_openai_output_text(response: dict[str, Any]) -> str:
+    output_text = response.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    parts: list[str] = []
+    refusals: list[str] = []
+    for item in response.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            content_type = content.get("type")
+            if content_type in {"output_text", "text"} and isinstance(content.get("text"), str):
+                parts.append(content["text"])
+            elif content_type == "refusal" and isinstance(content.get("refusal"), str):
+                refusals.append(content["refusal"])
+
+    if refusals:
+        raise RuntimeError(f"Model refusal: {' '.join(refusals)}")
+    if not parts:
+        raise RuntimeError("OpenAI response did not contain output text.")
+    return "\n".join(parts)
+
+
+def openai_usage_tokens(response: dict[str, Any]) -> tuple[int | None, int | None]:
+    usage = response.get("usage") or {}
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if not isinstance(input_tokens, int):
+        input_tokens = None
+    if not isinstance(output_tokens, int):
+        output_tokens = None
+    return input_tokens, output_tokens
+
+
+def gemini_usage_tokens(response: dict[str, Any]) -> tuple[int | None, int | None]:
+    usage = response.get("usageMetadata") or {}
+    input_tokens = usage.get("promptTokenCount")
+    output_tokens = usage.get("candidatesTokenCount")
+    if not isinstance(input_tokens, int):
+        input_tokens = None
+    if not isinstance(output_tokens, int):
+        output_tokens = None
+    return input_tokens, output_tokens
+
+
+def gemini_content_part(item: dict[str, Any]) -> dict[str, Any]:
+    item_type = item.get("type")
+    if item_type == "input_text":
+        return {"text": item.get("text") or ""}
+    if item_type == "input_file":
+        return {
+            "inline_data": {
+                "mime_type": "application/pdf",
+                "data": item.get("file_data") or "",
+            }
+        }
+    raise RuntimeError(f"Unsupported Gemini citation input item: {item_type}")
+
+
+def extract_gemini_output_text(response: dict[str, Any]) -> str:
+    texts: list[str] = []
+    for candidate in response.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content") or {}
+        for part in content.get("parts", []) or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+    if texts:
+        return "\n".join(texts)
+    prompt_feedback = response.get("promptFeedback")
+    if prompt_feedback:
+        raise RuntimeError(f"Gemini prompt feedback: {prompt_feedback}")
+    raise RuntimeError("Gemini response did not contain output text.")
+
+
+def call_openai_citation_extraction(
+    content: list[dict[str, Any]],
+    config: dict[str, Any],
+    paper_id: str,
+) -> CitationLLMCallResult:
+    payload: dict[str, Any] = {
+        "model": config["llm_model"],
+        "input": [
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": CITATION_EXTRACTION_PROMPT}],
+            },
+            {"role": "user", "content": content},
+        ],
+        "text": {"format": CITATION_RESPONSE_FORMAT},
+    }
+    if config.get("max_output_tokens"):
+        payload["max_output_tokens"] = int(config["max_output_tokens"])
+
+    response = post_json(
+        OPENAI_RESPONSES_URL,
+        payload,
+        headers={"Authorization": f"Bearer {config['llm_api_key']}"},
+        timeout=float(config["timeout"]),
+        retries=int(config["retries"]),
+        sleep_seconds=float(config["backoff"]),
+    )
+    raw_text = extract_openai_output_text(response)
+    parsed, validation_errors = parse_citation_llm_json(raw_text, paper_id)
+    input_tokens, output_tokens = openai_usage_tokens(response)
+    return CitationLLMCallResult(
+        parsed=parsed,
+        response=response,
+        raw_text=raw_text,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        schema_valid=not validation_errors,
+        validation_errors=validation_errors,
+    )
+
+
+def call_gemini_citation_extraction(
+    content: list[dict[str, Any]],
+    config: dict[str, Any],
+    paper_id: str,
+) -> CitationLLMCallResult:
+    parts = [{"text": CITATION_EXTRACTION_PROMPT}]
+    parts.extend(gemini_content_part(item) for item in content)
+    generation_config: dict[str, Any] = {
+        "responseMimeType": "application/json",
+        "responseJsonSchema": GEMINI_CITATION_RESPONSE_SCHEMA,
+    }
+    if config.get("max_output_tokens"):
+        generation_config["maxOutputTokens"] = int(config["max_output_tokens"])
+
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": generation_config,
+    }
+    model_name = str(config["llm_model"]).removeprefix("models/")
+    url = (
+        f"{GEMINI_GENERATE_URL.format(model=urllib.parse.quote(model_name, safe=''))}"
+        f"?{urllib.parse.urlencode({'key': config['llm_api_key']})}"
+    )
+    response = post_json(
+        url,
+        payload,
+        headers={},
+        timeout=float(config["timeout"]),
+        retries=int(config["retries"]),
+        sleep_seconds=float(config["backoff"]),
+    )
+    raw_text = extract_gemini_output_text(response)
+    parsed, validation_errors = parse_citation_llm_json(raw_text, paper_id)
+    input_tokens, output_tokens = gemini_usage_tokens(response)
+    return CitationLLMCallResult(
+        parsed=parsed,
+        response=response,
+        raw_text=raw_text,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        schema_valid=not validation_errors,
+        validation_errors=validation_errors,
+    )
+
+
+def call_llm_citation_extraction(
+    content: list[dict[str, Any]],
+    config: dict[str, Any],
+    paper_id: str,
+) -> CitationLLMCallResult:
+    provider = config["llm_provider"]
+    if provider == "gemini":
+        return call_gemini_citation_extraction(content, config, paper_id)
+    if provider == "openai":
+        return call_openai_citation_extraction(content, config, paper_id)
+    raise RuntimeError(f"Unsupported LLM provider: {provider}")
+
+
+def require_pymupdf():
+    try:
+        import fitz  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("PyMuPDF is required for citation extractor pymupdf_markdown.") from exc
+    return fitz
+
+
+def extract_pdf_text_for_citations(pdf_path: Path) -> tuple[str, int]:
+    fitz = require_pymupdf()
+    pages: list[str] = []
+    with fitz.open(pdf_path) as document:
+        page_count = document.page_count
+        for page_number, page in enumerate(document, start=1):
+            text = page.get_text("text", sort=True)
+            pages.append(f"# Page {page_number}\n\n{text.strip()}\n")
+    return "\n".join(pages), page_count
+
+
+def maybe_truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def build_direct_pdf_citation_content(pdf_path: Path, paper_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    pdf_data = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
+    content = [
+        {"type": "input_text", "text": make_citation_user_prompt(paper_id, "the attached PDF file")},
+        {"type": "input_file", "filename": pdf_path.name, "file_data": pdf_data},
+    ]
+    metadata = {
+        "source_description": "the attached PDF file",
+        "pdf_bytes": pdf_path.stat().st_size,
+    }
+    return content, metadata
+
+
+def build_pymupdf_markdown_citation_content(
+    pdf_path: Path,
+    paper_id: str,
+    max_text_chars: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    markdown, page_count = extract_pdf_text_for_citations(pdf_path)
+    text_for_model, truncated = maybe_truncate_text(markdown, max_text_chars)
+    prompt = make_citation_user_prompt(paper_id, "PyMuPDF-extracted page text")
+    if truncated:
+        prompt += (
+            f"\n\nNote: the extracted text was truncated to {max_text_chars} characters "
+            "by LitHarvest before citation extraction."
+        )
+    content = [{"type": "input_text", "text": f"{prompt}\n\n{text_for_model}"}]
+    metadata = {
+        "source_description": "PyMuPDF-extracted page text",
+        "num_pages": page_count,
+        "text_chars_total": len(markdown),
+        "text_chars_sent": len(text_for_model),
+        "text_truncated": truncated,
+        "markdown": markdown,
+    }
+    return content, metadata
+
+
 def quote_search_phrase(value: str) -> str:
     escaped = value.replace('"', " ").strip()
     return f'"{normalize_whitespace(escaped)}"'
@@ -1813,6 +2313,351 @@ def build_clients(config: dict[str, Any], http: HttpClient) -> list[SearchClient
     return clients
 
 
+def collect_core_pdfs(config: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    raw_core_pdfs = config.get("core_pdf") or []
+    if isinstance(raw_core_pdfs, str):
+        raw_core_pdfs = [raw_core_pdfs]
+    for value in raw_core_pdfs:
+        if value:
+            paths.append(Path(str(value)).expanduser())
+
+    core_pdf_dir = config.get("core_pdf_dir")
+    if core_pdf_dir:
+        directory = Path(str(core_pdf_dir)).expanduser()
+        if not directory.exists() or not directory.is_dir():
+            raise FileNotFoundError(f"Core PDF directory does not exist: {directory}")
+        paths.extend(sorted(directory.glob("*.pdf")))
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+
+    missing = [path for path in deduped if not path.exists() or not path.is_file()]
+    if missing:
+        formatted = ", ".join(str(path) for path in missing)
+        raise FileNotFoundError(f"Core PDF not found: {formatted}")
+    if not deduped:
+        raise ValueError("Citation harvest mode requires at least one --core-pdf or --core-pdf-dir PDF.")
+    return deduped
+
+
+def file_fingerprint(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "sha256": digest.hexdigest(),
+        "bytes": stat.st_size,
+    }
+
+
+def extract_citations_from_core_pdf(
+    pdf_path: Path,
+    logs_dir: Path,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    paper_id = safe_pdf_stem(pdf_path)
+    extractor = str(config["citation_extractor"])
+    artifact_dir = logs_dir / "citation_extractions" / paper_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    if extractor == "direct_pdf":
+        content, extraction_metadata = build_direct_pdf_citation_content(pdf_path, paper_id)
+    elif extractor == "pymupdf_markdown":
+        content, extraction_metadata = build_pymupdf_markdown_citation_content(
+            pdf_path,
+            paper_id,
+            int(config.get("max_text_chars") or 0),
+        )
+        markdown = str(extraction_metadata.pop("markdown"))
+        markdown_path = artifact_dir / "extracted_text.md"
+        markdown_path.write_text(markdown, encoding="utf-8")
+        extraction_metadata["markdown_path"] = str(markdown_path)
+    else:
+        raise ValueError(f"Unsupported citation extractor: {extractor}")
+
+    start = time.perf_counter()
+    call = call_llm_citation_extraction(content, config, paper_id)
+    elapsed = time.perf_counter() - start
+
+    output_path = artifact_dir / "references.json"
+    raw_response_path = artifact_dir / "response.json"
+    raw_text_path = artifact_dir / "response.txt"
+    metadata_path = artifact_dir / "metadata.json"
+    write_json(output_path, call.parsed)
+    write_json(raw_response_path, call.response)
+    raw_text_path.write_text(call.raw_text, encoding="utf-8")
+
+    metadata = {
+        "core_pdf": str(pdf_path),
+        "paper_id": paper_id,
+        "extractor": extractor,
+        "llm_provider": config["llm_provider"],
+        "llm_model": config["llm_model"],
+        "wall_clock_seconds": round(elapsed, 6),
+        "input_tokens": call.input_tokens,
+        "output_tokens": call.output_tokens,
+        "schema_valid": call.schema_valid,
+        "validation_errors": call.validation_errors,
+        "output_path": str(output_path),
+        "raw_response_path": str(raw_response_path),
+        "raw_text_path": str(raw_text_path),
+    }
+    metadata.update(extraction_metadata)
+    write_json(metadata_path, metadata)
+    metadata["metadata_path"] = str(metadata_path)
+
+    return {
+        "core_pdf": str(pdf_path),
+        "paper_id": paper_id,
+        "references": call.parsed.get("references", []),
+        "output": call.parsed,
+        "metadata": metadata,
+    }
+
+
+def extracted_reference_to_candidate(
+    reference: dict[str, Any],
+    *,
+    core_pdf: str,
+    paper_id: str,
+) -> Candidate | None:
+    raw_reference = reference.get("raw_reference")
+    raw_reference = normalize_whitespace(str(raw_reference)) if raw_reference else None
+    title = strip_markup(reference.get("title")) or raw_reference
+    if not title:
+        return None
+
+    authors = [
+        normalize_whitespace(str(author))
+        for author in ensure_list(reference.get("authors"))
+        if normalize_whitespace(str(author))
+    ]
+    doi = normalize_doi(reference.get("doi"))
+    url = clean_url(reference.get("url"))
+    arxiv_id = normalize_arxiv_id(reference.get("arxiv_id")) or normalize_arxiv_id(url)
+    pdf_urls: list[str] = []
+    landing_urls: list[str] = []
+    if looks_like_pdf_url(url):
+        add_url(pdf_urls, url)
+    else:
+        add_url(landing_urls, url)
+    add_doi_pdf_urls(pdf_urls, doi)
+    if arxiv_id:
+        add_identifier_pdf_urls(pdf_urls, arxiv_id, kind="arxiv")
+
+    source_ids: dict[str, str] = {}
+    if doi:
+        source_ids["citation:doi"] = doi
+    if arxiv_id:
+        source_ids["citation:arxiv"] = arxiv_id
+
+    return Candidate(
+        title=title,
+        authors=dedupe_preserve(authors),
+        year=safe_int(reference.get("year")),
+        doi=doi,
+        venue=strip_markup(reference.get("venue")),
+        landing_page_url=doi_to_url(doi) or (url if url and not looks_like_pdf_url(url) else None),
+        source_apis=["citation_extraction"],
+        source_ids=source_ids,
+        candidate_pdf_urls=dedupe_preserve(pdf_urls),
+        candidate_landing_page_urls=dedupe_preserve(landing_urls),
+        discovered_via=[
+            {
+                "source": "citation_extraction",
+                "core_pdf": core_pdf,
+                "paper_id": paper_id,
+                "ref_id": reference.get("ref_id"),
+                "raw_reference": raw_reference,
+            }
+        ],
+    )
+
+
+def candidates_from_citation_extractions(extractions: list[dict[str, Any]]) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    for extraction in extractions:
+        core_pdf = str(extraction.get("core_pdf") or "")
+        paper_id = str(extraction.get("paper_id") or "")
+        for reference in extraction.get("references") or []:
+            if not isinstance(reference, dict):
+                continue
+            candidate = extracted_reference_to_candidate(
+                reference,
+                core_pdf=core_pdf,
+                paper_id=paper_id,
+            )
+            if candidate:
+                candidates.append(candidate)
+    return candidates
+
+
+def candidate_arxiv_id(candidate: Candidate) -> str | None:
+    if candidate.doi and candidate.doi.lower().startswith("10.48550/arxiv."):
+        return normalize_arxiv_id(candidate.doi.split("arxiv.", 1)[1])
+    for key, value in candidate.source_ids.items():
+        if "arxiv" in key.lower():
+            arxiv_id = normalize_arxiv_id(value)
+            if arxiv_id:
+                return arxiv_id
+    return None
+
+
+def citation_lookup_query(candidate: Candidate) -> str | None:
+    if candidate.doi:
+        return candidate.doi
+    arxiv_id = candidate_arxiv_id(candidate)
+    if arxiv_id:
+        return f"arXiv:{arxiv_id}"
+    title = normalize_whitespace(candidate.title)
+    if not title:
+        return None
+    parts = [title]
+    if candidate.year:
+        parts.append(str(candidate.year))
+    if candidate.authors:
+        parts.append(candidate.authors[0])
+    return " ".join(parts)
+
+
+def first_author_last_name(candidate: Candidate) -> str | None:
+    if not candidate.authors:
+        return None
+    tokens = normalize_title(candidate.authors[0]).split()
+    if not tokens:
+        return None
+    return tokens[-1]
+
+
+def title_token_overlap_ratio(left: str, right: str) -> float:
+    left_tokens = set(content_tokens(left))
+    right_tokens = set(content_tokens(right))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+
+
+def citation_match_reason(seed: Candidate, result: Candidate) -> str | None:
+    if seed.doi and result.doi and normalize_doi(seed.doi) == normalize_doi(result.doi):
+        return "doi"
+
+    seed_arxiv = candidate_arxiv_id(seed)
+    result_arxiv = candidate_arxiv_id(result)
+    if seed_arxiv and result_arxiv and seed_arxiv.lower() == result_arxiv.lower():
+        return "arxiv"
+
+    seed_title = normalize_title(seed.title)
+    result_title = normalize_title(result.title)
+    if seed_title and result_title and seed_title == result_title:
+        return "title"
+
+    overlap = title_token_overlap_ratio(seed.title, result.title)
+    seed_author = first_author_last_name(seed)
+    result_author = first_author_last_name(result)
+    author_matches = bool(seed_author and result_author and seed_author == result_author)
+    year_matches = bool(seed.year and result.year and seed.year == result.year)
+    if overlap >= 0.8 and (author_matches or year_matches):
+        if author_matches and year_matches:
+            return "title_overlap_author_year"
+        if author_matches:
+            return "title_overlap_author"
+        return "title_overlap_year"
+    return None
+
+
+def enrich_citation_candidates(
+    candidates: list[Candidate],
+    clients: list[SearchClient],
+    config: dict[str, Any],
+) -> tuple[list[Candidate], list[dict[str, Any]]]:
+    enriched: list[Candidate] = []
+    lookup_errors: list[dict[str, Any]] = []
+    for candidate in candidates:
+        query_text = citation_lookup_query(candidate)
+        lookup_attempts: list[dict[str, Any]] = []
+        if query_text:
+            query = SearchQuery(bucket="citation_lookup", text=query_text, terms=content_tokens(candidate.title))
+            for client in clients:
+                try:
+                    results = client.search(
+                        query,
+                        top_k=int(config["top_k_per_query"]),
+                        year_from=config.get("year_from"),
+                        year_to=config.get("year_to"),
+                    )
+                    accepted = 0
+                    accepted_reasons: list[str] = []
+                    for result in results:
+                        reason = citation_match_reason(candidate, result)
+                        if not reason:
+                            continue
+                        accepted += 1
+                        accepted_reasons.append(reason)
+                        result.discovered_via = (
+                            candidate.discovered_via
+                            + result.discovered_via
+                            + [
+                                {
+                                    "source": "citation_lookup",
+                                    "client": client.name,
+                                    "query": query_text,
+                                    "match_reason": reason,
+                                }
+                            ]
+                        )
+                        merge_candidate_into(candidate, result)
+                    lookup_attempts.append(
+                        {
+                            "source": client.name,
+                            "query": query_text,
+                            "result_count": len(results),
+                            "accepted_count": accepted,
+                            "accepted_reasons": dedupe_preserve(accepted_reasons),
+                        }
+                    )
+                except Exception as exc:
+                    error = {
+                        "source": client.name,
+                        "query": query_text,
+                        "title": candidate.title,
+                        "reason": str(exc),
+                    }
+                    lookup_errors.append(error)
+                    lookup_attempts.append({**error, "status": "error"})
+        else:
+            lookup_attempts.append(
+                {
+                    "source": "citation_lookup",
+                    "status": "skipped",
+                    "reason": "No DOI, arXiv ID, title, or raw reference available.",
+                }
+            )
+
+        candidate.discovered_via.append(
+            {
+                "source": "citation_lookup",
+                "query": query_text,
+                "attempts": lookup_attempts,
+            }
+        )
+        enriched.append(candidate)
+
+    return merge_candidates(enriched), lookup_errors
+
+
 def normalize_source_name(source: str) -> str:
     return source.strip().lower().replace("-", "_")
 
@@ -1842,6 +2687,9 @@ def candidate_keys(candidate: Candidate) -> list[str]:
     keys: list[str] = []
     if candidate.doi:
         keys.append(f"doi:{candidate.doi}")
+    arxiv_id = candidate_arxiv_id(candidate)
+    if arxiv_id:
+        keys.append(f"arxiv:{arxiv_id.lower()}")
     title_key = normalize_title(candidate.title)
     if title_key:
         keys.append(f"title:{title_key}")
@@ -2092,11 +2940,13 @@ class PdfDownloader:
         output_dir: Path,
         max_pdf_mb: int = 80,
         force_download: bool = False,
+        allow_abstract_fallback: bool = True,
     ) -> None:
         self.http = http
         self.output_dir = output_dir
         self.max_bytes = max_pdf_mb * 1024 * 1024
         self.force_download = force_download
+        self.allow_abstract_fallback = allow_abstract_fallback
 
     def download(self, candidate: Candidate, urls: list[str]) -> dict[str, Any]:
         filename = build_pdf_filename(candidate)
@@ -2122,7 +2972,7 @@ class PdfDownloader:
             except Exception as exc:  # pragma: no cover - network defensive path
                 attempts.append({"url": url, "status": "failed", "reason": str(exc)})
 
-        if candidate.abstract:
+        if self.allow_abstract_fallback and candidate.abstract:
             try:
                 bytes_written = self._write_abstract_pdf(
                     destination,
@@ -2685,6 +3535,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             output_dir=output_dir,
             max_pdf_mb=int(config["max_pdf_mb"]),
             force_download=bool(config.get("force_download")),
+            allow_abstract_fallback=bool(config.get("allow_abstract_fallback", True)),
         )
 
         if config.get("metadata_only"):
@@ -2793,7 +3644,252 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def write_citation_candidate_cache(
+    path: Path,
+    *,
+    config: dict[str, Any],
+    core_pdfs: list[Path],
+    extractions: list[dict[str, Any]],
+    extraction_errors: list[dict[str, Any]],
+    lookup_errors: list[dict[str, Any]],
+    candidates: list[Candidate],
+) -> None:
+    payload = {
+        "project": "LitHarvest",
+        "version": VERSION,
+        "generated_at": utc_now(),
+        "stage": "citation_lookup_pre_download",
+        "config": redacted_config(config),
+        "core_pdfs": [file_fingerprint(path) for path in core_pdfs],
+        "extraction_count": len(extractions),
+        "extracted_reference_count": sum(
+            len(extraction.get("references") or []) for extraction in extractions
+        ),
+        "extraction_errors": extraction_errors,
+        "citation_lookup_errors": lookup_errors,
+        "candidate_count": len(candidates),
+        "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
+    }
+    write_json(path, payload)
+
+
+def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
+    output_dir = Path(config["output"]).expanduser()
+    logs_dir = Path(config.get("logs") or output_dir / "logs").expanduser()
+    candidates_json_path = resolve_candidates_json_path(config, logs_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    core_pdfs = collect_core_pdfs(config)
+    extractions: list[dict[str, Any]] = []
+    extraction_errors: list[dict[str, Any]] = []
+    lookup_errors: list[dict[str, Any]] = []
+    candidates: list[Candidate] = []
+    candidate_cache: dict[str, Any] = {
+        "path": str(candidates_json_path),
+        "status": "not_used",
+    }
+
+    if config.get("dry_run"):
+        LOGGER.info("Dry run requested; no citation extraction, API lookups, or downloads were attempted.")
+        candidate_cache["status"] = "not_used_dry_run"
+    else:
+        if not config.get("llm_api_key"):
+            provider = config.get("llm_provider")
+            if provider == "gemini":
+                raise ValueError(
+                    "GEMINI_API_KEY or GOOGLE_API_KEY is required for citation extraction. "
+                    "Set it in the environment or pass --llm-api-key."
+                )
+            raise ValueError(
+                "OPENAI_API_KEY is required for citation extraction. "
+                "Set it in the environment or pass --llm-api-key."
+            )
+
+        for pdf_path in core_pdfs:
+            try:
+                LOGGER.info("Extracting citations from %s", pdf_path)
+                extractions.append(extract_citations_from_core_pdf(pdf_path, logs_dir, config))
+            except Exception as exc:
+                LOGGER.warning("Citation extraction failed for %s: %s", pdf_path, exc)
+                extraction_errors.append(
+                    {
+                        "core_pdf": str(pdf_path),
+                        "paper_id": safe_pdf_stem(pdf_path),
+                        "reason": str(exc),
+                    }
+                )
+
+        candidates = merge_candidates(candidates_from_citation_extractions(extractions))
+        LOGGER.info("Built %d deduplicated citation candidates.", len(candidates))
+
+        http = HttpClient(
+            timeout=float(config["timeout"]),
+            retries=int(config["retries"]),
+            backoff=float(config["backoff"]),
+            rate_limit_delay=float(config["rate_limit_delay"]),
+            email=config.get("email"),
+        )
+        clients = build_clients(config, http)
+        candidates, lookup_errors = enrich_citation_candidates(candidates, clients, config)
+        write_citation_candidate_cache(
+            candidates_json_path,
+            config=config,
+            core_pdfs=core_pdfs,
+            extractions=extractions,
+            extraction_errors=extraction_errors,
+            lookup_errors=lookup_errors,
+            candidates=candidates,
+        )
+        candidate_cache = {
+            "path": str(candidates_json_path),
+            "status": "saved",
+            "candidate_count": len(candidates),
+        }
+
+        web_searcher = build_web_pdf_searcher(config, http)
+        resolver = PdfResolver(
+            http,
+            unpaywall_email=config.get("unpaywall_email")
+            or os.getenv("UNPAYWALL_EMAIL")
+            or config.get("email"),
+            web_searcher=web_searcher,
+        )
+        downloader = PdfDownloader(
+            http,
+            output_dir=output_dir,
+            max_pdf_mb=int(config["max_pdf_mb"]),
+            force_download=bool(config.get("force_download")),
+            allow_abstract_fallback=bool(config.get("allow_abstract_fallback")),
+        )
+
+        if config.get("metadata_only"):
+            for candidate in candidates:
+                candidate.download = {
+                    "status": "not_attempted",
+                    "reason": "metadata_only mode",
+                }
+        else:
+            download_limit = config.get("max_downloads")
+            max_downloads = int(download_limit) if download_limit is not None else None
+            web_limit = config.get("web_search_max_candidates")
+            max_web_search_candidates = int(web_limit) if web_limit is not None else None
+            web_search_count = 0
+            downloaded_count = 0
+            for candidate in candidates:
+                if max_downloads is not None and downloaded_count >= max_downloads:
+                    candidate.download = {
+                        "status": "not_attempted",
+                        "reason": "max_downloads limit reached",
+                    }
+                    continue
+                use_web_search = bool(web_searcher)
+                if max_web_search_candidates == 0:
+                    use_web_search = False
+                elif (
+                    max_web_search_candidates is not None
+                    and web_search_count >= max_web_search_candidates
+                ):
+                    use_web_search = False
+                if use_web_search:
+                    web_search_count += 1
+                urls = resolver.resolve(candidate, use_web_search=use_web_search)
+                result = downloader.download(candidate, urls)
+                if is_saved_document_status(result.get("status")):
+                    downloaded_count += 1
+                    LOGGER.info("Document %s: %s", result["status"], candidate.title)
+                else:
+                    LOGGER.info("No document saved for: %s", candidate.title)
+
+    downloads = [candidate.download for candidate in candidates if candidate.download]
+    failures = [
+        {
+            "title": candidate.title,
+            "doi": candidate.doi,
+            "reason": candidate.download.get("reason")
+            or candidate.download.get("status")
+            or "No download attempted.",
+            "attempts": candidate.download.get("attempts", []),
+        }
+        for candidate in candidates
+        if candidate.download.get("status") == "failed"
+    ]
+
+    extracted_reference_count = sum(len(extraction.get("references") or []) for extraction in extractions)
+    manifest = {
+        "project": "LitHarvest",
+        "version": VERSION,
+        "generated_at": utc_now(),
+        "harvest_mode": "citations",
+        "config": redacted_config(config),
+        "core_pdfs": [file_fingerprint(path) for path in core_pdfs],
+        "citation_extraction": {
+            "extractor": config["citation_extractor"],
+            "llm_provider": config["llm_provider"],
+            "llm_model": config["llm_model"],
+            "extraction_count": len(extractions),
+            "extracted_reference_count": extracted_reference_count,
+            "errors": extraction_errors,
+            "artifacts": [extraction.get("metadata", {}) for extraction in extractions],
+        },
+        "citation_lookup_errors": lookup_errors,
+        "candidate_cache": candidate_cache,
+        "candidate_count": len(candidates),
+        "deduplicated_candidate_count": len(candidates),
+        "downloaded_count": sum(
+            1
+            for candidate in candidates
+            if is_saved_document_status(candidate.download.get("status"))
+        ),
+        "failed_downloads": failures,
+        "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
+    }
+    download_log = {
+        "project": "LitHarvest",
+        "generated_at": utc_now(),
+        "harvest_mode": "citations",
+        "candidate_cache": candidate_cache,
+        "downloads": downloads,
+        "failed_downloads": failures,
+        "extraction_errors": extraction_errors,
+        "citation_lookup_errors": lookup_errors,
+    }
+
+    manifest_path = logs_dir / "manifest.json"
+    download_log_path = logs_dir / "download_log.json"
+    write_json(manifest_path, manifest)
+    write_json(download_log_path, download_log)
+    if config.get("csv_report"):
+        write_csv_report(logs_dir / "candidates.csv", candidates)
+    if config.get("bibtex"):
+        write_bibtex(logs_dir / "candidates.bib", candidates)
+
+    LOGGER.info("Wrote manifest: %s", manifest_path)
+    LOGGER.info("Wrote download log: %s", download_log_path)
+    return {
+        "manifest": manifest,
+        "manifest_path": str(manifest_path),
+        "download_log_path": str(download_log_path),
+        "candidates_json_path": str(candidates_json_path),
+    }
+
+
+def run_harvest(config: dict[str, Any]) -> dict[str, Any]:
+    if config.get("harvest_mode") == "citations":
+        return run_citation_pipeline(config)
+    return run_pipeline(config)
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
+    "harvest_mode": "draft",
+    "core_pdf": [],
+    "core_pdf_dir": None,
+    "citation_extractor": "direct_pdf",
+    "llm_provider": os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER),
+    "llm_model": None,
+    "llm_api_key": None,
+    "max_output_tokens": 0,
+    "max_text_chars": 0,
     "max_queries": 8,
     "top_k_per_query": 10,
     "sources": DEFAULT_SOURCES,
@@ -2822,6 +3918,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "refresh_candidates": False,
     "metadata_only": False,
     "force_download": False,
+    "allow_abstract_fallback": True,
     "csv_report": False,
     "bibtex": False,
     "dry_run": False,
@@ -2833,7 +3930,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect open scholarly PDFs from a draft using API-first metadata sources."
     )
+    parser.add_argument(
+        "--harvest-mode",
+        choices=HARVEST_MODES,
+        help="Harvest mode: draft search or citation-seeded core PDF expansion.",
+    )
     parser.add_argument("--draft", help="Path to the input draft text or markdown file.")
+    parser.add_argument(
+        "--core-pdf",
+        action="append",
+        help="Core PDF to mine for citations. Repeatable. Enables citation mode when no mode is set.",
+    )
+    parser.add_argument(
+        "--core-pdf-dir",
+        help="Directory of core PDFs to mine for citations. Enables citation mode when no mode is set.",
+    )
+    parser.add_argument(
+        "--citation-extractor",
+        choices=CITATION_EXTRACTORS,
+        help="Citation extraction path for core PDFs: direct_pdf or pymupdf_markdown.",
+    )
+    parser.add_argument(
+        "--llm-provider",
+        choices=LLM_PROVIDERS,
+        help="LLM provider for citation extraction.",
+    )
+    parser.add_argument("--llm-model", help="LLM model for citation extraction.")
+    parser.add_argument(
+        "--llm-api-key",
+        help="LLM API key for citation extraction. Defaults to provider-specific environment variables.",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        help="Optional max output tokens for citation extraction LLM calls.",
+    )
+    parser.add_argument(
+        "--max-text-chars",
+        type=int,
+        help="Optional character cap for PyMuPDF text sent to the model. 0 means no cap.",
+    )
     parser.add_argument("--output", help="Folder where downloaded PDFs should be stored.")
     parser.add_argument("--logs", help="Folder for manifest.json and download_log.json.")
     parser.add_argument(
@@ -2903,6 +4039,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Overwrite existing PDFs with the same generated filename.",
     )
     parser.add_argument(
+        "--allow-abstract-fallback",
+        action="store_true",
+        default=None,
+        help="Allow saving abstract-only placeholder PDFs when no PDF is downloadable.",
+    )
+    parser.add_argument(
         "--refresh-candidates",
         action="store_true",
         default=None,
@@ -2933,6 +4075,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def load_config(args: argparse.Namespace) -> dict[str, Any]:
     config = dict(DEFAULT_CONFIG)
+    loaded: dict[str, Any] = {}
     if args.config:
         config_path = Path(args.config).expanduser()
         loaded = json.loads(config_path.read_text(encoding="utf-8"))
@@ -2940,12 +4083,51 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("Config file must contain a JSON object.")
         config.update(loaded)
 
+    explicit_harvest_mode = args.harvest_mode is not None or "harvest_mode" in loaded
+    explicit_allow_abstract_fallback = (
+        args.allow_abstract_fallback is not None or "allow_abstract_fallback" in loaded
+    )
+
     for key, value in vars(args).items():
         if key in {"config", "quiet", "verbose"}:
             continue
         if value is None:
             continue
         config[key] = value
+
+    config["harvest_mode"] = str(config.get("harvest_mode") or "draft").strip().lower()
+    if not explicit_harvest_mode and (config.get("core_pdf") or config.get("core_pdf_dir")):
+        config["harvest_mode"] = "citations"
+    if config["harvest_mode"] not in HARVEST_MODES:
+        raise ValueError(f"--harvest-mode must be one of: {', '.join(HARVEST_MODES)}.")
+
+    config["citation_extractor"] = str(
+        config.get("citation_extractor") or "direct_pdf"
+    ).strip().lower()
+    if config["citation_extractor"] not in CITATION_EXTRACTORS:
+        raise ValueError(
+            f"--citation-extractor must be one of: {', '.join(CITATION_EXTRACTORS)}."
+        )
+
+    config["llm_provider"] = str(
+        config.get("llm_provider") or DEFAULT_LLM_PROVIDER
+    ).strip().lower()
+    if config["llm_provider"] not in LLM_PROVIDERS:
+        raise ValueError(f"--llm-provider must be one of: {', '.join(LLM_PROVIDERS)}.")
+    if not config.get("llm_model"):
+        config["llm_model"] = llm_provider_default_model(config["llm_provider"])
+    if not config.get("llm_api_key"):
+        config["llm_api_key"] = llm_provider_env_api_key(config["llm_provider"])
+
+    if isinstance(config.get("core_pdf"), str):
+        config["core_pdf"] = [config["core_pdf"]]
+    elif config.get("core_pdf") is None:
+        config["core_pdf"] = []
+    else:
+        config["core_pdf"] = [str(path) for path in ensure_list(config.get("core_pdf")) if str(path)]
+
+    if config["harvest_mode"] == "citations" and not explicit_allow_abstract_fallback:
+        config["allow_abstract_fallback"] = False
 
     if isinstance(config.get("sources"), str):
         config["sources"] = parse_sources(config["sources"])
@@ -2961,10 +4143,14 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
             normalize_source_name(source) for source in config.get("web_search_sources", [])
         ]
 
-    if not config.get("draft"):
-        raise ValueError("--draft is required unless provided in --config.")
     if not config.get("output"):
         raise ValueError("--output is required unless provided in --config.")
+    if config["harvest_mode"] == "draft" and not config.get("draft"):
+        raise ValueError("--draft is required unless provided in --config.")
+    if config["harvest_mode"] == "citations" and not (
+        config.get("core_pdf") or config.get("core_pdf_dir")
+    ):
+        raise ValueError("Citation harvest mode requires --core-pdf or --core-pdf-dir.")
     if config.get("year_from") and config.get("year_to"):
         if int(config["year_from"]) > int(config["year_to"]):
             raise ValueError("--year-from cannot be later than --year-to.")
@@ -2974,6 +4160,10 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--top-k-per-query must be at least 1.")
     if int(config["max_pdf_mb"]) < 1:
         raise ValueError("--max-pdf-mb must be at least 1.")
+    if int(config["max_output_tokens"]) < 0:
+        raise ValueError("--max-output-tokens must be 0 or greater.")
+    if int(config["max_text_chars"]) < 0:
+        raise ValueError("--max-text-chars must be 0 or greater.")
     if int(config["web_search_max_candidates"]) < 0:
         raise ValueError("--web-search-max-candidates must be at least 0.")
     if int(config["web_search_max_results"]) < 1:
@@ -2997,7 +4187,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(verbose=args.verbose, quiet=args.quiet)
     try:
         config = load_config(args)
-        result = run_pipeline(config)
+        result = run_harvest(config)
     except Exception as exc:
         LOGGER.error("%s", exc)
         return 1
