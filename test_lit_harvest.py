@@ -887,6 +887,68 @@ class LitHarvestCoreTests(unittest.TestCase):
         self.assertEqual(citation_match_reason(seed, title_match), "title")
         self.assertIsNone(citation_match_reason(seed, weak_match))
 
+    def test_citation_lookup_resume_skips_completed_sources(self):
+        query = "Seed Paper 2020 Smith"
+        candidate = Candidate(title="Seed Paper", authors=["Alice Smith"], year=2020)
+        candidate.discovered_via.append(
+            {
+                "source": "citation_lookup",
+                "query": query,
+                "attempts": [
+                    {
+                        "source": "openalex",
+                        "query": query,
+                        "result_count": 1,
+                        "accepted_count": 1,
+                    }
+                ],
+            }
+        )
+
+        class FakeClient:
+            def __init__(self, name, results=None):
+                self.name = name
+                self.results = results or []
+                self.calls = 0
+
+            def search(self, query, top_k, year_from, year_to):
+                self.calls += 1
+                return self.results
+
+        openalex = FakeClient("openalex")
+        crossref = FakeClient(
+            "crossref",
+            [
+                Candidate(
+                    title="Seed Paper",
+                    authors=["Alice Smith"],
+                    year=2020,
+                    doi="10.1000/seed",
+                    source_apis=["crossref"],
+                )
+            ],
+        )
+        checkpoints = []
+
+        candidates, errors = lit_harvest.enrich_citation_candidates(
+            [candidate],
+            [openalex, crossref],
+            {
+                "top_k_per_query": 1,
+                "progress": False,
+                "_initial_citation_lookup_errors": [],
+            },
+            checkpoint=lambda current, lookup_errors, progress: checkpoints.append(progress),
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(openalex.calls, 0)
+        self.assertEqual(crossref.calls, 1)
+        self.assertEqual(candidates[0].doi, "10.1000/seed")
+        self.assertEqual(len(candidates[0].discovered_via), 2)
+        self.assertEqual(checkpoints[-1]["completed_lookup_attempts"], 2)
+        self.assertEqual(checkpoints[-1]["total_lookup_attempts"], 2)
+
     def test_citation_mode_config_validation(self):
         args = parse_args(
             [

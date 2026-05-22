@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 VERSION = "0.1.0"
@@ -2383,14 +2383,100 @@ def file_fingerprint(path: Path) -> dict[str, Any]:
     }
 
 
+def citation_extraction_paths(pdf_path: Path, logs_dir: Path) -> tuple[str, Path, Path, Path]:
+    paper_id = safe_pdf_stem(pdf_path)
+    artifact_dir = logs_dir / "citation_extractions" / paper_id
+    return (
+        paper_id,
+        artifact_dir,
+        artifact_dir / "references.json",
+        artifact_dir / "metadata.json",
+    )
+
+
+def load_cached_citation_extraction(
+    pdf_path: Path,
+    logs_dir: Path,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    paper_id, artifact_dir, output_path, metadata_path = citation_extraction_paths(
+        pdf_path,
+        logs_dir,
+    )
+    if not output_path.exists() or not output_path.is_file():
+        return None
+
+    try:
+        output = json.loads(output_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        LOGGER.warning("Could not load cached citation extraction %s: %s", output_path, exc)
+        return None
+
+    validation_errors = validate_citation_bibliography(output)
+    if validation_errors:
+        LOGGER.warning(
+            "Cached citation extraction %s is invalid; re-extracting: %s",
+            output_path,
+            "; ".join(validation_errors),
+        )
+        return None
+    if output.get("paper_id") != paper_id:
+        LOGGER.warning(
+            "Cached citation extraction %s has paper_id %r, expected %r; re-extracting.",
+            output_path,
+            output.get("paper_id"),
+            paper_id,
+        )
+        return None
+
+    metadata: dict[str, Any] = {}
+    if metadata_path.exists() and metadata_path.is_file():
+        try:
+            loaded_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_metadata, dict):
+                metadata = loaded_metadata
+        except (json.JSONDecodeError, OSError) as exc:
+            LOGGER.warning("Could not load cached citation metadata %s: %s", metadata_path, exc)
+            return None
+
+    for key in ["extractor", "llm_provider", "llm_model"]:
+        cached_value = metadata.get(key)
+        current_value = config.get("citation_extractor" if key == "extractor" else key)
+        if cached_value and current_value and str(cached_value) != str(current_value):
+            LOGGER.info(
+                "Cached citation extraction for %s used %s=%s; current config has %s. Re-extracting.",
+                pdf_path,
+                key,
+                cached_value,
+                current_value,
+            )
+            return None
+
+    metadata.setdefault("core_pdf", str(pdf_path))
+    metadata.setdefault("paper_id", paper_id)
+    metadata.setdefault("output_path", str(output_path))
+    metadata.setdefault("metadata_path", str(metadata_path))
+    metadata["loaded_from_cache"] = True
+
+    return {
+        "core_pdf": str(pdf_path),
+        "paper_id": paper_id,
+        "references": output.get("references", []),
+        "output": output,
+        "metadata": metadata,
+    }
+
+
 def extract_citations_from_core_pdf(
     pdf_path: Path,
     logs_dir: Path,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    paper_id = safe_pdf_stem(pdf_path)
+    paper_id, artifact_dir, output_path, metadata_path = citation_extraction_paths(
+        pdf_path,
+        logs_dir,
+    )
     extractor = str(config["citation_extractor"])
-    artifact_dir = logs_dir / "citation_extractions" / paper_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     if extractor == "direct_pdf":
@@ -2412,10 +2498,8 @@ def extract_citations_from_core_pdf(
     call = call_llm_citation_extraction(content, config, paper_id)
     elapsed = time.perf_counter() - start
 
-    output_path = artifact_dir / "references.json"
     raw_response_path = artifact_dir / "response.json"
     raw_text_path = artifact_dir / "response.txt"
-    metadata_path = artifact_dir / "metadata.json"
     write_json(output_path, call.parsed)
     write_json(raw_response_path, call.response)
     raw_text_path.write_text(call.raw_text, encoding="utf-8")
@@ -2598,19 +2682,165 @@ def citation_match_reason(seed: Candidate, result: Candidate) -> str | None:
     return None
 
 
+def citation_lookup_records(candidate: Candidate) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in candidate.discovered_via
+        if item.get("source") == "citation_lookup" and isinstance(item.get("attempts"), list)
+    ]
+
+
+def citation_lookup_resume_query(candidate: Candidate) -> str | None:
+    for record in reversed(citation_lookup_records(candidate)):
+        if "query" in record:
+            query = record.get("query")
+            return str(query) if query is not None else None
+    return citation_lookup_query(candidate)
+
+
+def citation_lookup_record(candidate: Candidate, query_text: str | None) -> dict[str, Any]:
+    for record in reversed(citation_lookup_records(candidate)):
+        if record.get("query") == query_text:
+            return record
+    record = {
+        "source": "citation_lookup",
+        "query": query_text,
+        "attempts": [],
+    }
+    candidate.discovered_via.append(record)
+    return record
+
+
+def citation_lookup_attempted_sources(candidate: Candidate, query_text: str | None) -> set[str]:
+    sources: set[str] = set()
+    for record in citation_lookup_records(candidate):
+        if record.get("query") != query_text:
+            continue
+        for attempt in record.get("attempts") or []:
+            if isinstance(attempt, dict) and attempt.get("source"):
+                sources.add(str(attempt["source"]))
+    return sources
+
+
+def citation_lookup_has_skip(candidate: Candidate, query_text: str | None) -> bool:
+    for record in citation_lookup_records(candidate):
+        if record.get("query") != query_text:
+            continue
+        for attempt in record.get("attempts") or []:
+            if (
+                isinstance(attempt, dict)
+                and attempt.get("source") == "citation_lookup"
+                and attempt.get("status") == "skipped"
+            ):
+                return True
+    return False
+
+
+def citation_lookup_completed_attempt_count(
+    candidate: Candidate,
+    clients: list[SearchClient],
+) -> int:
+    query_text = citation_lookup_resume_query(candidate)
+    if not query_text:
+        return 1 if citation_lookup_has_skip(candidate, query_text) else 0
+    client_names = {client.name for client in clients}
+    return len(citation_lookup_attempted_sources(candidate, query_text) & client_names)
+
+
+def citation_lookup_total_attempt_count(
+    candidate: Candidate,
+    clients: list[SearchClient],
+) -> int:
+    return len(clients) if citation_lookup_resume_query(candidate) else 1
+
+
+def citation_lookup_accepted_count(candidates: list[Candidate]) -> int:
+    total = 0
+    for candidate in candidates:
+        for record in citation_lookup_records(candidate):
+            for attempt in record.get("attempts") or []:
+                if isinstance(attempt, dict):
+                    total += int(safe_int(attempt.get("accepted_count")) or 0)
+    return total
+
+
+def citation_lookup_skipped_count(candidates: list[Candidate]) -> int:
+    skipped = 0
+    for candidate in candidates:
+        query_text = citation_lookup_resume_query(candidate)
+        if not query_text and citation_lookup_has_skip(candidate, query_text):
+            skipped += 1
+    return skipped
+
+
+def citation_lookup_progress_payload(
+    candidates: list[Candidate],
+    clients: list[SearchClient],
+    lookup_errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    total_attempts = sum(citation_lookup_total_attempt_count(candidate, clients) for candidate in candidates)
+    completed_attempts = sum(
+        citation_lookup_completed_attempt_count(candidate, clients) for candidate in candidates
+    )
+    completed_candidates = sum(
+        1
+        for candidate in candidates
+        if citation_lookup_completed_attempt_count(candidate, clients)
+        >= citation_lookup_total_attempt_count(candidate, clients)
+    )
+    return {
+        "total_candidates": len(candidates),
+        "completed_candidates": completed_candidates,
+        "total_lookup_attempts": total_attempts,
+        "completed_lookup_attempts": completed_attempts,
+        "accepted_count": citation_lookup_accepted_count(candidates),
+        "error_count": len(lookup_errors),
+        "skipped_count": citation_lookup_skipped_count(candidates),
+    }
+
+
 def enrich_citation_candidates(
     candidates: list[Candidate],
     clients: list[SearchClient],
     config: dict[str, Any],
+    checkpoint: Callable[[list[Candidate], list[dict[str, Any]], dict[str, Any]], None] | None = None,
 ) -> tuple[list[Candidate], list[dict[str, Any]]]:
     enriched: list[Candidate] = []
-    lookup_errors: list[dict[str, Any]] = []
+    lookup_errors: list[dict[str, Any]] = [
+        error for error in ensure_list(config.get("_initial_citation_lookup_errors")) if isinstance(error, dict)
+    ]
+    total_attempts = sum(citation_lookup_total_attempt_count(candidate, clients) for candidate in candidates)
+    completed_attempts = sum(
+        citation_lookup_completed_attempt_count(candidate, clients) for candidate in candidates
+    )
+    progress = PhaseProgressReporter(
+        total_attempts,
+        enabled=bool(config.get("progress")),
+        label="Citation lookup",
+    )
+    accepted_total = citation_lookup_accepted_count(candidates)
+    skipped_total = citation_lookup_skipped_count(candidates)
+    progress.set_current(
+        completed_attempts,
+        summary=f"accepted={accepted_total} errors={len(lookup_errors)} skipped={skipped_total}",
+        force=True,
+    )
+    LOGGER.info(
+        "Looking up %d citation candidates across %d sources (%d lookup attempts).",
+        len(candidates),
+        len(clients),
+        total_attempts,
+    )
     for candidate in candidates:
-        query_text = citation_lookup_query(candidate)
-        lookup_attempts: list[dict[str, Any]] = []
+        query_text = citation_lookup_resume_query(candidate)
+        lookup_record = citation_lookup_record(candidate, query_text)
+        lookup_attempts = lookup_record["attempts"]
         if query_text:
             query = SearchQuery(bucket="citation_lookup", text=query_text, terms=content_tokens(candidate.title))
+            attempted_sources = citation_lookup_attempted_sources(candidate, query_text)
             for client in clients:
+                if client.name in attempted_sources:
+                    continue
                 try:
                     results = client.search(
                         query,
@@ -2626,19 +2856,16 @@ def enrich_citation_candidates(
                             continue
                         accepted += 1
                         accepted_reasons.append(reason)
-                        result.discovered_via = (
-                            candidate.discovered_via
-                            + result.discovered_via
-                            + [
-                                {
-                                    "source": "citation_lookup",
-                                    "client": client.name,
-                                    "query": query_text,
-                                    "match_reason": reason,
-                                }
-                            ]
-                        )
+                        result.discovered_via = result.discovered_via + [
+                            {
+                                "source": "citation_lookup_match",
+                                "client": client.name,
+                                "query": query_text,
+                                "match_reason": reason,
+                            }
+                        ]
                         merge_candidate_into(candidate, result)
+                    accepted_total += accepted
                     lookup_attempts.append(
                         {
                             "source": client.name,
@@ -2657,7 +2884,18 @@ def enrich_citation_candidates(
                     }
                     lookup_errors.append(error)
                     lookup_attempts.append({**error, "status": "error"})
-        else:
+                attempted_sources.add(client.name)
+                progress.advance(
+                    summary=f"accepted={accepted_total} errors={len(lookup_errors)} skipped={skipped_total}"
+                )
+                if checkpoint:
+                    checkpoint(
+                        candidates,
+                        lookup_errors,
+                        citation_lookup_progress_payload(candidates, clients, lookup_errors),
+                    )
+        elif not citation_lookup_has_skip(candidate, query_text):
+            skipped_total += 1
             lookup_attempts.append(
                 {
                     "source": "citation_lookup",
@@ -2665,16 +2903,18 @@ def enrich_citation_candidates(
                     "reason": "No DOI, arXiv ID, title, or raw reference available.",
                 }
             )
-
-        candidate.discovered_via.append(
-            {
-                "source": "citation_lookup",
-                "query": query_text,
-                "attempts": lookup_attempts,
-            }
-        )
+            progress.advance(
+                summary=f"accepted={accepted_total} errors={len(lookup_errors)} skipped={skipped_total}"
+            )
+            if checkpoint:
+                checkpoint(
+                    candidates,
+                    lookup_errors,
+                    citation_lookup_progress_payload(candidates, clients, lookup_errors),
+                )
         enriched.append(candidate)
 
+    progress.done(summary=f"accepted={accepted_total} errors={len(lookup_errors)} skipped={skipped_total}")
     return merge_candidates(enriched), lookup_errors
 
 
@@ -2701,6 +2941,23 @@ def merge_candidates(candidates: list[Candidate]) -> list[Candidate]:
         for key in candidate_keys(existing):
             by_key[key] = existing
     return merged
+
+
+def dedupe_discovered_via(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            key = json.dumps(item, sort_keys=True, default=str)
+        except TypeError:
+            key = repr(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def candidate_keys(candidate: Candidate) -> list[str]:
@@ -2739,7 +2996,9 @@ def merge_candidate_into(target: Candidate, incoming: Candidate) -> None:
     target.matched_keywords = dedupe_preserve(
         target.matched_keywords + incoming.matched_keywords
     )
-    target.discovered_via.extend(incoming.discovered_via)
+    target.discovered_via = dedupe_discovered_via(
+        target.discovered_via + incoming.discovered_via
+    )
     if not target.doi and incoming.doi:
         target.doi = incoming.doi
     if not target.year and incoming.year:
@@ -3217,6 +3476,95 @@ class ProgressReporter:
         self._line_length = 0
 
 
+class PhaseProgressReporter:
+    def __init__(
+        self,
+        total: int,
+        *,
+        enabled: bool = True,
+        label: str = "Progress",
+        min_interval: float = 0.5,
+        log_interval: float = 30.0,
+    ) -> None:
+        self.total = max(total, 0)
+        self.enabled = enabled and self.total > 0
+        self.tty = sys.stderr.isatty()
+        self.label = label
+        self.min_interval = min_interval
+        self.log_interval = log_interval
+        self.started_at = time.monotonic()
+        self.current = 0
+        self.summary = ""
+        self._last_render_at = 0.0
+        self._last_log_at = 0.0
+        self._line_length = 0
+
+    def set_current(
+        self,
+        current: int,
+        *,
+        summary: str | None = None,
+        force: bool = False,
+    ) -> None:
+        self.current = max(0, min(current, self.total))
+        if summary is not None:
+            self.summary = summary
+        self.render(force=force)
+
+    def advance(self, step: int = 1, *, summary: str | None = None) -> None:
+        self.current = max(0, min(self.current + step, self.total))
+        if summary is not None:
+            self.summary = summary
+        self.render()
+
+    def progress_line(self) -> str:
+        now = time.monotonic()
+        elapsed = max(now - self.started_at, 0.001)
+        rate = self.current / elapsed
+        remaining = self.total - self.current
+        eta = remaining / rate if rate > 0 else 0
+        percent = (self.current / self.total * 100.0) if self.total else 100.0
+        line = (
+            f"{self.label}: {self.current}/{self.total} "
+            f"({percent:5.1f}%) | {rate * 60:5.1f}/min | "
+            f"elapsed {format_duration(elapsed)} | ETA {format_duration(eta)}"
+        )
+        if self.summary:
+            line += f" | {self.summary}"
+        return line
+
+    def render(self, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if self.tty:
+            if not force and self.current < self.total and now - self._last_render_at < self.min_interval:
+                return
+            self._last_render_at = now
+            line = self.progress_line()
+            padding = " " * max(0, self._line_length - len(line))
+            sys.stderr.write("\r" + line + padding)
+            sys.stderr.flush()
+            self._line_length = len(line)
+            return
+
+        if force or self.current >= self.total or now - self._last_log_at >= self.log_interval:
+            self._last_log_at = now
+            LOGGER.info(self.progress_line())
+
+    def done(self, *, summary: str | None = None) -> None:
+        if not self.enabled:
+            return
+        self.current = self.total
+        if summary is not None:
+            self.summary = summary
+        self.render(force=True)
+        if self.tty:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+            self._line_length = 0
+
+
 def resolve_and_download_candidate(
     candidate: Candidate,
     resolver: PdfResolver,
@@ -3523,7 +3871,21 @@ def slugify(value: str | None, max_length: int = 80) -> str:
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            delete=False,
+            dir=str(path.parent),
+            encoding="utf-8",
+        ) as handle:
+            handle.write(text)
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
 
 
 def candidate_download_identity(candidate: Candidate) -> str:
@@ -3990,13 +4352,28 @@ def load_candidate_cache(path: Path) -> dict[str, Any] | None:
     search_errors = payload.get("search_errors") or []
     if not isinstance(search_errors, list):
         search_errors = []
+    citation_lookup_errors = payload.get("citation_lookup_errors") or []
+    if not isinstance(citation_lookup_errors, list):
+        citation_lookup_errors = []
+    extraction_errors = payload.get("extraction_errors") or []
+    if not isinstance(extraction_errors, list):
+        extraction_errors = []
+    citation_lookup_progress = payload.get("citation_lookup_progress") or {}
+    if not isinstance(citation_lookup_progress, dict):
+        citation_lookup_progress = {}
 
     return {
         "path": str(path),
         "generated_at": payload.get("generated_at"),
+        "stage": payload.get("stage"),
         "candidates": candidates,
         "queries": cached_queries,
         "search_errors": search_errors,
+        "citation_lookup_errors": citation_lookup_errors,
+        "extraction_errors": extraction_errors,
+        "extraction_count": safe_int(payload.get("extraction_count")),
+        "extracted_reference_count": safe_int(payload.get("extracted_reference_count")),
+        "citation_lookup_progress": citation_lookup_progress,
         "keyword_search_counts": keyword_counts,
         "candidate_count": len(candidates),
     }
@@ -4285,20 +4662,29 @@ def write_citation_candidate_cache(
     extraction_errors: list[dict[str, Any]],
     lookup_errors: list[dict[str, Any]],
     candidates: list[Candidate],
+    stage: str = "citation_lookup_pre_download",
+    lookup_progress: dict[str, Any] | None = None,
+    extraction_count: int | None = None,
+    extracted_reference_count: int | None = None,
 ) -> None:
+    if extraction_count is None:
+        extraction_count = len(extractions)
+    if extracted_reference_count is None:
+        extracted_reference_count = sum(
+            len(extraction.get("references") or []) for extraction in extractions
+        )
     payload = {
         "project": "LitHarvest",
         "version": VERSION,
         "generated_at": utc_now(),
-        "stage": "citation_lookup_pre_download",
+        "stage": stage,
         "config": redacted_config(config),
         "core_pdfs": [file_fingerprint(path) for path in core_pdfs],
-        "extraction_count": len(extractions),
-        "extracted_reference_count": sum(
-            len(extraction.get("references") or []) for extraction in extractions
-        ),
+        "extraction_count": extraction_count,
+        "extracted_reference_count": extracted_reference_count,
         "extraction_errors": extraction_errors,
         "citation_lookup_errors": lookup_errors,
+        "citation_lookup_progress": lookup_progress or {},
         "candidate_count": len(candidates),
         "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
     }
@@ -4311,12 +4697,16 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     candidates_json_path = resolve_candidates_json_path(config, logs_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = logs_dir / "manifest.json"
+    download_log_path = logs_dir / "download_log.json"
 
     core_pdfs = collect_core_pdfs(config)
     extractions: list[dict[str, Any]] = []
     extraction_errors: list[dict[str, Any]] = []
     lookup_errors: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
+    extraction_count = 0
+    extracted_reference_count = 0
     candidate_cache: dict[str, Any] = {
         "path": str(candidates_json_path),
         "status": "not_used",
@@ -4326,35 +4716,6 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         LOGGER.info("Dry run requested; no citation extraction, API lookups, or downloads were attempted.")
         candidate_cache["status"] = "not_used_dry_run"
     else:
-        if not config.get("llm_api_key"):
-            provider = config.get("llm_provider")
-            if provider == "gemini":
-                raise ValueError(
-                    "GEMINI_API_KEY or GOOGLE_API_KEY is required for citation extraction. "
-                    "Set it in the environment or pass --llm-api-key."
-                )
-            raise ValueError(
-                "OPENAI_API_KEY is required for citation extraction. "
-                "Set it in the environment or pass --llm-api-key."
-            )
-
-        for pdf_path in core_pdfs:
-            try:
-                LOGGER.info("Extracting citations from %s", pdf_path)
-                extractions.append(extract_citations_from_core_pdf(pdf_path, logs_dir, config))
-            except Exception as exc:
-                LOGGER.warning("Citation extraction failed for %s: %s", pdf_path, exc)
-                extraction_errors.append(
-                    {
-                        "core_pdf": str(pdf_path),
-                        "paper_id": safe_pdf_stem(pdf_path),
-                        "reason": str(exc),
-                    }
-                )
-
-        candidates = merge_candidates(candidates_from_citation_extractions(extractions))
-        LOGGER.info("Built %d deduplicated citation candidates.", len(candidates))
-
         http = HttpClient(
             timeout=float(config["timeout"]),
             retries=int(config["retries"]),
@@ -4362,22 +4723,175 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             rate_limit_delay=float(config["rate_limit_delay"]),
             email=config.get("email"),
         )
-        clients = build_clients(config, http)
-        candidates, lookup_errors = enrich_citation_candidates(candidates, clients, config)
-        write_citation_candidate_cache(
-            candidates_json_path,
-            config=config,
-            core_pdfs=core_pdfs,
-            extractions=extractions,
-            extraction_errors=extraction_errors,
-            lookup_errors=lookup_errors,
-            candidates=candidates,
-        )
-        candidate_cache = {
-            "path": str(candidates_json_path),
-            "status": "saved",
-            "candidate_count": len(candidates),
-        }
+
+        cached = None
+        if not config.get("refresh_candidates"):
+            cached = load_candidate_cache(candidates_json_path)
+        lookup_needs_run = False
+        if cached:
+            candidates = cached["candidates"]
+            lookup_errors = cached.get("citation_lookup_errors") or cached.get("search_errors", [])
+            extraction_errors = cached.get("extraction_errors", [])
+            extraction_count = int(cached.get("extraction_count") or 0)
+            extracted_reference_count = int(cached.get("extracted_reference_count") or 0)
+            cached_stage = str(cached.get("stage") or "")
+            candidate_cache = {
+                "path": str(candidates_json_path),
+                "status": "loaded",
+                "generated_at": cached.get("generated_at"),
+                "stage": cached_stage,
+                "candidate_count": len(candidates),
+            }
+            if cached_stage == "citation_lookup_partial":
+                lookup_needs_run = True
+                progress = cached.get("citation_lookup_progress") or {}
+                LOGGER.info(
+                    "Loaded partial citation lookup from %s: %s/%s attempts complete.",
+                    candidates_json_path,
+                    progress.get("completed_lookup_attempts", "?"),
+                    progress.get("total_lookup_attempts", "?"),
+                )
+            else:
+                LOGGER.info(
+                    "Loaded %d citation candidates from %s; skipping citation extraction and lookup.",
+                    len(candidates),
+                    candidates_json_path,
+                )
+        else:
+            cached_extraction_count = 0
+            fresh_extraction_count = 0
+            extraction_progress = PhaseProgressReporter(
+                len(core_pdfs),
+                enabled=bool(config.get("progress")),
+                label="Citation extraction",
+            )
+            extraction_progress.set_current(
+                0,
+                summary="cached=0 extracted=0 errors=0",
+                force=True,
+            )
+
+            for pdf_path in core_pdfs:
+                cached_extraction = None
+                if not config.get("refresh_citation_extractions"):
+                    cached_extraction = load_cached_citation_extraction(pdf_path, logs_dir, config)
+                if cached_extraction:
+                    extractions.append(cached_extraction)
+                    cached_extraction_count += 1
+                    extraction_progress.advance(
+                        summary=(
+                            f"cached={cached_extraction_count} "
+                            f"extracted={fresh_extraction_count} errors={len(extraction_errors)}"
+                        )
+                    )
+                    continue
+
+                if not config.get("llm_api_key"):
+                    provider = config.get("llm_provider")
+                    if provider == "gemini":
+                        raise ValueError(
+                            "GEMINI_API_KEY or GOOGLE_API_KEY is required for citation extraction. "
+                            "Set it in the environment or pass --llm-api-key."
+                        )
+                    raise ValueError(
+                        "OPENAI_API_KEY is required for citation extraction. "
+                        "Set it in the environment or pass --llm-api-key."
+                    )
+
+                try:
+                    if not extraction_progress.enabled:
+                        LOGGER.info("Extracting citations from %s", pdf_path)
+                    extractions.append(extract_citations_from_core_pdf(pdf_path, logs_dir, config))
+                    fresh_extraction_count += 1
+                except Exception as exc:
+                    LOGGER.warning("Citation extraction failed for %s: %s", pdf_path, exc)
+                    extraction_errors.append(
+                        {
+                            "core_pdf": str(pdf_path),
+                            "paper_id": safe_pdf_stem(pdf_path),
+                            "reason": str(exc),
+                        }
+                    )
+                extraction_progress.advance(
+                    summary=(
+                        f"cached={cached_extraction_count} "
+                        f"extracted={fresh_extraction_count} errors={len(extraction_errors)}"
+                    )
+                )
+            extraction_progress.done(
+                summary=(
+                    f"cached={cached_extraction_count} "
+                    f"extracted={fresh_extraction_count} errors={len(extraction_errors)}"
+                )
+            )
+
+            candidates = merge_candidates(candidates_from_citation_extractions(extractions))
+            extraction_count = len(extractions)
+            extracted_reference_count = sum(
+                len(extraction.get("references") or []) for extraction in extractions
+            )
+            LOGGER.info("Built %d deduplicated citation candidates.", len(candidates))
+            lookup_needs_run = True
+
+        if lookup_needs_run:
+            clients = build_clients(config, http)
+
+            def write_lookup_checkpoint(
+                checkpoint_candidates: list[Candidate],
+                checkpoint_errors: list[dict[str, Any]],
+                lookup_progress: dict[str, Any],
+            ) -> None:
+                write_citation_candidate_cache(
+                    candidates_json_path,
+                    config=config,
+                    core_pdfs=core_pdfs,
+                    extractions=extractions,
+                    extraction_errors=extraction_errors,
+                    lookup_errors=checkpoint_errors,
+                    candidates=checkpoint_candidates,
+                    stage="citation_lookup_partial",
+                    lookup_progress=lookup_progress,
+                    extraction_count=extraction_count,
+                    extracted_reference_count=extracted_reference_count,
+                )
+
+            write_lookup_checkpoint(
+                candidates,
+                lookup_errors,
+                citation_lookup_progress_payload(candidates, clients, lookup_errors),
+            )
+            lookup_config = dict(config)
+            lookup_config["_initial_citation_lookup_errors"] = lookup_errors
+            candidates, lookup_errors = enrich_citation_candidates(
+                candidates,
+                clients,
+                lookup_config,
+                checkpoint=write_lookup_checkpoint,
+            )
+            write_citation_candidate_cache(
+                candidates_json_path,
+                config=config,
+                core_pdfs=core_pdfs,
+                extractions=extractions,
+                extraction_errors=extraction_errors,
+                lookup_errors=lookup_errors,
+                candidates=candidates,
+                stage="citation_lookup_pre_download",
+                lookup_progress=citation_lookup_progress_payload(candidates, clients, lookup_errors),
+                extraction_count=extraction_count,
+                extracted_reference_count=extracted_reference_count,
+            )
+            candidate_cache = {
+                "path": str(candidates_json_path),
+                "status": "saved",
+                "stage": "citation_lookup_pre_download",
+                "candidate_count": len(candidates),
+            }
+            LOGGER.info(
+                "Saved %d post-lookup citation candidates to %s before PDF download.",
+                len(candidates),
+                candidates_json_path,
+            )
 
         web_searcher = build_web_pdf_searcher(config, http)
         resolver = PdfResolver(
@@ -4394,50 +4908,57 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             force_download=bool(config.get("force_download")),
             allow_abstract_fallback=bool(config.get("allow_abstract_fallback")),
         )
+        download_ledger = DownloadLogLedger(
+            download_log_path,
+            candidate_cache=candidate_cache,
+            search_errors=lookup_errors,
+        )
+        download_ledger.load()
+        if not config.get("force_download"):
+            apply_download_log_resume(
+                candidates,
+                download_ledger,
+                downloader,
+                retry_failed_downloads=bool(config.get("retry_failed_downloads")),
+            )
 
         if config.get("metadata_only"):
             for candidate in candidates:
                 candidate.download = {
                     "status": "not_attempted",
                     "reason": "metadata_only mode",
+                    "filename": build_pdf_filename(candidate),
                 }
+            download_ledger.record_many(
+                [(candidate, candidate.download) for candidate in candidates]
+            )
         else:
             download_limit = config.get("max_downloads")
             max_downloads = int(download_limit) if download_limit is not None else None
             web_limit = config.get("web_search_max_candidates")
             max_web_search_candidates = int(web_limit) if web_limit is not None else None
-            web_search_count = 0
-            downloaded_count = 0
-            for candidate in candidates:
-                if max_downloads is not None and downloaded_count >= max_downloads:
-                    candidate.download = {
-                        "status": "not_attempted",
-                        "reason": "max_downloads limit reached",
-                    }
-                    continue
-                use_web_search = bool(web_searcher)
-                if max_web_search_candidates == 0:
-                    use_web_search = False
-                elif (
-                    max_web_search_candidates is not None
-                    and web_search_count >= max_web_search_candidates
-                ):
-                    use_web_search = False
-                if use_web_search:
-                    web_search_count += 1
-                urls = resolver.resolve(candidate, use_web_search=use_web_search)
-                result = downloader.download(candidate, urls)
-                if is_saved_document_status(result.get("status")):
-                    downloaded_count += 1
-                    LOGGER.info("Document %s: %s", result["status"], candidate.title)
-                else:
-                    LOGGER.info("No document saved for: %s", candidate.title)
+            download_candidates(
+                candidates,
+                resolver=resolver,
+                downloader=downloader,
+                max_downloads=max_downloads,
+                max_web_search_candidates=max_web_search_candidates,
+                download_workers=int(config.get("download_workers") or 1),
+                ledger=download_ledger,
+                progress_enabled=bool(config.get("progress")),
+            )
 
-    downloads = [candidate.download for candidate in candidates if candidate.download]
+    download_records = [
+        download_log_record(candidate, candidate.download)
+        for candidate in candidates
+        if candidate.download
+    ]
+    downloads = [record["download"] for record in download_records]
     failures = [
         {
             "title": candidate.title,
             "doi": candidate.doi,
+            "filename": candidate.download.get("filename", build_pdf_filename(candidate)),
             "reason": candidate.download.get("reason")
             or candidate.download.get("status")
             or "No download attempted.",
@@ -4447,7 +4968,9 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         if candidate.download.get("status") == "failed"
     ]
 
-    extracted_reference_count = sum(len(extraction.get("references") or []) for extraction in extractions)
+    if extractions:
+        extraction_count = len(extractions)
+        extracted_reference_count = sum(len(extraction.get("references") or []) for extraction in extractions)
     manifest = {
         "project": "LitHarvest",
         "version": VERSION,
@@ -4459,7 +4982,7 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             "extractor": config["citation_extractor"],
             "llm_provider": config["llm_provider"],
             "llm_model": config["llm_model"],
-            "extraction_count": len(extractions),
+            "extraction_count": extraction_count,
             "extracted_reference_count": extracted_reference_count,
             "errors": extraction_errors,
             "artifacts": [extraction.get("metadata", {}) for extraction in extractions],
@@ -4476,19 +4999,17 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "failed_downloads": failures,
         "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
     }
-    download_log = {
-        "project": "LitHarvest",
-        "generated_at": utc_now(),
-        "harvest_mode": "citations",
-        "candidate_cache": candidate_cache,
-        "downloads": downloads,
-        "failed_downloads": failures,
-        "extraction_errors": extraction_errors,
-        "citation_lookup_errors": lookup_errors,
-    }
+    download_log = download_log_payload(
+        download_records,
+        candidate_cache=candidate_cache,
+        search_errors=lookup_errors,
+    )
+    download_log["harvest_mode"] = "citations"
+    download_log["downloads"] = downloads
+    download_log["failed_downloads"] = failures
+    download_log["extraction_errors"] = extraction_errors
+    download_log["citation_lookup_errors"] = lookup_errors
 
-    manifest_path = logs_dir / "manifest.json"
-    download_log_path = logs_dir / "download_log.json"
     write_json(manifest_path, manifest)
     write_json(download_log_path, download_log)
     if config.get("csv_report"):
@@ -4549,6 +5070,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "logs": None,
     "candidates_json": None,
     "refresh_candidates": False,
+    "refresh_citation_extractions": False,
     "retry_failed_downloads": False,
     "progress": True,
     "metadata_only": False,
@@ -4698,6 +5220,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=None,
         help="Ignore an existing candidates JSON checkpoint and run metadata searches again.",
+    )
+    parser.add_argument(
+        "--refresh-citation-extractions",
+        action="store_true",
+        default=None,
+        help="Ignore cached citation extraction artifacts and reread core PDFs with the LLM.",
     )
     parser.add_argument(
         "--retry-failed-downloads",

@@ -213,6 +213,7 @@ Important config fields:
 - `core_pdf`: one or more core PDFs for citation mode
 - `core_pdf_dir`: folder of core PDFs for citation mode
 - `citation_extractor`: `direct_pdf` or `pymupdf_markdown`
+- `refresh_citation_extractions`: reread core PDFs instead of reusing cached citation artifacts
 - `llm_provider`, `llm_model`, `llm_api_key`: citation extraction LLM settings
 - `output`: folder for downloaded PDFs
 - `logs`: folder for `manifest.json`, `download_log.json`, and optional reports
