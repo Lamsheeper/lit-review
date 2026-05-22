@@ -1,3 +1,4 @@
+comparison_plots
 lit_extract
 lit_harvest
 lit_log_summary

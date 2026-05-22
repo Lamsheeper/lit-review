@@ -12,3 +12,4 @@ review_runs/
 extract_configs/
 !extract_configs/*.json
 collected_*
+comparison_plots/

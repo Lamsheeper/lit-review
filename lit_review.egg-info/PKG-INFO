@@ -4,6 +4,7 @@ Version: 0.1.0
 Summary: API-first literature collection and evidence-bound review synthesis tools.
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+Requires-Dist: matplotlib>=3.8.0
 Requires-Dist: pypdf>=5.0.0
 Requires-Dist: PyMuPDF>=1.24.0
 Requires-Dist: tqdm>=4.66.0

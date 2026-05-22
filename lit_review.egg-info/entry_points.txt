@@ -1,4 +1,5 @@
 [console_scripts]
+comparison-plots = comparison_plots:main
 lit-extract = lit_extract:main
 lit-harvest = lit_harvest:main
 lit-log-summary = lit_log_summary:main
