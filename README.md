@@ -1,6 +1,6 @@
 # lit-review
 
-Pipeline for academic literature review.
+Agentic pipeline for academic literature review.
 
 ## LitHarvest
 
