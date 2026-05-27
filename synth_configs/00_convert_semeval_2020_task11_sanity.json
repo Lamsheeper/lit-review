@@ -1,0 +1,7 @@
+{
+  "command": "convert",
+  "papers": "collected_semeval_2020_task11_papers",
+  "manifest": "collected_semeval_2020_task11_papers/logs/manifest.json",
+  "out": "review_runs/semeval_2020_task11_sanity",
+  "extractor": "auto"
+}

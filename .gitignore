@@ -13,3 +13,15 @@ extract_configs/
 !extract_configs/*.json
 collected_*
 comparison_plots/
+!harvest_configs/
+harvest_configs/*
+!harvest_configs/config.semeval_2020_task11_sanity.json
+!synth_configs/
+synth_configs/*
+!synth_configs/00_convert_semeval_2020_task11_sanity.json
+!synth_configs/01_index_semeval_2020_task11_sanity.json
+!extract_configs/
+extract_configs/*
+!extract_configs/00_extract_semeval_2020_task11_pdf.json
+!extract_configs/01_curate_semeval_2020_task11_pdf.json
+!extract_configs/02_finalize_semeval_2020_task11_pdf.json

@@ -1,0 +1,17 @@
+{
+  "command": "finalize",
+  "input_dir": "review_runs/semeval_2020_task11_sanity/feature_extract_pdf",
+  "output_dir": "review_runs/semeval_2020_task11_sanity/feature_extract_pdf",
+  "goal": "goal.md",
+  "api_key_env": "GEMINI_API_KEY",
+  "model": "gemini-3.1-pro-preview",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "api_provider": "gemini",
+  "reasoning_effort": "low",
+  "target_per_category": 100,
+  "candidate_pool_per_category": 150,
+  "merge_style": "moderate",
+  "temperature": 0.0,
+  "max_tokens": 30000,
+  "timeout": 600
+}

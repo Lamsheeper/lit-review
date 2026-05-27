@@ -1,0 +1,87 @@
+{
+  "harvest_mode": "draft",
+  "draft": "./draft.md",
+  "output": "./collected_semeval_2020_task11_papers",
+  "logs": "./collected_semeval_2020_task11_papers/logs",
+  "max_queries": 6,
+  "top_k_per_query": 50,
+  "sources": [
+    "openalex",
+    "semantic_scholar",
+    "crossref"
+  ],
+  "extra_queries": [
+    {
+      "bucket": "semeval_2020_task11",
+      "text": "SemEval 2020 Task 11 Detection of Propaganda Techniques in News Articles",
+      "terms": [
+        "SemEval 2020",
+        "Task 11",
+        "Detection of Propaganda Techniques in News Articles"
+      ]
+    },
+    {
+      "bucket": "semeval_2020_task11",
+      "text": "SemEval-2020 Task 11 propaganda techniques news articles",
+      "terms": [
+        "SemEval-2020 Task 11",
+        "propaganda techniques",
+        "news articles"
+      ]
+    },
+    {
+      "bucket": "semeval_2020_task11",
+      "text": "2020.semeval-1.186",
+      "terms": [
+        "2020.semeval-1.186"
+      ]
+    },
+    {
+      "bucket": "semeval_2020_task11",
+      "text": "10.18653/v1/2020.semeval-1.186",
+      "terms": [
+        "10.18653/v1/2020.semeval-1.186"
+      ]
+    },
+    {
+      "bucket": "semeval_2020_task11_systems",
+      "text": "at SemEval-2020 Task 11 propaganda detection",
+      "terms": [
+        "SemEval-2020 Task 11",
+        "propaganda detection"
+      ]
+    },
+    {
+      "bucket": "semeval_2020_task11_systems",
+      "text": "SemEval 2020 Task 11 technique classification span identification propaganda",
+      "terms": [
+        "SemEval 2020 Task 11",
+        "technique classification",
+        "span identification",
+        "propaganda"
+      ]
+    }
+  ],
+  "year_from": 2020,
+  "year_to": 2020,
+  "timeout": 30.0,
+  "retries": 2,
+  "backoff": 1.5,
+  "rate_limit_delay": 0.2,
+  "download_workers": 4,
+  "max_pdf_mb": 100,
+  "max_downloads": 200,
+  "metadata_only": false,
+  "force_download": false,
+  "allow_abstract_fallback": false,
+  "web_search_sources": [],
+  "web_search_max_candidates": 0,
+  "web_search_max_results": 5,
+  "web_search_queries_per_candidate": 3,
+  "refresh_candidates": false,
+  "retry_failed_downloads": false,
+  "progress": true,
+  "csv_report": true,
+  "bibtex": true,
+  "dry_run": false
+}

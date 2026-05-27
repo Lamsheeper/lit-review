@@ -1,0 +1,14 @@
+{
+  "command": "curate",
+  "input_dir": "review_runs/semeval_2020_task11_sanity/feature_extract_pdf",
+  "output_dir": "review_runs/semeval_2020_task11_sanity/feature_extract_pdf",
+  "goal": "goal.md",
+  "api_key_env": "GEMINI_API_KEY",
+  "model": "gemini-3-flash-preview",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+  "reasoning_effort": "low",
+  "batch_features": 40,
+  "merge_style": "moderate",
+  "temperature": 0.1,
+  "timeout": 600
+}

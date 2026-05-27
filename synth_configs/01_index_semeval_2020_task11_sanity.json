@@ -1,0 +1,7 @@
+{
+  "command": "index",
+  "run": "review_runs/semeval_2020_task11_sanity",
+  "chunk_words": 700,
+  "overlap_words": 80,
+  "min_chunk_words": 40
+}

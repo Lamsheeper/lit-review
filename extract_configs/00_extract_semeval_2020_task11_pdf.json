@@ -1,0 +1,19 @@
+{
+  "command": "run",
+  "run": "review_runs/semeval_2020_task11_sanity",
+  "output_dir": "review_runs/semeval_2020_task11_sanity/feature_extract_pdf",
+  "goal": "goal.md",
+  "api_key_env": "GEMINI_API_KEY",
+  "model": "gemini-3.1-flash-lite",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "api_provider": "gemini",
+  "reasoning_effort": "low",
+  "input_mode": "pdf",
+  "batch_chunks": 4,
+  "max_features_per_chunk": 12,
+  "max_features_per_pdf": 40,
+  "max_chunk_chars": 5000,
+  "temperature": 0.1,
+  "timeout": 600,
+  "paper_limit": 200
+}
