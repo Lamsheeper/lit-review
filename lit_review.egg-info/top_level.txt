@@ -1,4 +1,5 @@
 comparison_plots
+feature_embedding_tsne
 lit_extract
 lit_harvest
 lit_log_summary

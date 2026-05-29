@@ -1,5 +1,6 @@
 README.md
 comparison_plots.py
+feature_embedding_tsne.py
 lit_extract.py
 lit_harvest.py
 lit_log_summary.py

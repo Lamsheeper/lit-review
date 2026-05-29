@@ -1,6 +1,8 @@
 matplotlib>=3.8.0
+numpy>=2.0.0
 pypdf>=5.0.0
 PyMuPDF>=1.24.0
+scikit-learn>=1.5.0
 tqdm>=4.66.0
 
 [dev]
