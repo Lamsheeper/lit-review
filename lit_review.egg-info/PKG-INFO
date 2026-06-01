@@ -12,140 +12,145 @@ Provides-Extra: dev
 
 # lit-review
 
-Pipeline for academic literature review.
+`lit-review` is a local pipeline for building an evidence-backed feature set
+from academic literature. The full path is:
 
-## LitHarvest
+```text
+draft.md / seed PDFs
+  -> LitHarvest paper collection
+  -> LitSynth PDF conversion and chunk index
+  -> LitExtract feature extraction
+  -> LLM curation
+  -> final feature inventory
+  -> comparison and sanity-check plots
+```
 
-LitHarvest is a literature collection tool. It can start from a plain-text or
-Markdown draft, extract search terms, query scholarly metadata APIs, and
-download open PDFs. It can also start from a small set of core PDFs, extract
-their reference lists with an LLM, resolve those cited papers through exact
-metadata lookups, and download reachable open PDFs.
+The repository is intentionally API-first. It does not scrape Google Scholar,
+bypass paywalls, solve CAPTCHAs, or automate browser sessions. LitHarvest uses
+open scholarly metadata APIs and downloads only PDFs that are openly accessible
+or directly exposed in returned metadata.
 
-LitHarvest does not scrape Google Scholar, bypass paywalls, solve CAPTCHAs, or
-automate browser sessions. It uses API-first sources and only downloads PDFs
-that are openly accessible or directly accessible from returned metadata.
+## 1. Set Up
 
-Supported search and resolution sources:
-
-- OpenAlex
-- Semantic Scholar
-- Crossref
-- Europe PMC
-- Unpaywall for DOI-based open-access PDF resolution
-
-## Requirements
-
-- Python 3.10 or newer
-- `uv` for project/environment management
-- Internet access for live API searches and PDF downloads
-- A draft file in `.txt` or `.md` format, or core PDFs for citation-seeded harvests
-
-LitHarvest itself uses only the Python standard library. The `uv` project
-installs `pypdf` so LitSynth can convert PDFs to text Markdown.
-
-## Setup
-
-Create the project environment:
+Install the project environment:
 
 ```bash
 uv sync
 ```
 
-This installs the default dependencies and exposes two commands:
+The package exposes these commands:
 
 ```bash
 uv run lit-harvest --help
 uv run lit-synthesize --help
+uv run lit-extract --help
+uv run lit-log-summary --help
+uv run comparison-plots --help
 ```
 
-## Quick Start
-
-Create or choose a draft file:
+For live harvests and LLM-backed extraction, set the credentials you need:
 
 ```bash
-cat > seed_paper.md <<'EOF'
-# Robust Sensor Fusion for Autonomous Flight
-
-This draft surveys robust sensor fusion methods for autonomous flight in
-degraded visual environments, including radar, inertial navigation, and visual
-odometry.
-EOF
+export LITHARVEST_EMAIL="you@example.com"
+export UNPAYWALL_EMAIL="you@example.com"
+export SEMANTIC_SCHOLAR_API_KEY="optional-semantic-scholar-key"
+export GEMINI_API_KEY="your-gemini-key"
+export OPENAI_API_KEY="your-openai-compatible-key"
 ```
 
-Run LitHarvest:
+The SemEval sanity configs use `GEMINI_API_KEY` through `api_key_env`. LitSynth
+and LitExtract also accept OpenAI-compatible keys through `OPENAI_API_KEY`,
+`LIT_SYNTH_OPENAI_API_KEY`, or `LIT_EXTRACT_OPENAI_API_KEY`.
+
+## 2. Define The Target Feature Set
+
+Use two Markdown files to keep the collection and extraction focused:
+
+- `draft.md`: search target for LitHarvest. This should describe the research
+  area, candidate labels, search phrases, and inclusion priorities.
+- `goal.md`: extraction and curation target. This should define the feature
+  families you want in the final taxonomy.
+
+For this repository, the current target is a persuasion/media attribute
+taxonomy with three major categories:
+
+- persuasion techniques
+- moral framing
+- sentiment or affective targeting
+
+Edit these files before starting a new feature-set run. The more explicit the
+target labels and exclusion criteria are, the less cleanup the curation stages
+need later.
+
+## 3. Harvest Candidate Papers
+
+Start with the checked-in SemEval sanity config, or copy it as a template for a
+new run:
 
 ```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --max-queries 8 \
-  --top-k-per-query 10 \
-  --email you@example.com
+uv run lit-harvest --config harvest_configs/config.semeval_2020_task11_sanity.json --dry-run
 ```
 
-After the run, check:
+The dry run previews draft parsing and generated queries without API calls or
+downloads. When the query set looks right, run the harvest:
+
+```bash
+uv run lit-harvest --config harvest_configs/config.semeval_2020_task11_sanity.json
+```
+
+The example config writes to:
 
 ```text
-collected_papers/
-├── *.pdf
-└── logs/
-    ├── manifest.json
-    └── download_log.json
+collected_semeval_2020_task11_papers/
+  *.pdf
+  logs/
+    manifest.json
+    download_log.json
+    candidates.json
+    candidates.csv
+    candidates.bib
 ```
 
-Create a compact source/outcome summary from an existing logs folder:
+`manifest.json` is the main run record. It contains the effective config,
+extracted terms, generated queries, every candidate, dedupe evidence, PDF
+resolution attempts, and download status. `download_log.json` is the resumable
+download ledger.
+
+If a harvest is interrupted, rerun the same command. LitHarvest reuses
+`logs/candidates.json` and skips completed downloads. Use these flags when you
+need to change that behavior:
 
 ```bash
-python3 lit_log_summary.py ./collected_papers/logs \
-  --output ./collected_papers/logs/service_summary.json
+uv run lit-harvest --config harvest_configs/config.semeval_2020_task11_sanity.json --refresh-candidates
+uv run lit-harvest --config harvest_configs/config.semeval_2020_task11_sanity.json --retry-failed-downloads
 ```
 
-If the project is installed as a package, the same command is available as
-`lit-log-summary`.
+To summarize which services produced candidates and PDFs:
 
-## Safe First Run
+```bash
+uv run lit-log-summary collected_semeval_2020_task11_papers/logs \
+  --output collected_semeval_2020_task11_papers/logs/service_summary.json
+```
 
-Use `--dry-run` to test draft parsing and query generation without making API
-calls or downloading files:
+Useful harvest controls:
+
+- `max_queries`, `top_k_per_query`, and `max_downloads` control run size.
+- `sources` can include `openalex`, `semantic_scholar`, `crossref`, and
+  `europe_pmc`.
+- `year_from` and `year_to` constrain publication years.
+- `unpaywall_email` enables DOI-based open-access PDF resolution.
+- `web_search_sources` can enable `brave` or `serpapi` fallback search when
+  API metadata does not expose PDF URLs.
+- `allow_abstract_fallback` controls whether abstract-only PDFs can be created.
+
+## 4. Optional: Harvest From Seed PDF Citations
+
+Use citation mode when you already have core PDFs and want one-hop collection
+from their reference lists. Citation extraction uses an LLM, then LitHarvest
+resolves the cited works through scholarly metadata APIs.
 
 ```bash
 uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --dry-run
-```
-
-Use `--metadata-only` to perform API searches and write manifests without
-attempting PDF downloads:
-
-```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --metadata-only \
-  --email you@example.com
-```
-
-Use `--no-abstract` to skip the abstract-only PDF fallback when no full PDF is
-available:
-
-```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --no-abstract
-```
-
-## Citation-Seed Harvest
-
-Use citation mode when you already have core papers as PDFs and want a one-hop
-collection of the papers they cite. Citation extraction uses an LLM, then
-LitHarvest resolves each extracted reference with exact scholarly lookups such
-as OpenAlex before attempting open PDF downloads.
-
-```bash
-uv run python -m lit_harvest \
   --harvest-mode citations \
   --core-pdf ./core_papers/paper1.pdf \
   --core-pdf-dir ./more_core_papers \
@@ -156,451 +161,403 @@ uv run python -m lit_harvest \
   --unpaywall-email you@example.com
 ```
 
-Supported citation extractors are:
+Supported citation extractors:
 
 - `direct_pdf`: send each core PDF directly to the LLM.
-- `pymupdf_markdown`: extract text with PyMuPDF, then send that text to the LLM.
+- `pymupdf_markdown`: extract text locally with PyMuPDF, then send text to the
+  LLM.
 
-Citation mode writes extracted reference artifacts under
-`logs/citation_extractions/` and defaults to real PDF downloads only. It will
-not create abstract-only placeholder PDFs unless `--allow-abstract-fallback` is
-set.
+Citation artifacts are written under `logs/citation_extractions/`.
 
-## Recommended Full Run
+## 5. Convert PDFs To A LitSynth Run
 
-For better open-access PDF resolution, provide an Unpaywall email. Semantic
-Scholar works without an API key, but an API key can improve reliability and
-rate limits.
+LitExtract works from a LitSynth run folder. First convert harvested PDFs to
+text Markdown:
 
 ```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --logs ./collected_papers/logs \
-  --max-queries 8 \
-  --top-k-per-query 10 \
-  --max-downloads 50 \
-  --email you@example.com \
-  --unpaywall-email you@example.com \
-  --semantic-scholar-api-key YOUR_KEY \
-  --csv-report \
-  --bibtex
+uv run lit-synthesize --config synth_configs/00_convert_semeval_2020_task11_sanity.json
 ```
 
-You can also provide credentials through environment variables:
-
-```bash
-export LITHARVEST_EMAIL="you@example.com"
-export UNPAYWALL_EMAIL="you@example.com"
-export SEMANTIC_SCHOLAR_API_KEY="YOUR_KEY"
-```
-
-## Configuration File
-
-Copy the example config and edit it:
-
-```bash
-cp config.example.json config.local.json
-```
-
-Run with the config:
-
-```bash
-uv run lit-harvest --config config.local.json
-```
-
-Command-line flags override values from the config file:
-
-```bash
-uv run lit-harvest \
-  --config config.local.json \
-  --draft ./another_draft.md \
-  --output ./another_collection
-```
-
-Important config fields:
-
-- `harvest_mode`: `draft` or `citations`
-- `draft`: input draft path
-- `core_pdf`: one or more core PDFs for citation mode
-- `core_pdf_dir`: folder of core PDFs for citation mode
-- `citation_extractor`: `direct_pdf` or `pymupdf_markdown`
-- `llm_provider`, `llm_model`, `llm_api_key`: citation extraction LLM settings
-- `output`: folder for downloaded PDFs
-- `logs`: folder for `manifest.json`, `download_log.json`, and optional reports
-- `candidates_json`: post-search checkpoint path, defaulting to `logs/candidates.json`
-- `refresh_candidates`: ignore an existing candidate checkpoint and run searches again
-- `retry_failed_downloads`: retry candidates marked failed in `download_log.json`
-- `max_queries`: maximum number of search queries generated from the draft
-- `extra_queries`: optional hand-curated seed queries searched before generated draft queries
-- `top_k_per_query`: maximum results per source per query
-- `sources`: enabled search sources
-- `year_from` and `year_to`: optional publication year filters
-- `email`: contact email for polite API usage
-- `unpaywall_email`: email required for Unpaywall DOI lookups
-- `semantic_scholar_api_key`: optional Semantic Scholar API key
-- `web_search_sources`: optional PDF web-search fallbacks, such as `brave` or `serpapi`
-- `web_search_max_candidates`: maximum ranked candidates to enrich with web search
-- `web_search_max_results`: maximum web results to inspect per web query
-- `web_search_queries_per_candidate`: maximum exact-title/DOI web queries per candidate
-- `brave_search_api_key`: optional Brave Search API key
-- `serpapi_api_key`: optional SerpAPI key for Google-style search results
-- `download_workers`: number of candidates to resolve/download in parallel
-- `progress`: show a terminal progress meter during PDF download
-- `max_pdf_mb`: maximum accepted PDF size
-- `max_downloads`: maximum successful PDF downloads
-- `metadata_only`: search without downloading PDFs
-- `no_abstract`: skip abstract-only fallback PDFs when no full PDF is available
-- `csv_report`: write `candidates.csv`
-- `bibtex`: write `candidates.bib`
-
-## Common Options
-
-Limit search to specific sources:
-
-```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --sources openalex,semantic_scholar
-```
-
-Limit by publication year:
-
-```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --year-from 2019 \
-  --year-to 2026
-```
-
-Reduce result volume for a fast trial:
-
-```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --max-queries 3 \
-  --top-k-per-query 5 \
-  --max-downloads 10
-```
-
-Enable web-search PDF fallback:
-
-```bash
-BRAVE_SEARCH_API_KEY=... uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --web-search-sources brave \
-  --web-search-max-candidates 100
-```
-
-For Google-style result pages through SerpAPI:
-
-```bash
-SERPAPI_API_KEY=... uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --web-search-sources serpapi
-```
-
-Reuse a completed candidate search and retry downloads:
-
-```bash
-uv run lit-harvest \
-  --config config.local.json
-```
-
-If `logs/candidates.json` already contains candidates, LitHarvest skips metadata
-search and continues with PDF resolution/download. During download, LitHarvest
-also updates `logs/download_log.json` after each candidate completes. On rerun,
-saved documents and prior failures in that log are skipped so interrupted runs do
-not start from scratch. To force a fresh candidate search:
-
-```bash
-uv run lit-harvest \
-  --config config.local.json \
-  --refresh-candidates
-```
-
-To retry prior failed downloads:
-
-```bash
-uv run lit-harvest \
-  --config config.local.json \
-  --retry-failed-downloads
-```
-
-Increase network tolerance:
-
-```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --timeout 30 \
-  --retries 4 \
-  --backoff 2 \
-  --rate-limit-delay 0.25
-```
-
-Speed up PDF retries/downloads:
-
-```bash
-uv run lit-harvest \
-  --config config.local.json \
-  --download-workers 8 \
-  --timeout 12 \
-  --retries 1 \
-  --backoff 1
-```
-
-The download phase shows a terminal progress meter with processed candidates,
-rate, elapsed time, ETA, and status counts. Candidates already skipped from the
-download log are excluded from the active progress total. Disable it with
-`--no-progress`.
-
-Show detailed logs:
-
-```bash
-uv run lit-harvest \
-  --draft ./seed_paper.md \
-  --output ./collected_papers \
-  --verbose
-```
-
-## Outputs
-
-`manifest.json` contains the full run record:
-
-- draft path, hash, and character count
-- effective configuration with API keys redacted
-- extracted title, headings, keywords, noun phrases, and domain terms
-- generated search queries
-- all discovered candidates
-- candidate checkpoint status and path
-- source metadata, DOI, authors, venue, year, abstract, URLs, and scores
-- deduplication and merged-source evidence
-- PDF resolution attempts
-- download status for each candidate
-
-`download_log.json` contains a smaller download-focused record:
-
-- resumable per-candidate records keyed by filename/title/DOI
-- successful downloads
-- failed downloads and reasons
-- per-URL download attempts
-- search errors
-
-Optional reports:
-
-- `candidates.json` with the post-search, pre-download candidate checkpoint
-- `candidates.csv` with a spreadsheet-friendly candidate summary
-- `candidates.bib` with a lightweight BibTeX export
-
-PDF filenames use this pattern:
+The example config reads:
 
 ```text
-year_firstauthor_shorttitle_hash.pdf
+papers:   collected_semeval_2020_task11_papers
+manifest: collected_semeval_2020_task11_papers/logs/manifest.json
+out:      review_runs/semeval_2020_task11_sanity
 ```
 
-Example:
+Expected conversion artifacts:
 
 ```text
-2024_lovelace_sensor_fusion_radar_visual_navigation_1a2b3c4d5e.pdf
+review_runs/semeval_2020_task11_sanity/
+  papers_md/*.md
+  paper_index.json
 ```
 
-## How the Pipeline Works
+`uv sync` installs `pypdf` and `PyMuPDF`, so `extractor: auto` should work for
+most PDFs. If Poppler is installed, LitSynth can also use `pdftotext`.
 
-1. Reads the draft and normalizes text.
-2. Extracts title-like lines, Markdown headings, repeated terms, noun-like
-   n-grams, acronyms, and hyphenated technical terms.
-3. Builds a compact set of search queries.
-4. Searches enabled API sources.
-5. Normalizes metadata into a shared candidate format.
-6. Deduplicates candidates by DOI, normalized title, and title-year-author
-   heuristics.
-7. Ranks candidates with keyword overlap, title/abstract similarity signals,
-   source relevance scores, citations, recency, DOI presence, and PDF
-   availability.
-8. Resolves PDF URLs from source metadata and Unpaywall when a DOI is available.
-9. Downloads only responses that validate as PDFs.
-10. Writes the manifest and download log.
+## 6. Build And Inspect The Chunk Index
 
-## What LitHarvest Will Not Do
+Build the SQLite FTS/BM25 index:
 
-- It will not scrape Google Scholar.
-- It will not bypass paywalls, login walls, robot protections, or CAPTCHAs.
-- It will not OCR downloaded PDFs.
-- It will not summarize papers.
-- It will not synthesize citations into your draft.
+```bash
+uv run lit-synthesize --config synth_configs/01_index_semeval_2020_task11_sanity.json
+```
 
-## LitSynth: Downstream Review Agent
-
-`lit_synthesize.py` is the downstream companion to LitHarvest. It takes the
-collected PDFs, converts them to basic text-only Markdown, builds a local search
-index over paper chunks, and writes a goal-driven Markdown report.
-
-The workflow is intentionally evidence-bound:
+Expected index artifacts:
 
 ```text
-collected PDFs + manifest.json
-  -> papers_md/*.md
-  -> index.sqlite + chunks.jsonl
-  -> BM25 retrieval from goal.md
-  -> report.md + agent_trace.json
+review_runs/semeval_2020_task11_sanity/
+  index.sqlite
+  chunks.jsonl
+  index_meta.json
 ```
 
-### Optional PDF Text Extractors
-
-PDF text conversion needs one local extractor. `uv sync` installs `pypdf` and
-`PyMuPDF` by default. You can also provide:
-
-- Poppler's `pdftotext` (install via `brew install poppler` on macOS)
-
-If no extractor is available, LitSynth records conversion failures in
-`paper_index.json` instead of guessing.
-
-### Three-Step Use
-
-Create a goal file:
-
-```bash
-cat > goal.md <<'EOF'
-# Propaganda Persuasion Taxonomy Review
-
-Build a non-redundant taxonomy for persuasion techniques, moral framing,
-intended reader emotion, and stance toward institutions in media texts.
-EOF
-```
-
-Convert collected PDFs:
-
-```bash
-uv run lit-synthesize convert \
-  --papers collected_papers/04_small_pdf_download \
-  --manifest collected_papers/04_small_pdf_download/logs/manifest.json \
-  --out review_runs/propaganda_review
-```
-
-Build the search index:
-
-```bash
-uv run lit-synthesize index \
-  --run review_runs/propaganda_review
-```
-
-Write a report:
-
-```bash
-uv run lit-synthesize write \
-  --run review_runs/propaganda_review \
-  --goal goal.md \
-  --output review_runs/propaganda_review/report.md
-```
-
-Without an API key, `write` creates an offline extractive evidence report. With
-an OpenAI-compatible API key, it plans research questions and writes a narrative
-synthesis while citing retrieved chunk IDs.
-
-```bash
-export OPENAI_API_KEY="..."
-export LIT_SYNTH_LLM_MODEL="gpt-4o-mini"
-
-uv run lit-synthesize write \
-  --run review_runs/propaganda_review \
-  --goal goal.md \
-  --output review_runs/propaganda_review/report.md
-```
-
-You can also run all phases together:
-
-```bash
-uv run lit-synthesize run \
-  --papers collected_papers/04_small_pdf_download \
-  --manifest collected_papers/04_small_pdf_download/logs/manifest.json \
-  --goal goal.md \
-  --out review_runs/propaganda_review \
-  --report review_runs/propaganda_review/report.md
-```
-
-### Inspect Retrieval
-
-Before trusting a report, search the index directly:
+Before extraction, spot-check retrieval against the goal:
 
 ```bash
 uv run lit-synthesize search \
-  --run review_runs/propaganda_review \
-  --query "moral framing authority loyalty news media" \
+  --run review_runs/semeval_2020_task11_sanity \
+  --query "propaganda technique taxonomy loaded language name calling" \
   --limit 5
 ```
 
-### Config-Driven Test Runs
+If the retrieved chunks are obviously off-topic, fix the harvest target or
+collection before spending LLM budget on extraction.
 
-LitSynth can also run from JSON configs:
+## 7. Optional: Write A Review Report
+
+This is not required to produce the feature set, but it is useful for reviewing
+the corpus.
 
 ```bash
-uv run lit-synthesize --config synthesize_configs/00_convert_pdf_text.json
-uv run lit-synthesize --config synthesize_configs/01_index_balanced_chunks.json
-uv run lit-synthesize --config synthesize_configs/02_search_moral_framing.json
-uv run lit-synthesize --config synthesize_configs/03_write_offline_evidence_report.json
+uv run lit-synthesize write \
+  --run review_runs/semeval_2020_task11_sanity \
+  --goal goal.md \
+  --output review_runs/semeval_2020_task11_sanity/report.md
 ```
 
-The config runner accepts a `command` field matching a LitSynth subcommand
-(`convert`, `index`, `search`, `write`, or `run`). API-backed configs can use
-`api_key_env` to read a key from the environment without storing secrets.
+Without an API key, LitSynth writes an offline extractive evidence report. With
+an OpenAI-compatible key, it writes a narrative synthesis with retrieved chunk
+citations.
 
-Key generated files:
+You can also run convert, index, and write in one command for future runs:
 
-- `papers_md/*.md`: text-only Markdown papers with page headings
-- `paper_index.json`: PDF-to-Markdown conversion records
-- `index.sqlite`: SQLite FTS/BM25 chunk index
-- `chunks.jsonl`: transparent chunk export
-- `agent_trace.json`: plan, retrieved evidence, and citation checks
-- `report.md`: generated literature review report
+```bash
+uv run lit-synthesize run \
+  --papers collected_semeval_2020_task11_papers \
+  --manifest collected_semeval_2020_task11_papers/logs/manifest.json \
+  --goal goal.md \
+  --out review_runs/semeval_2020_task11_sanity \
+  --report review_runs/semeval_2020_task11_sanity/report.md
+```
+
+## 8. Preview Feature Extraction
+
+The first LitExtract pass scans the LitSynth corpus and produces raw feature
+mentions, paper-level features, and corpus-level features.
+
+Preview the workload without LLM calls:
+
+```bash
+uv run lit-extract --config extract_configs/00_extract_semeval_2020_task11_pdf.json --dry-run
+```
+
+The example config uses direct PDF mode:
+
+```json
+{
+  "command": "run",
+  "run": "review_runs/semeval_2020_task11_sanity",
+  "output_dir": "review_runs/semeval_2020_task11_sanity/feature_extract_pdf",
+  "goal": "goal.md",
+  "api_key_env": "GEMINI_API_KEY",
+  "api_provider": "gemini",
+  "input_mode": "pdf"
+}
+```
+
+Use `input_mode: "pdf"` when your model accepts PDFs and the original PDF paths
+are available in `paper_index.json`. Use `input_mode: "chunks"` for
+OpenAI-compatible text-only extraction from `chunks.jsonl`.
+
+Helpful controls:
+
+- `paper_limit`: small smoke tests before scanning the full corpus.
+- `batch_chunks`: number of text chunks per request in chunk mode.
+- `max_features_per_chunk` and `max_features_per_pdf`: extraction breadth.
+- `max_chunk_chars`: prompt size control in chunk mode.
+- `force`: overwrite existing extraction outputs.
+
+## 9. Run Raw Feature Extraction
+
+Run the first pass:
+
+```bash
+uv run lit-extract --config extract_configs/00_extract_semeval_2020_task11_pdf.json
+```
+
+Expected first-pass artifacts:
+
+```text
+review_runs/semeval_2020_task11_sanity/feature_extract_pdf/
+  feature_mentions.jsonl
+  feature_mentions.csv
+  paper_features.jsonl
+  paper_features.csv
+  features.jsonl
+  features.csv
+  completed_papers.jsonl
+  extraction_errors.jsonl
+  extraction_trace.json
+```
+
+Use `features.csv` for a quick spreadsheet review. Use `features.jsonl` as the
+machine-readable input to curation.
+
+## 10. Curate And Consolidate Features
+
+Curation merges duplicates, normalizes canonical names, records member
+mappings, and rejects off-goal or non-taxonomic rows.
+
+Preview the curation batches:
+
+```bash
+uv run lit-extract --config extract_configs/01_curate_semeval_2020_task11_pdf.json --dry-run
+```
+
+Run curation:
+
+```bash
+uv run lit-extract --config extract_configs/01_curate_semeval_2020_task11_pdf.json
+```
+
+Expected curation artifacts:
+
+```text
+review_runs/semeval_2020_task11_sanity/feature_extract_pdf/
+  curated_features.jsonl
+  curated_features.csv
+  curated_feature_members.jsonl
+  curated_feature_members.csv
+  rejected_features.jsonl
+  rejected_features.csv
+  final_curated_features_top100_by_category.jsonl
+  final_curated_features_top100_by_category.csv
+  curation_trace.json
+```
+
+`merge_style` controls synonym merging:
+
+- `conservative`: merge only obvious duplicates.
+- `moderate`: default balance for near-synonyms.
+- `aggressive`: broader merges, useful when the raw extraction is noisy.
+
+## 11. Finalize The Feature Set
+
+The finalization pass sends ranked curated candidates by category to the LLM and
+asks for a publication-ready top feature set.
+
+Preview finalization:
+
+```bash
+uv run lit-extract --config extract_configs/02_finalize_semeval_2020_task11_pdf.json --dry-run
+```
+
+Run finalization:
+
+```bash
+uv run lit-extract --config extract_configs/02_finalize_semeval_2020_task11_pdf.json
+```
+
+The final feature inventory is:
+
+```text
+review_runs/semeval_2020_task11_sanity/feature_extract_pdf/
+  final_curated_features_llm_top100_by_category.jsonl
+  final_curated_features_llm_top100_by_category.csv
+```
+
+Supporting finalization artifacts:
+
+```text
+final_curated_feature_members_llm.jsonl
+final_curated_feature_members_llm.csv
+final_rejected_features_llm.jsonl
+final_rejected_features_llm.csv
+final_curation_decisions.jsonl
+final_curation_trace.json
+```
+
+Use the JSONL final file for downstream scripts that expect structured feature
+rows. Use the CSV final file for manual review or spreadsheet handoff.
+
+## 12. Sanity-Check Against The SemEval Inventory
+
+The SemEval sanity check compares final extracted features with the expected
+Task 11 propaganda-technique labels in
+`sanity_checks/semeval_2020_task11/expected_features.csv`.
+
+Run the default comparison:
+
+```bash
+uv run python sanity_checks/semeval_2020_task11/compare_expected_features.py
+```
+
+Compare a specific final artifact:
+
+```bash
+uv run python sanity_checks/semeval_2020_task11/compare_expected_features.py \
+  --features review_runs/semeval_2020_task11_sanity/feature_extract_pdf/final_curated_features_llm_top100_by_category.csv \
+  --show-unmatched
+```
+
+Fail a CI-style run if coverage is too low:
+
+```bash
+uv run python sanity_checks/semeval_2020_task11/compare_expected_features.py \
+  --features review_runs/semeval_2020_task11_sanity/feature_extract_pdf/final_curated_features_llm_top100_by_category.csv \
+  --fail-under 10
+```
+
+Generate the SemEval coverage figures:
+
+```bash
+uv run python sanity_checks/semeval_2020_task11/plot_expected_features.py \
+  --extract-dir review_runs/semeval_2020_task11_sanity/feature_extract_pdf \
+  --output-dir review_runs/semeval_2020_task11_sanity/feature_extract_pdf/figures
+```
+
+These figures summarize stage coverage, expected-label support in the final
+output, category mix, and unmatched final features.
+
+## 13. Compare Two Feature Sets
+
+Use `comparison-plots` to compare two LitExtract-style JSON or JSONL feature
+exports. The script does not read CSV input; use the `.jsonl` final artifacts.
+
+```bash
+uv run comparison-plots \
+  review_runs/run_a/feature_extract_pdf/final_curated_features_llm_top100_by_category.jsonl \
+  review_runs/run_b/feature_extract_pdf/final_curated_features_llm_top100_by_category.jsonl \
+  --name-1 "Run A" \
+  --name-2 "Run B" \
+  --top-a 1 \
+  --top-b 100 \
+  --top-k 100 \
+  --output-dir review_runs/comparisons/run_a_vs_run_b \
+  --prefix run_a_vs_run_b
+```
+
+Main outputs:
+
+```text
+review_runs/comparisons/run_a_vs_run_b/
+  run_a_vs_run_b_jaccard_top_1_100.png
+  run_a_vs_run_b_venn_top_100.png
+  run_a_vs_run_b_scatter_top_100.png
+  run_a_vs_run_b_features.json
+  run_a_vs_run_b_unique_top10.md
+  run_a_vs_run_b_final_features.json
+  run_a_vs_run_b_final_features.csv
+```
+
+By default, `top-k` is applied per category, which keeps persuasion, moral
+framing, and sentiment/affect from being dominated by the largest category.
+
+Useful options:
+
+- `--match-scope category`: match by category plus normalized feature name.
+- `--match-scope name`: match by normalized feature name only.
+- `--match-normalization singular`: merge simple plural variants.
+- `--venn-k` and `--scatter-k`: override the default `--top-k` for those plots.
+- `--scatter-scale log`: compare feature support on a log scale.
+- `--annotate-top N`: label high-count scatter points.
+- `--no-category-plots`: write only overall plots.
+- `--final-category-k CATEGORY=K`: manually choose final export size for one
+  category.
+
+For optional semantic matching with Gemini:
+
+```bash
+uv run comparison-plots \
+  review_runs/run_a/feature_extract_pdf/final_curated_features_llm_top100_by_category.jsonl \
+  review_runs/run_b/feature_extract_pdf/final_curated_features_llm_top100_by_category.jsonl \
+  --name-1 "Run A" \
+  --name-2 "Run B" \
+  --semantic-match gemini \
+  --gemini-api-key "$GEMINI_API_KEY" \
+  --output-dir review_runs/comparisons/run_a_vs_run_b_semantic \
+  --prefix run_a_vs_run_b_semantic
+```
+
+The semantic run writes accepted matches to
+`<output-dir>/<prefix>_semantic_matches.json` before generating the plots.
+
+## 14. tSNE Script Status
+
+There is currently no checked-in tSNE script or `tSNE` console command in this
+repository. A search of the tracked files shows only these plotting entry
+points:
+
+- `comparison_plots.py`
+- `sanity_checks/semeval_2020_task11/plot_expected_features.py`
+
+Until a tSNE script is added, use `comparison-plots` for feature-set overlap
+and support plots. When a tSNE script is added, it should use the same finalized
+feature artifact used above:
+
+```text
+review_runs/<run_name>/feature_extract_pdf/final_curated_features_llm_top100_by_category.jsonl
+```
 
 ## Testing
 
-Run the local tests:
+Run the test suite:
 
 ```bash
 uv run python -m unittest discover
 ```
 
-Run syntax checks:
+Run syntax checks for the main scripts:
 
 ```bash
-uv run python -m py_compile lit_harvest.py lit_synthesize.py test_lit_harvest.py test_lit_synthesize.py
+uv run python -m py_compile \
+  lit_harvest.py \
+  lit_synthesize.py \
+  lit_extract.py \
+  comparison_plots.py \
+  lit_log_summary.py
 ```
 
-Run a no-network smoke test:
+Run a no-network harvest smoke test:
 
 ```bash
 uv run lit-harvest \
-  --draft README_lit_harvest.md \
+  --draft draft.md \
   --output /tmp/litharvest_smoke \
   --dry-run
 ```
 
 ## Troubleshooting
 
-If few or no PDFs download, check `manifest.json`. Many scholarly APIs return
-metadata without direct PDF URLs, and some open-access records only expose HTML
+If few PDFs download, inspect `logs/manifest.json`. Many scholarly APIs return
+metadata without direct PDFs, and some open-access records expose only HTML
 landing pages.
 
-If Semantic Scholar returns rate-limit or authentication errors, use
-`--semantic-scholar-api-key` or lower `--top-k-per-query`.
+If a run is too broad, reduce `max_queries`, `top_k_per_query`, or
+`max_downloads`; add year filters; or narrow `draft.md`.
 
-If Unpaywall is skipped, provide `--unpaywall-email` or set
-`UNPAYWALL_EMAIL`.
+If a run is too narrow, add explicit `extra_queries`, include all metadata
+sources, and make the draft include title-like phrases, known seed papers,
+candidate labels, acronyms, and repeated technical terms.
 
-If downloaded URLs return HTML instead of PDFs, LitHarvest records the failure
-and skips the file. This is expected for landing pages, stale links, and pages
-that require interaction.
+If extraction produces generic ML features, tighten `goal.md` and reduce the
+model's room to infer off-goal categories. The extraction prompt already asks
+the model to ignore generic machine-learning features unless they are directly
+used as persuasion, moral framing, or affect labels.
 
-If a run is too broad, reduce `--max-queries`, reduce `--top-k-per-query`, add
-year filters, or limit `--sources`.
-
-If a run is too narrow, increase `--max-queries`, increase `--top-k-per-query`,
-include all sources, and use a draft that contains a title, abstract, headings,
-and repeated technical terms.
+If curation over-merges labels, rerun `lit-extract curate` or `finalize` with
+`merge_style: "conservative"`. If it leaves too many near-duplicates, try
+`merge_style: "aggressive"`.
