@@ -27,9 +27,10 @@ lit-log-summary = "lit_log_summary:main"
 lit-synthesize = "lit_synthesize:main"
 comparison-plots = "comparison_plots:main"
 feature-embedding-tsne = "feature_embedding_tsne:main"
+embedding-merge = "embedding_merge:main"
 
 [tool.setuptools]
-py-modules = ["comparison_plots", "feature_embedding_tsne", "lit_extract", "lit_harvest", "lit_log_summary", "lit_pdf_service", "lit_synthesize"]
+py-modules = ["comparison_plots", "embedding_merge", "feature_embedding_tsne", "lit_extract", "lit_harvest", "lit_log_summary", "lit_pdf_service", "lit_synthesize"]
 
 [tool.uv]
 package = true

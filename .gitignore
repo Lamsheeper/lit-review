@@ -25,3 +25,4 @@ extract_configs/*
 !extract_configs/00_extract_semeval_2020_task11_pdf.json
 !extract_configs/01_curate_semeval_2020_task11_pdf.json
 !extract_configs/02_finalize_semeval_2020_task11_pdf.json
+!extract_configs/03_annotate_media_attributes_v3.json

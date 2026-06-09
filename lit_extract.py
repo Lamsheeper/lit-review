@@ -39,6 +39,8 @@ except ImportError:  # pragma: no cover - dependency is optional at runtime
 
 VERSION = "0.1.0"
 PROMPT_VERSION = "lit_extract_v1"
+ANNOTATION_PROMPT_VERSION = "lit_extract_annotation_v5"
+SCORING_PROMPT_VERSION = "lit_extract_scoring_v1"
 LOGGER = logging.getLogger("litextract")
 PDF_INPUT_MAX_BYTES = 50 * 1024 * 1024
 
@@ -46,6 +48,12 @@ CATEGORIES = {"persuasion", "moral_framing", "sentiment_affect"}
 CATEGORY_EXPORT_ORDER = ["persuasion", "moral_framing", "sentiment_affect"]
 EVIDENCE_TYPES = {"definition", "taxonomy_row", "example", "named_mention"}
 FINAL_FEATURES_PER_CATEGORY = 100
+EXCLUDED_ANNOTATION_REPORT_LIMIT_PER_CATEGORY = 25
+ANNOTATION_FIGURE_FILENAMES = [
+    "annotation_status_counts.png",
+    "annotation_excluded_by_category.png",
+    "annotation_status_by_category.png",
+]
 TITLE_RANK_RULES = [
     (r"\btaxonom(?:y|ies)\b", 14),
     (r"\bclassification\b", 5),
@@ -137,6 +145,42 @@ CONFIG_ARG_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("target_per_category", "--target-per-category"),
         ("candidate_pool_per_category", "--candidate-pool-per-category"),
         ("merge_style", "--merge-style"),
+        ("temperature", "--temperature"),
+        ("max_tokens", "--max-tokens"),
+        ("timeout", "--timeout"),
+        ("force", "--force"),
+        ("dry_run", "--dry-run"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
+    "annotate": [
+        ("input_file", "--input-file"),
+        ("output_dir", "--output-dir"),
+        ("goal", "--goal"),
+        ("api_key", "--api-key"),
+        ("model", "--model"),
+        ("base_url", "--base-url"),
+        ("api_provider", "--api-provider"),
+        ("reasoning_effort", "--reasoning-effort"),
+        ("batch_features", "--batch-features"),
+        ("temperature", "--temperature"),
+        ("max_tokens", "--max-tokens"),
+        ("timeout", "--timeout"),
+        ("force", "--force"),
+        ("dry_run", "--dry-run"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
+    "score": [
+        ("input_file", "--input-file"),
+        ("output_dir", "--output-dir"),
+        ("goal", "--goal"),
+        ("api_key", "--api-key"),
+        ("model", "--model"),
+        ("base_url", "--base-url"),
+        ("api_provider", "--api-provider"),
+        ("reasoning_effort", "--reasoning-effort"),
+        ("batch_features", "--batch-features"),
         ("temperature", "--temperature"),
         ("max_tokens", "--max-tokens"),
         ("timeout", "--timeout"),
@@ -289,6 +333,103 @@ REJECTED_FEATURE_FIELDNAMES = [
     "curated_at",
 ]
 
+ANNOTATED_FEATURE_FIELDNAMES = list(
+    dict.fromkeys(
+        [
+            "feature_key",
+            *CURATED_FEATURE_FIELDNAMES,
+            *FEATURE_FIELDNAMES,
+            "annotation_status",
+            "annotation_formal_definition",
+            "annotation_short_definition",
+            "annotation_synonyms",
+            "annotation_examples",
+            "annotation_paper_count",
+            "annotation_mention_count",
+            "annotation_confidence",
+            "annotation_definition_basis",
+            "annotation_notes",
+            "annotation_model",
+            "annotation_run_id",
+            "annotation_annotated_at",
+        ]
+    )
+)
+
+SCORED_FEATURE_FIELDNAMES = list(
+    dict.fromkeys(
+        [
+            "feature_key",
+            *CURATED_FEATURE_FIELDNAMES,
+            *FEATURE_FIELDNAMES,
+            "annotation",
+            "embedding_merge",
+            *ANNOTATED_FEATURE_FIELDNAMES,
+            "score",
+            "score_literature_support",
+            "score_literature_support_rationale",
+            "score_annotation_reliability",
+            "score_annotation_reliability_rationale",
+            "score_distinctiveness",
+            "score_distinctiveness_rationale",
+            "score_total",
+            "score_confidence",
+            "score_notes",
+            "score_model",
+            "score_run_id",
+            "score_scored_at",
+        ]
+    )
+)
+
+FEATURE_INVENTORY_JSON_FIELDS = {
+    "annotation",
+    "embedding_merge",
+    "score",
+    "authors",
+    "pages",
+    "chunk_ids",
+    "parent_categories",
+    "definitions",
+    "synonyms",
+    "examples",
+    "source_paper_ids",
+    "source_titles",
+    "source_feature_names",
+    "source_normalized_feature_names",
+    "evidence_types",
+    "annotation_synonyms",
+    "annotation_examples",
+    "score_neighbors",
+}
+FEATURE_INVENTORY_INT_FIELDS = {
+    "year",
+    "paper_count",
+    "mention_count",
+    "member_count",
+    "annotation_paper_count",
+    "annotation_mention_count",
+    "score_literature_support",
+    "score_annotation_reliability",
+    "score_distinctiveness",
+}
+FEATURE_INVENTORY_FLOAT_FIELDS = {
+    "confidence",
+    "source_confidence_avg",
+    "source_confidence_max",
+    "curation_confidence",
+    "annotation_confidence",
+    "score_total",
+    "score_confidence",
+}
+SCORING_PERCENTILES = [5, 10, 25, 50, 75, 90, 95]
+SCORING_FIGURE_FILENAMES = [
+    "scoring_total_distribution.png",
+    "scoring_criteria_distributions.png",
+    "scoring_percentiles.png",
+    "scoring_total_percentiles_by_category.png",
+]
+
 RELEVANCE_PATTERNS = [
     r"\bpersuasion\b",
     r"\bpersuasive\b",
@@ -372,6 +513,30 @@ class FinalCurationStats:
     repaired_json_count: int = 0
 
 
+@dataclass
+class AnnotationStats:
+    feature_count: int = 0
+    batch_count: int = 0
+    completed_batch_count: int = 0
+    skipped_batch_count: int = 0
+    failed_batch_count: int = 0
+    annotation_count: int = 0
+    needs_review_count: int = 0
+    excluded_count: int = 0
+    repaired_json_count: int = 0
+
+
+@dataclass
+class ScoringStats:
+    feature_count: int = 0
+    batch_count: int = 0
+    completed_batch_count: int = 0
+    skipped_batch_count: int = 0
+    failed_batch_count: int = 0
+    scoring_count: int = 0
+    repaired_json_count: int = 0
+
+
 class NullProgress:
     def __enter__(self) -> "NullProgress":
         return self
@@ -414,6 +579,14 @@ def curation_progress(total: int, show: bool) -> Any:
 
 def final_curation_progress(total: int, show: bool) -> Any:
     return progress_bar(total=total, desc="Finalizing features", unit="feature", show=show)
+
+
+def annotation_progress(total: int, show: bool) -> Any:
+    return progress_bar(total=total, desc="Annotating features", unit="feature", show=show)
+
+
+def scoring_progress(total: int, show: bool) -> Any:
+    return progress_bar(total=total, desc="Scoring features", unit="feature", show=show)
 
 
 def clean_api_key(api_key: str) -> str:
@@ -971,6 +1144,148 @@ def parse_curation_json_with_repair(
             ) from repair_exc
 
 
+def parse_annotation_json(content: str) -> list[dict[str, Any]]:
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+
+    payload: Any
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        object_start = stripped.find("{")
+        object_end = stripped.rfind("}")
+        if object_start == -1 or object_end <= object_start:
+            raise
+        payload = json.loads(stripped[object_start : object_end + 1])
+
+    if not isinstance(payload, dict):
+        raise ValueError("Expected a JSON object with annotations.")
+    annotations = payload.get("annotations", [])
+    if not isinstance(annotations, list):
+        raise ValueError("Expected annotations to be a list.")
+    return [item for item in annotations if isinstance(item, dict)]
+
+
+def repair_annotation_json(raw_content: str, client: ChatCompletionClient) -> str:
+    return client.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You repair malformed JSON. Return only one valid JSON object "
+                    "with an annotations array. Do not add Markdown fences or explanation."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Repair this annotation response into valid JSON with exactly one "
+                    "top-level key, annotations. Preserve all annotation objects and "
+                    "fields that can be recovered. Escape embedded quotes and newlines "
+                    "in string values. If no annotations can be recovered, return "
+                    '{"annotations": []}.\n\n'
+                    f"MALFORMED RESPONSE:\n{raw_content[:20000]}"
+                ),
+            },
+        ],
+        temperature=0.0,
+        max_tokens=5000,
+        response_format={"type": "json_object"},
+    )
+
+
+def parse_annotation_json_with_repair(
+    content: str,
+    client: ChatCompletionClient | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    try:
+        return parse_annotation_json(content), False
+    except (json.JSONDecodeError, ValueError) as exc:
+        if client is None:
+            raise
+        LOGGER.warning("Model returned malformed annotation JSON; asking model to repair it: %s", exc)
+        repaired = repair_annotation_json(content, client=client)
+        try:
+            return parse_annotation_json(repaired), True
+        except (json.JSONDecodeError, ValueError) as repair_exc:
+            raise ValueError(
+                f"Model annotation JSON parse failed: {exc}; repair failed: {repair_exc}"
+            ) from repair_exc
+
+
+def parse_scoring_json(content: str) -> list[dict[str, Any]]:
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+
+    payload: Any
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        object_start = stripped.find("{")
+        object_end = stripped.rfind("}")
+        if object_start == -1 or object_end <= object_start:
+            raise
+        payload = json.loads(stripped[object_start : object_end + 1])
+
+    if not isinstance(payload, dict):
+        raise ValueError("Expected a JSON object with scores.")
+    scores = payload.get("scores", [])
+    if not isinstance(scores, list):
+        raise ValueError("Expected scores to be a list.")
+    return [item for item in scores if isinstance(item, dict)]
+
+
+def repair_scoring_json(raw_content: str, client: ChatCompletionClient) -> str:
+    return client.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You repair malformed JSON. Return only one valid JSON object "
+                    "with a scores array. Do not add Markdown fences or explanation."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Repair this scoring response into valid JSON with exactly one "
+                    "top-level key, scores. Preserve all score objects and fields "
+                    "that can be recovered. Escape embedded quotes and newlines "
+                    "in string values. If no scores can be recovered, return "
+                    '{"scores": []}.\n\n'
+                    f"MALFORMED RESPONSE:\n{raw_content[:20000]}"
+                ),
+            },
+        ],
+        temperature=0.0,
+        max_tokens=5000,
+        response_format={"type": "json_object"},
+    )
+
+
+def parse_scoring_json_with_repair(
+    content: str,
+    client: ChatCompletionClient | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    try:
+        return parse_scoring_json(content), False
+    except (json.JSONDecodeError, ValueError) as exc:
+        if client is None:
+            raise
+        LOGGER.warning("Model returned malformed scoring JSON; asking model to repair it: %s", exc)
+        repaired = repair_scoring_json(content, client=client)
+        try:
+            return parse_scoring_json(repaired), True
+        except (json.JSONDecodeError, ValueError) as repair_exc:
+            raise ValueError(
+                f"Model scoring JSON parse failed: {exc}; repair failed: {repair_exc}"
+            ) from repair_exc
+
+
 def is_taxonomy_relevant(item: dict[str, Any], chunk_text: str, paper: dict[str, Any]) -> bool:
     haystack = "\n".join(
         [
@@ -1100,6 +1415,182 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             if not line.strip():
                 continue
             rows.append(json.loads(line))
+    return rows
+
+
+def parse_jsonish_csv_cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    if stripped[0] in "[{\"" or stripped in {"null", "true", "false"}:
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return stripped
+    return stripped
+
+
+def csv_int_value(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(str(value)))
+        except (TypeError, ValueError):
+            return 0
+
+
+def csv_float_value(value: Any) -> float | str:
+    if value in (None, ""):
+        return ""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def rebuild_annotation_from_flat_fields(row: dict[str, Any]) -> None:
+    if isinstance(row.get("annotation"), dict):
+        return
+    mapping = {
+        "annotation_status": "status",
+        "annotation_formal_definition": "formal_definition",
+        "annotation_short_definition": "short_definition",
+        "annotation_synonyms": "synonyms",
+        "annotation_examples": "examples",
+        "annotation_paper_count": "paper_count",
+        "annotation_mention_count": "mention_count",
+        "annotation_confidence": "confidence",
+        "annotation_definition_basis": "definition_basis",
+        "annotation_notes": "notes",
+        "annotation_model": "model",
+        "annotation_run_id": "run_id",
+        "annotation_annotated_at": "annotated_at",
+    }
+    annotation: dict[str, Any] = {}
+    for csv_field, annotation_field in mapping.items():
+        value = row.get(csv_field)
+        if value in (None, "", [], {}):
+            continue
+        annotation[annotation_field] = value
+    if annotation:
+        row["annotation"] = annotation
+
+
+def rebuild_score_from_flat_fields(row: dict[str, Any]) -> None:
+    if isinstance(row.get("score"), dict):
+        return
+    mapping = {
+        "score_literature_support": "literature_support",
+        "score_literature_support_rationale": "literature_support_rationale",
+        "score_annotation_reliability": "annotation_reliability",
+        "score_annotation_reliability_rationale": "annotation_reliability_rationale",
+        "score_distinctiveness": "distinctiveness",
+        "score_distinctiveness_rationale": "distinctiveness_rationale",
+        "score_total": "total",
+        "score_confidence": "confidence",
+        "score_notes": "notes",
+        "score_model": "model",
+        "score_run_id": "run_id",
+        "score_scored_at": "scored_at",
+    }
+    score: dict[str, Any] = {}
+    for csv_field, score_field in mapping.items():
+        value = row.get(csv_field)
+        if value in (None, "", [], {}):
+            continue
+        score[score_field] = value
+    if score:
+        row["score"] = score
+
+
+def read_csv_feature_inventory(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    list_json_fields = FEATURE_INVENTORY_JSON_FIELDS - {"annotation", "embedding_merge", "score"}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        for raw_row in csv.DictReader(handle):
+            row: dict[str, Any] = {}
+            for field, raw_value in raw_row.items():
+                if field is None:
+                    continue
+                if field in FEATURE_INVENTORY_JSON_FIELDS:
+                    value = parse_jsonish_csv_cell(raw_value)
+                    if field in list_json_fields and isinstance(value, str):
+                        value = coerce_str_list(value)
+                    row[field] = value
+                elif field in FEATURE_INVENTORY_INT_FIELDS:
+                    row[field] = csv_int_value(raw_value)
+                elif field in FEATURE_INVENTORY_FLOAT_FIELDS:
+                    row[field] = csv_float_value(raw_value)
+                else:
+                    row[field] = "" if raw_value is None else raw_value
+            rebuild_annotation_from_flat_fields(row)
+            rebuild_score_from_flat_fields(row)
+            rows.append(ensure_feature_identity(row))
+    return rows
+
+
+def read_feature_inventory(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Feature inventory does not exist: {path}")
+    if path.suffix.lower() == ".csv":
+        return read_csv_feature_inventory(path)
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        return []
+    if path.suffix.lower() == ".jsonl":
+        return [ensure_feature_identity(row) for row in read_jsonl_rows_from_text(path, raw)]
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return [ensure_feature_identity(row) for row in read_jsonl_rows_from_text(path, raw)]
+    return [ensure_feature_identity(row) for row in coerce_feature_inventory_rows(parsed, path)]
+
+
+def read_jsonl_rows_from_text(path: Path, raw: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_number} is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{path}:{line_number} must contain a JSON object row.")
+        rows.append(parsed)
+    return rows
+
+
+def coerce_feature_inventory_rows(parsed: Any, path: Path) -> list[dict[str, Any]]:
+    if isinstance(parsed, list):
+        return coerce_feature_inventory_row_list(parsed, path)
+    if isinstance(parsed, dict):
+        for key in ("features", "rows", "items", "data"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                return coerce_feature_inventory_row_list(value, path)
+        if any(key in parsed for key in ("feature_name", "normalized_feature_name", "feature_key")):
+            return [parsed]
+    raise ValueError(
+        f"{path} must be JSONL, a JSON list, or a JSON object with feature rows "
+        "under 'features', 'rows', 'items', or 'data'."
+    )
+
+
+def coerce_feature_inventory_row_list(values: list[Any], path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, value in enumerate(values, start=1):
+        if not isinstance(value, dict):
+            raise ValueError(f"{path} item {index} must be a JSON object row.")
+        rows.append(value)
     return rows
 
 
@@ -2441,6 +2932,2177 @@ def remove_final_curation_outputs(output_dir: Path) -> None:
             path.unlink()
 
 
+def annotation_batch_id(batch_index: int, rows: list[dict[str, Any]]) -> str:
+    digest_source = "\n".join(str(row.get("feature_key") or feature_key(row)) for row in rows)
+    digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:10]
+    return f"annotation:{batch_index}:{digest}"
+
+
+def prepare_annotation_batches(
+    features: list[dict[str, Any]],
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    batches: list[dict[str, Any]] = []
+    size = max(1, batch_size)
+    for batch_index, start in enumerate(range(0, len(features), size), start=1):
+        rows = features[start : start + size]
+        batches.append(
+            {
+                "batch_id": annotation_batch_id(batch_index, rows),
+                "batch_index": batch_index,
+                "features": rows,
+            }
+        )
+    return batches
+
+
+def compact_annotation_feature_for_prompt(row: dict[str, Any], rank: int) -> dict[str, Any]:
+    payload = compact_feature_for_prompt(row)
+    payload["rank"] = rank
+    payload["source_feature_names"] = compact_list(row.get("source_feature_names"), 16)
+    payload["source_normalized_feature_names"] = compact_list(
+        row.get("source_normalized_feature_names"),
+        16,
+    )
+    payload["paper_count"] = annotation_int(row.get("paper_count"))
+    payload["mention_count"] = annotation_int(row.get("mention_count"))
+    payload["curation_confidence"] = row.get("curation_confidence")
+    payload["curation_notes"] = truncate_text(str(row.get("curation_notes") or ""), 350)
+    return payload
+
+
+def build_annotation_prompt(
+    *,
+    features: list[dict[str, Any]],
+    goal_text: str,
+) -> str:
+    goal_section = (
+        f"\nGOAL / TAXONOMY CONTEXT\n{goal_text}\n"
+        if goal_text.strip()
+        else "\nGOAL / TAXONOMY CONTEXT\nNo external goal file was provided.\n"
+    )
+    payload = {
+        "annotation_mode": "hybrid_evidence_grounded",
+        "features": [
+            compact_annotation_feature_for_prompt(row, rank=idx)
+            for idx, row in enumerate(features, start=1)
+        ],
+    }
+    return f"""Write polished feature annotations for a taxonomy inventory.
+{goal_section}
+
+Return strict JSON only with this shape:
+{{
+  "annotations": [
+    {{
+      "feature_key": "category::normalized feature name from input",
+      "status": "annotated | needs_review | excluded",
+      "formal_definition": "one formal, publication-ready definition",
+      "short_definition": "brief glossary definition",
+      "synonyms": ["zero or more close, substitutable aliases; [] is valid"],
+      "examples": ["brief representative examples"],
+      "paper_count": 0,
+      "mention_count": 0,
+      "confidence": 0.0,
+      "definition_basis": "evidence_synthesized | evidence_limited | model_suggested | needs_review | excluded_descriptor",
+      "notes": "short caveat, evidence limit, or empty string"
+    }}
+  ]
+}}
+
+Annotation rules:
+- Every input feature_key must appear exactly once in annotations.
+- Preserve the input category and feature identity; do not merge or rename features.
+- Ground definitions in the supplied feature evidence: names, categories, existing definitions,
+  examples, synonyms, source feature names, source titles, paper_count, mention_count, and goal context.
+- Hybrid mode allows concise model-polished wording and limited standard taxonomy phrasing,
+  but unsupported additions must be reflected with definition_basis="model_suggested".
+- Crack down on candidates that are not concrete, category-fitting annotatable features.
+  If the feature name and generated definition show that the item is an umbrella construct,
+  measurement dimension, generic descriptor, analytic task, parent category, or category label
+  rather than a specific feature, set status="excluded" and
+  definition_basis="excluded_descriptor".
+- Exclude broad descriptor/category candidates such as sentiment polarity, polarity, valence,
+  sentiment, affect, emotion, framing, frame, persuasion, propaganda, rhetoric, moral framing,
+  moral frame, and moral foundation unless the evidence clearly names a narrower, concrete
+  annotatable feature.
+- For sentiment_affect, be especially strict: keep only specific emotions or affective states
+  that a person can actually feel, such as anger, fear, disgust, joy, sadness, anxiety,
+  guilt, shame, pride, hope, compassion, embarrassment, confusion, uncertainty, or doubt.
+  Exclude sentiment dimensions, scores, orientations, polarity/valence, arousal,
+  activation, intensity, subjectivity, stance, tone, positive/negative emotion buckets,
+  and generic affect/emotion labels.
+- For moral_framing, prefer high-level moral-frame classes over detailed moral
+  frameworks. Keep canonical frame labels such as care/harm, fairness/cheating,
+  loyalty/betrayal, loyalty/ingroup, authority/subversion, sanctity/degradation,
+  purity/sanctity, and liberty/oppression when they describe annotatable text frames.
+  Exclude framework, instrument, and theory names such as Moral Foundations Theory,
+  Moral Foundations Questionnaire, Basic Human Values, CAD Triad, or Morality as
+  Cooperation unless the item is clearly a concrete moral-frame label.
+- Treat the status field as your final judgment for borderline cases. If a feature is
+  a plausible felt affective state or canonical high-level moral-frame label, annotate
+  it rather than excluding it solely because it comes from a known framework.
+- For excluded features, keep a concise formal_definition if it helps audit the decision,
+  leave synonyms/examples empty unless directly evidenced, use confidence for the exclusion
+  decision, and explain the reason in notes.
+- Generate zero or more synonyms for each feature. Return [] when there are no truly close
+  aliases.
+- Synonyms must be definitionally close and substitutable for the original feature label in
+  taxonomy use.
+- For moral_framing, include close canonical aliases in synonyms when they are
+  interchangeable labels for the same high-level frame, such as loyalty/ingroup and
+  loyalty/betrayal.
+- Do not include parent categories, sibling feature labels, examples, explanations, domains,
+  broad category names, or loosely related concepts as synonyms.
+- If the supplied evidence is too thin or internally conflicting, set status="needs_review",
+  use low confidence, and explain the limitation in notes instead of inventing a definition.
+- Keep formal_definition to one sentence and short_definition to roughly 25 words or fewer.
+- Return paper_count and mention_count from the input feature.
+
+INPUT
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+"""
+
+
+def annotation_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def annotation_confidence(value: Any, status: str) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = 0.2 if status == "needs_review" else 0.5
+    return round(max(0.0, min(1.0, confidence)), 4)
+
+
+def canonical_annotation_status(value: Any, formal_definition: str) -> str:
+    normalized = normalize_feature_name(str(value or ""))
+    if normalized in {
+        "exclude",
+        "excluded",
+        "filter",
+        "filtered",
+        "reject",
+        "rejected",
+        "too broad",
+        "generic descriptor",
+        "not a feature",
+        "not annotatable",
+        "descriptor",
+    }:
+        return "excluded"
+    if normalized in {"needs review", "review", "insufficient evidence", "unclear"}:
+        return "needs_review"
+    if normalized in {"annotated", "complete", "ok", "ready"}:
+        return "annotated"
+    return "annotated" if formal_definition else "needs_review"
+
+
+def scoring_batch_id(batch_index: int, rows: list[dict[str, Any]]) -> str:
+    digest_source = "\n".join(str(row.get("feature_key") or feature_key(row)) for row in rows)
+    digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:10]
+    return f"scoring:{batch_index}:{digest}"
+
+
+def prepare_scoring_batches(
+    features: list[dict[str, Any]],
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    batches: list[dict[str, Any]] = []
+    size = max(1, batch_size)
+    for batch_index, start in enumerate(range(0, len(features), size), start=1):
+        rows = features[start : start + size]
+        batches.append(
+            {
+                "batch_id": scoring_batch_id(batch_index, rows),
+                "batch_index": batch_index,
+                "features": rows,
+            }
+        )
+    return batches
+
+
+def row_path_value(row: dict[str, Any], field: str) -> Any:
+    if field in row:
+        return row.get(field)
+    if "." not in field:
+        return None
+    value: Any = row
+    for part in field.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value.get(part)
+    return value
+
+
+def first_row_path_value(row: dict[str, Any], fields: Iterable[str]) -> Any:
+    for field in fields:
+        value = row_path_value(row, field)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def scoring_paper_count(row: dict[str, Any]) -> int:
+    return annotation_int(
+        first_row_path_value(
+            row,
+            ("paper_count", "annotation.paper_count", "annotation_paper_count"),
+        )
+    )
+
+
+def scoring_mention_count(row: dict[str, Any]) -> int:
+    return annotation_int(
+        first_row_path_value(
+            row,
+            ("mention_count", "annotation.mention_count", "annotation_mention_count"),
+        )
+    )
+
+
+def literature_support_score(paper_count: Any) -> int:
+    count = annotation_int(paper_count)
+    if count >= 15:
+        return 5
+    if count >= 10:
+        return 4
+    if count >= 6:
+        return 3
+    if count >= 3:
+        return 2
+    if count >= 2:
+        return 1
+    return 0
+
+
+def literature_support_rationale(paper_count: Any) -> str:
+    count = annotation_int(paper_count)
+    return f"paper_count={count} maps to literature_support={literature_support_score(count)}."
+
+
+def scoring_criterion_score(value: Any, default: int = 0) -> int:
+    try:
+        score = int(round(float(value)))
+    except (TypeError, ValueError):
+        score = default
+    return max(0, min(5, score))
+
+
+def scoring_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    return round(max(0.0, min(1.0, confidence)), 4)
+
+
+def total_feature_score(
+    literature_support: Any,
+    annotation_reliability: Any,
+    distinctiveness: Any,
+) -> float:
+    return round(
+        0.4 * scoring_criterion_score(literature_support)
+        + 0.3 * scoring_criterion_score(annotation_reliability)
+        + 0.3 * scoring_criterion_score(distinctiveness),
+        2,
+    )
+
+
+def scoring_feature_tokens(row: dict[str, Any]) -> set[str]:
+    values: list[Any] = [
+        row.get("feature_name"),
+        row.get("normalized_feature_name"),
+        row.get("source_feature_names"),
+        row.get("source_normalized_feature_names"),
+        row.get("synonyms"),
+        row_path_value(row, "annotation.synonyms"),
+    ]
+    tokens: set[str] = set()
+    for value in values:
+        for item in coerce_str_list(value):
+            tokens.update(normalize_feature_name(item).split())
+    return {token for token in tokens if len(token) > 2}
+
+
+def normalized_feature_label(row: dict[str, Any]) -> str:
+    return normalize_feature_name(
+        str(row.get("normalized_feature_name") or row.get("feature_name") or "")
+    )
+
+
+def token_overlap_score(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, min(len(left), len(right)))
+
+
+def distinctiveness_neighbors(
+    feature: dict[str, Any],
+    all_features: list[dict[str, Any]],
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    key = str(feature.get("feature_key") or feature_key(feature))
+    category = str(feature.get("category") or "")
+    label = normalized_feature_label(feature)
+    tokens = scoring_feature_tokens(feature)
+    candidates: list[tuple[float, int, dict[str, Any]]] = []
+    for row in all_features:
+        row_key = str(row.get("feature_key") or feature_key(row))
+        if row_key == key or str(row.get("category") or "") != category:
+            continue
+        row_label = normalized_feature_label(row)
+        row_tokens = scoring_feature_tokens(row)
+        overlap = token_overlap_score(tokens, row_tokens)
+        contains = bool(
+            label
+            and row_label
+            and (label in row_label or row_label in label)
+            and label != row_label
+        )
+        if overlap < 0.5 and not contains:
+            continue
+        score = overlap + (0.25 if contains else 0.0)
+        candidates.append((score, scoring_paper_count(row), row))
+    candidates.sort(
+        key=lambda item: (
+            -item[0],
+            -item[1],
+            str(item[2].get("feature_name") or "").casefold(),
+        )
+    )
+    return [
+        {
+            "feature_key": row.get("feature_key") or feature_key(row),
+            "category": row.get("category"),
+            "feature_name": row.get("feature_name"),
+            "paper_count": scoring_paper_count(row),
+            "short_definition": truncate_text(
+                str(
+                    row_path_value(row, "annotation.short_definition")
+                    or row_path_value(row, "annotation_short_definition")
+                    or ""
+                ),
+                160,
+            ),
+            "overlap_score": round(score, 3),
+        }
+        for score, _, row in candidates[:limit]
+    ]
+
+
+def compact_embedding_merge_context(row: dict[str, Any]) -> dict[str, Any]:
+    merge = row.get("embedding_merge")
+    if not isinstance(merge, dict):
+        return {}
+    pairs = merge.get("pairs") if isinstance(merge.get("pairs"), list) else []
+    return {
+        "group_id": merge.get("group_id") or "",
+        "canonical_feature_key": merge.get("canonical_feature_key") or "",
+        "canonical_feature_name": merge.get("canonical_feature_name") or "",
+        "member_count": annotation_int(merge.get("member_count")),
+        "member_feature_keys": compact_list(merge.get("member_feature_keys"), 12),
+        "member_feature_names": compact_list(merge.get("member_feature_names"), 12),
+        "member_categories": compact_list(merge.get("member_categories"), 8),
+        "similarity_summary": merge.get("similarity_summary") if isinstance(merge.get("similarity_summary"), dict) else {},
+        "pairs": [
+            {
+                "feature_name_1": pair.get("feature_name_1"),
+                "feature_name_2": pair.get("feature_name_2"),
+                "similarity": pair.get("similarity"),
+            }
+            for pair in pairs[:6]
+            if isinstance(pair, dict)
+        ],
+    }
+
+
+def compact_scoring_feature_for_prompt(
+    row: dict[str, Any],
+    *,
+    rank: int,
+    all_features: list[dict[str, Any]],
+) -> dict[str, Any]:
+    annotation = row.get("annotation") if isinstance(row.get("annotation"), dict) else {}
+    paper_count = scoring_paper_count(row)
+    return {
+        "rank": rank,
+        "feature_key": row.get("feature_key") or feature_key(row),
+        "category": row.get("category"),
+        "feature_name": row.get("feature_name"),
+        "normalized_feature_name": row.get("normalized_feature_name"),
+        "paper_count": paper_count,
+        "mention_count": scoring_mention_count(row),
+        "literature_support_score": literature_support_score(paper_count),
+        "parent_categories": compact_list(row.get("parent_categories"), 8),
+        "definitions": compact_list(row.get("definitions"), 5, max_chars=240),
+        "synonyms": compact_list(row.get("synonyms"), 12),
+        "examples": compact_list(row.get("examples"), 8),
+        "source_feature_names": compact_list(row.get("source_feature_names"), 16),
+        "source_normalized_feature_names": compact_list(
+            row.get("source_normalized_feature_names"),
+            16,
+        ),
+        "source_titles": compact_list(row.get("source_titles"), 8, max_chars=160),
+        "annotation": {
+            "status": annotation.get("status") or row.get("annotation_status") or "",
+            "formal_definition": truncate_text(
+                str(annotation.get("formal_definition") or row.get("annotation_formal_definition") or ""),
+                350,
+            ),
+            "short_definition": truncate_text(
+                str(annotation.get("short_definition") or row.get("annotation_short_definition") or ""),
+                180,
+            ),
+            "synonyms": compact_list(annotation.get("synonyms") or row.get("annotation_synonyms"), 12),
+            "examples": compact_list(annotation.get("examples") or row.get("annotation_examples"), 8),
+            "definition_basis": annotation.get("definition_basis") or row.get("annotation_definition_basis") or "",
+            "notes": truncate_text(str(annotation.get("notes") or row.get("annotation_notes") or ""), 240),
+        },
+        "embedding_merge": compact_embedding_merge_context(row),
+        "distinctiveness_neighbors": distinctiveness_neighbors(row, all_features),
+    }
+
+
+def build_scoring_prompt(
+    *,
+    features: list[dict[str, Any]],
+    all_features: list[dict[str, Any]],
+    goal_text: str,
+) -> str:
+    goal_section = (
+        f"\nGOAL / TAXONOMY CONTEXT\n{goal_text}\n"
+        if goal_text.strip()
+        else "\nGOAL / TAXONOMY CONTEXT\nNo external goal file was provided.\n"
+    )
+    payload = {
+        "scoring_mode": "feature_quality_scores_v1",
+        "features": [
+            compact_scoring_feature_for_prompt(row, rank=idx, all_features=all_features)
+            for idx, row in enumerate(features, start=1)
+        ],
+    }
+    return f"""Score taxonomy features for downstream media annotation.
+{goal_section}
+
+Return strict JSON only with this shape:
+{{
+  "scores": [
+    {{
+      "feature_key": "category::normalized feature name from input",
+      "annotation_reliability": 0,
+      "annotation_reliability_rationale": "short reason",
+      "distinctiveness": 0,
+      "distinctiveness_rationale": "short reason",
+      "confidence": 0.0,
+      "notes": "short caveat or empty string"
+    }}
+  ]
+}}
+
+Scoring rules:
+- Every input feature_key must appear exactly once in scores.
+- Return integer scores from 0 to 5 only.
+- Do not score literature support and do not compute total_score. The pipeline
+  computes literature_support deterministically from paper_count and ignores any
+  model-provided literature or total fields.
+- Annotation Reliability asks whether a trained human or LLM could reliably and
+  consistently identify the feature in media, and whether two annotators would
+  likely agree that it is present.
+  5 = concrete, observable, clear boundaries, strong examples; 3 = usable but
+  somewhat contextual or fuzzy; 0 = not reliably annotatable.
+- Distinctiveness asks whether this feature contributes unique information
+  relative to the current inventory. If removed, would another surviving feature
+  already capture most of its meaning?
+  5 = clearly unique; 3 = partially overlapping but still useful; 0 = duplicate
+  or fully redundant.
+- Use distinctiveness_neighbors and embedding_merge metadata as evidence about
+  overlap. Do not penalize a canonical merged row merely because it absorbed
+  duplicate labels; penalize only when another surviving feature in the current
+  input still captures most of the same meaning.
+- Score every row, including rows whose annotation status is needs_review or
+  excluded. Excluded or very broad rows should usually receive low annotation
+  reliability and/or low distinctiveness.
+- Keep rationales concise and grounded in the supplied names, definitions,
+  annotations, examples, counts, neighbors, and goal context.
+
+INPUT
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+"""
+
+
+def normalize_scoring_decision(
+    raw: dict[str, Any],
+    feature: dict[str, Any],
+    *,
+    model: str,
+    run_id: str,
+    scored_at: str,
+) -> dict[str, Any]:
+    paper_count = scoring_paper_count(feature)
+    literature = literature_support_score(paper_count)
+    annotation_reliability = scoring_criterion_score(raw.get("annotation_reliability"))
+    distinctiveness = scoring_criterion_score(raw.get("distinctiveness"))
+    return {
+        "feature_key": str(raw.get("feature_key") or feature.get("feature_key") or feature_key(feature)),
+        "category": str(feature.get("category") or ""),
+        "feature_name": str(feature.get("feature_name") or ""),
+        "normalized_feature_name": str(feature.get("normalized_feature_name") or ""),
+        "paper_count": paper_count,
+        "mention_count": scoring_mention_count(feature),
+        "literature_support": literature,
+        "literature_support_rationale": literature_support_rationale(paper_count),
+        "annotation_reliability": annotation_reliability,
+        "annotation_reliability_rationale": truncate_text(
+            str(raw.get("annotation_reliability_rationale") or ""),
+            500,
+        ),
+        "distinctiveness": distinctiveness,
+        "distinctiveness_rationale": truncate_text(
+            str(raw.get("distinctiveness_rationale") or ""),
+            500,
+        ),
+        "total": total_feature_score(literature, annotation_reliability, distinctiveness),
+        "confidence": scoring_confidence(raw.get("confidence")),
+        "notes": truncate_text(str(raw.get("notes") or ""), 500),
+        "model": model,
+        "run_id": run_id,
+        "scored_at": scored_at,
+    }
+
+
+def fallback_scoring_decision(
+    feature: dict[str, Any],
+    *,
+    model: str = "",
+    run_id: str = "",
+    scored_at: str = "",
+) -> dict[str, Any]:
+    return normalize_scoring_decision(
+        {
+            "feature_key": feature.get("feature_key") or feature_key(feature),
+            "annotation_reliability": 0,
+            "annotation_reliability_rationale": "No model score returned; needs human review.",
+            "distinctiveness": 0,
+            "distinctiveness_rationale": "No model score returned; needs human review.",
+            "confidence": 0.0,
+            "notes": "No model score returned; needs human review.",
+        },
+        feature,
+        model=model,
+        run_id=run_id,
+        scored_at=scored_at,
+    )
+
+
+def normalize_scoring_decisions(
+    raw_scores: list[dict[str, Any]],
+    features: list[dict[str, Any]],
+    *,
+    model: str,
+    run_id: str,
+    scored_at: str,
+) -> list[dict[str, Any]]:
+    features_by_key = {str(feature.get("feature_key") or feature_key(feature)): feature for feature in features}
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_scores:
+        key = str(raw.get("feature_key") or "")
+        if key in seen:
+            continue
+        feature = features_by_key.get(key)
+        if feature is None:
+            continue
+        output.append(
+            normalize_scoring_decision(
+                raw,
+                feature,
+                model=model,
+                run_id=run_id,
+                scored_at=scored_at,
+            )
+        )
+        seen.add(key)
+
+    for key, feature in features_by_key.items():
+        if key not in seen:
+            output.append(
+                fallback_scoring_decision(
+                    feature,
+                    model=model,
+                    run_id=run_id,
+                    scored_at=scored_at,
+                )
+            )
+    return output
+
+
+def latest_scores_by_feature(decisions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for decision in decisions:
+        key = str(decision.get("feature_key") or "")
+        if key:
+            latest[key] = decision
+    return latest
+
+
+def score_payload(
+    decision: dict[str, Any],
+    feature: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source = feature if feature is not None else decision
+    paper_count = scoring_paper_count(source)
+    literature_support = literature_support_score(paper_count)
+    annotation_reliability = scoring_criterion_score(decision.get("annotation_reliability"))
+    distinctiveness = scoring_criterion_score(decision.get("distinctiveness"))
+    return {
+        "literature_support": literature_support,
+        "literature_support_rationale": literature_support_rationale(paper_count),
+        "annotation_reliability": annotation_reliability,
+        "annotation_reliability_rationale": decision.get("annotation_reliability_rationale") or "",
+        "distinctiveness": distinctiveness,
+        "distinctiveness_rationale": decision.get("distinctiveness_rationale") or "",
+        "total": total_feature_score(
+            literature_support,
+            annotation_reliability,
+            distinctiveness,
+        ),
+        "confidence": scoring_confidence(decision.get("confidence")),
+        "notes": decision.get("notes") or "",
+        "model": decision.get("model") or "",
+        "run_id": decision.get("run_id") or "",
+        "scored_at": decision.get("scored_at") or "",
+    }
+
+
+def build_scored_features(
+    features: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    decision_map = latest_scores_by_feature(decisions)
+    scored: list[dict[str, Any]] = []
+    for feature in features:
+        key = str(feature.get("feature_key") or feature_key(feature))
+        decision = decision_map.get(key) or fallback_scoring_decision(feature)
+        scored.append({**feature, "score": score_payload(decision, feature)})
+    return scored
+
+
+def flatten_scored_feature(row: dict[str, Any]) -> dict[str, Any]:
+    output = flatten_annotated_feature(row)
+    score = output.get("score") if isinstance(output.get("score"), dict) else {}
+    output.update(
+        {
+            "score_literature_support": score.get("literature_support") or 0,
+            "score_literature_support_rationale": score.get("literature_support_rationale") or "",
+            "score_annotation_reliability": score.get("annotation_reliability") or 0,
+            "score_annotation_reliability_rationale": score.get("annotation_reliability_rationale") or "",
+            "score_distinctiveness": score.get("distinctiveness") or 0,
+            "score_distinctiveness_rationale": score.get("distinctiveness_rationale") or "",
+            "score_total": score.get("total") or 0.0,
+            "score_confidence": score.get("confidence") or 0.0,
+            "score_notes": score.get("notes") or "",
+            "score_model": score.get("model") or "",
+            "score_run_id": score.get("run_id") or "",
+            "score_scored_at": score.get("scored_at") or "",
+        }
+    )
+    return output
+
+
+def scored_feature_sort_key(row: dict[str, Any]) -> tuple[float, int, int, str]:
+    score = row.get("score") if isinstance(row.get("score"), dict) else {}
+    return (
+        -float(score.get("total") or 0.0),
+        -scoring_criterion_score(score.get("literature_support")),
+        -scoring_paper_count(row),
+        str(row.get("feature_name") or "").casefold(),
+    )
+
+
+def scoring_summary_by_category(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_category: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_category.setdefault(str(row.get("category") or "uncategorized"), []).append(row)
+
+    categories: dict[str, dict[str, Any]] = {}
+    for category, category_rows in sorted(by_category.items()):
+        scores = [
+            row.get("score") if isinstance(row.get("score"), dict) else {}
+            for row in category_rows
+        ]
+        count = len(category_rows)
+        categories[category] = {
+            "feature_count": count,
+            "mean_literature_support": round(
+                sum(scoring_criterion_score(score.get("literature_support")) for score in scores) / max(count, 1),
+                4,
+            ),
+            "mean_annotation_reliability": round(
+                sum(scoring_criterion_score(score.get("annotation_reliability")) for score in scores) / max(count, 1),
+                4,
+            ),
+            "mean_distinctiveness": round(
+                sum(scoring_criterion_score(score.get("distinctiveness")) for score in scores) / max(count, 1),
+                4,
+            ),
+            "mean_total": round(
+                sum(float(score.get("total") or 0.0) for score in scores) / max(count, 1),
+                4,
+            ),
+        }
+    return {
+        "generated_at": utc_now(),
+        "feature_count": len(rows),
+        "category_count": len(categories),
+        "categories": categories,
+    }
+
+
+def score_metric_values(rows: list[dict[str, Any]], metric: str) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        score = row.get("score") if isinstance(row.get("score"), dict) else {}
+        try:
+            value = float(score.get(metric))
+        except (TypeError, ValueError):
+            continue
+        values.append(value)
+    return values
+
+
+def percentile_value(values: list[float], percentile: int) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return round(sorted_values[0], 4)
+    position = (len(sorted_values) - 1) * (percentile / 100.0)
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = position - lower
+    value = sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+    return round(value, 4)
+
+
+def scoring_percentile_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    metrics = [
+        ("total", "total_score"),
+        ("literature_support", "literature_support"),
+        ("annotation_reliability", "annotation_reliability"),
+        ("distinctiveness", "distinctiveness"),
+    ]
+    output: list[dict[str, Any]] = []
+    for metric, label in metrics:
+        values = score_metric_values(rows, metric)
+        for percentile in SCORING_PERCENTILES:
+            output.append(
+                {
+                    "scope": "all",
+                    "category": "",
+                    "metric": label,
+                    "percentile": percentile,
+                    "value": percentile_value(values, percentile),
+                    "feature_count": len(values),
+                }
+            )
+
+    categories = sorted({str(row.get("category") or "uncategorized") for row in rows})
+    for category in categories:
+        category_rows = [row for row in rows if str(row.get("category") or "uncategorized") == category]
+        values = score_metric_values(category_rows, "total")
+        for percentile in SCORING_PERCENTILES:
+            output.append(
+                {
+                    "scope": "category",
+                    "category": category,
+                    "metric": "total_score",
+                    "percentile": percentile,
+                    "value": percentile_value(values, percentile),
+                    "feature_count": len(values),
+                }
+            )
+    return output
+
+
+def write_scoring_percentile_artifacts(
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    percentile_rows = scoring_percentile_rows(rows)
+    write_json(
+        output_dir / "scoring_percentiles.json",
+        {
+            "generated_at": utc_now(),
+            "percentiles": SCORING_PERCENTILES,
+            "rows": percentile_rows,
+        },
+    )
+    write_csv(
+        output_dir / "scoring_percentiles.csv",
+        percentile_rows,
+        ["scope", "category", "metric", "percentile", "value", "feature_count"],
+    )
+    return percentile_rows
+
+
+def set_scoring_plot_style() -> None:
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update(
+        {
+            "figure.dpi": 140,
+            "savefig.dpi": 160,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": True,
+            "grid.alpha": 0.25,
+            "font.size": 10,
+        }
+    )
+
+
+def no_score_data_text(ax: Any) -> None:
+    ax.text(0.5, 0.5, "No scored features", ha="center", va="center", transform=ax.transAxes)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def write_scoring_figures(
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+    percentile_rows: list[dict[str, Any]],
+) -> list[Path]:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - dependency is required in pyproject
+        raise RuntimeError("Matplotlib is required for scoring figures.") from exc
+
+    set_scoring_plot_style()
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+
+    total_values = score_metric_values(rows, "total")
+    total_path = figure_dir / "scoring_total_distribution.png"
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    if total_values:
+        bins = [index / 2 for index in range(0, 11)]
+        ax.hist(total_values, bins=bins, color="#2f6f8f", edgecolor="white")
+        ax.set_xlim(0, 5)
+        ax.set_xticks([0, 1, 2, 3, 4, 5])
+        ax.set_xlabel("Weighted total score")
+        ax.set_ylabel("Feature count")
+    else:
+        no_score_data_text(ax)
+    ax.set_title("Total Score Distribution")
+    fig.tight_layout()
+    fig.savefig(total_path, bbox_inches="tight")
+    plt.close(fig)
+    written.append(total_path)
+
+    criteria_path = figure_dir / "scoring_criteria_distributions.png"
+    criteria = [
+        ("literature_support", "Literature support", "#4c78a8"),
+        ("annotation_reliability", "Annotation reliability", "#59a14f"),
+        ("distinctiveness", "Distinctiveness", "#e15759"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(12.4, 4.4), sharey=True)
+    for ax, (metric, label, color) in zip(axes, criteria):
+        values = score_metric_values(rows, metric)
+        if values:
+            bins = [value - 0.5 for value in range(0, 7)]
+            ax.hist(values, bins=bins, color=color, edgecolor="white")
+            ax.set_xlim(-0.5, 5.5)
+            ax.set_xticks([0, 1, 2, 3, 4, 5])
+            ax.set_xlabel("Score")
+        else:
+            no_score_data_text(ax)
+        ax.set_title(label)
+    axes[0].set_ylabel("Feature count")
+    fig.suptitle("Criterion Score Distributions", y=1.02)
+    fig.tight_layout()
+    fig.savefig(criteria_path, bbox_inches="tight")
+    plt.close(fig)
+    written.append(criteria_path)
+
+    percentile_path = figure_dir / "scoring_percentiles.png"
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    all_rows = [row for row in percentile_rows if row.get("scope") == "all"]
+    metric_labels = ["total_score", "literature_support", "annotation_reliability", "distinctiveness"]
+    display_labels = {
+        "total_score": "Total",
+        "literature_support": "Literature",
+        "annotation_reliability": "Reliability",
+        "distinctiveness": "Distinctiveness",
+    }
+    if all_rows:
+        for metric in metric_labels:
+            metric_rows = [row for row in all_rows if row.get("metric") == metric]
+            xs = [int(row["percentile"]) for row in metric_rows]
+            ys = [float(row["value"]) for row in metric_rows]
+            ax.plot(xs, ys, marker="o", linewidth=2, label=display_labels[metric])
+        ax.set_ylim(0, 5)
+        ax.set_xticks(SCORING_PERCENTILES)
+        ax.set_xlabel("Percentile")
+        ax.set_ylabel("Score")
+        ax.legend(frameon=False)
+    else:
+        no_score_data_text(ax)
+    ax.set_title("Score Percentiles")
+    fig.tight_layout()
+    fig.savefig(percentile_path, bbox_inches="tight")
+    plt.close(fig)
+    written.append(percentile_path)
+
+    by_category_path = figure_dir / "scoring_total_percentiles_by_category.png"
+    category_rows = [row for row in percentile_rows if row.get("scope") == "category"]
+    categories = sorted({str(row.get("category") or "") for row in category_rows if row.get("category")})
+    fig, ax = plt.subplots(figsize=(9.6, max(4.8, 0.8 * max(len(categories), 1))))
+    if categories:
+        p25 = {
+            str(row.get("category")): float(row.get("value") or 0.0)
+            for row in category_rows
+            if row.get("percentile") == 25
+        }
+        p50 = {
+            str(row.get("category")): float(row.get("value") or 0.0)
+            for row in category_rows
+            if row.get("percentile") == 50
+        }
+        p75 = {
+            str(row.get("category")): float(row.get("value") or 0.0)
+            for row in category_rows
+            if row.get("percentile") == 75
+        }
+        y_positions = list(range(len(categories)))
+        left_errors = [max(0.0, p50.get(category, 0.0) - p25.get(category, 0.0)) for category in categories]
+        right_errors = [max(0.0, p75.get(category, 0.0) - p50.get(category, 0.0)) for category in categories]
+        ax.errorbar(
+            [p50.get(category, 0.0) for category in categories],
+            y_positions,
+            xerr=[left_errors, right_errors],
+            fmt="o",
+            color="#2f6f8f",
+            ecolor="#8ab6cc",
+            elinewidth=3,
+            capsize=4,
+        )
+        ax.set_yticks(y_positions, labels=[category.replace("_", " ") for category in categories])
+        ax.invert_yaxis()
+        ax.set_xlim(0, 5)
+        ax.set_xlabel("Total score percentile")
+        ax.set_title("Total Score Median and IQR by Category")
+    else:
+        no_score_data_text(ax)
+        ax.set_title("Total Score Median and IQR by Category")
+    fig.tight_layout()
+    fig.savefig(by_category_path, bbox_inches="tight")
+    plt.close(fig)
+    written.append(by_category_path)
+
+    return written
+
+
+def write_scoring_artifacts(
+    output_dir: Path,
+    features: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+) -> dict[str, int]:
+    scored = build_scored_features(features, decisions)
+    ranked = sorted(scored, key=scored_feature_sort_key)
+    write_jsonl(output_dir / "scored_features.jsonl", scored)
+    write_json(
+        output_dir / "scored_features.json",
+        {
+            "feature_count": len(scored),
+            "features": scored,
+        },
+    )
+    write_csv(
+        output_dir / "scored_features.csv",
+        [flatten_scored_feature(row) for row in scored],
+        SCORED_FEATURE_FIELDNAMES,
+    )
+    write_csv(
+        output_dir / "scored_features_ranked.csv",
+        [flatten_scored_feature(row) for row in ranked],
+        SCORED_FEATURE_FIELDNAMES,
+    )
+    summary = scoring_summary_by_category(scored)
+    write_json(output_dir / "scoring_summary_by_category.json", summary)
+    percentile_rows = write_scoring_percentile_artifacts(output_dir, scored)
+    figure_paths = write_scoring_figures(output_dir, scored, percentile_rows)
+    return {
+        "scored_features": len(scored),
+        "scored_features_ranked": len(ranked),
+        "scoring_categories": int(summary.get("category_count") or 0),
+        "scoring_percentile_rows": len(percentile_rows),
+        "scoring_figures": len(figure_paths),
+    }
+
+
+def completed_scoring_batch_ids(
+    output_dir: Path,
+    prompt_version: str = SCORING_PROMPT_VERSION,
+) -> set[str]:
+    completed: set[str] = set()
+    for row in read_jsonl(output_dir / "completed_scoring_batches.jsonl"):
+        if str(row.get("prompt_version") or "") != prompt_version:
+            continue
+        batch_id = str(row.get("batch_id") or "")
+        if batch_id:
+            completed.add(batch_id)
+    return completed
+
+
+def load_existing_scoring_decisions(
+    output_dir: Path,
+    prompt_version: str = SCORING_PROMPT_VERSION,
+) -> list[dict[str, Any]]:
+    decisions: list[dict[str, Any]] = []
+    for row in read_jsonl(output_dir / "scoring_decisions.jsonl"):
+        if str(row.get("prompt_version") or "") != prompt_version:
+            continue
+        decisions.append(row)
+    return decisions
+
+
+def remove_scoring_outputs(output_dir: Path) -> None:
+    for name in [
+        "scored_features.json",
+        "scored_features.jsonl",
+        "scored_features.csv",
+        "scored_features_ranked.csv",
+        "scoring_summary_by_category.json",
+        "scoring_percentiles.json",
+        "scoring_percentiles.csv",
+        "scoring_trace.json",
+        "scoring_errors.jsonl",
+        "scoring_decisions.jsonl",
+        "completed_scoring_batches.jsonl",
+    ]:
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+    for name in SCORING_FIGURE_FILENAMES:
+        path = output_dir / "figures" / name
+        if path.exists():
+            path.unlink()
+
+
+ANNOTATION_GENERIC_DESCRIPTOR_NAMES = {
+    "*": {
+        "affect",
+        "category",
+        "descriptor",
+        "emotion",
+        "emotionality",
+        "feature",
+        "frame",
+        "framing",
+        "label",
+        "media analysis",
+        "media attribute",
+        "media framing",
+        "morality",
+        "polarity",
+        "propaganda",
+        "rhetoric",
+        "rhetorical device",
+        "sentiment",
+        "sentiment analysis",
+        "sentiment intensity",
+        "sentiment polarity",
+        "sentiment score",
+        "subjectivity",
+        "taxonomy",
+        "technique",
+        "valence",
+    },
+    "persuasion": {
+        "argumentation",
+        "communication strategy",
+        "discourse",
+        "frame",
+        "framing",
+        "media framing",
+        "narrative",
+        "persuasion",
+        "persuasion technique",
+        "persuasive communication",
+        "propaganda",
+        "propaganda technique",
+        "rhetoric",
+        "rhetorical strategy",
+    },
+    "moral_framing": {
+        "basic human values",
+        "cad triad",
+        "mft",
+        "mfq",
+        "moral foundation",
+        "moral foundations",
+        "moral foundations questionnaire",
+        "moral foundations theory",
+        "moral frame",
+        "moral framing",
+        "moral language",
+        "moral value",
+        "morality",
+        "morality as cooperation",
+        "schwartz basic human values",
+    },
+    "sentiment_affect": {
+        "affect",
+        "activation",
+        "arousal",
+        "affective dimension",
+        "affective intensity",
+        "affective polarity",
+        "affective tone",
+        "affective valence",
+        "attitude",
+        "emotion",
+        "emotion intensity",
+        "emotion polarity",
+        "emotional intensity",
+        "emotional tone",
+        "emotional valence",
+        "mood",
+        "negative affect",
+        "negative emotion",
+        "opinion",
+        "polarity",
+        "positive affect",
+        "positive emotion",
+        "sentiment",
+        "sentiment intensity",
+        "sentiment orientation",
+        "sentiment polarity",
+        "sentiment valence",
+        "stance",
+        "subjectivity",
+        "tone",
+        "toxicity",
+        "valence",
+    },
+}
+
+
+MORAL_FRAME_ALIAS_GROUPS = (
+    (
+        "Care/Harm",
+        "Harm/Care",
+        "Care foundation",
+    ),
+    (
+        "Fairness/Cheating",
+        "Fairness/Reciprocity",
+        "Justice/Fairness",
+        "Fairness foundation",
+    ),
+    (
+        "Loyalty/Betrayal",
+        "Loyalty/Ingroup",
+        "Ingroup/Loyalty",
+        "Loyalty foundation",
+    ),
+    (
+        "Authority/Subversion",
+        "Authority/Respect",
+        "Respect/Authority",
+        "Authority foundation",
+    ),
+    (
+        "Sanctity/Degradation",
+        "Sanctity/Purity",
+        "Purity/Sanctity",
+        "Purity foundation",
+    ),
+    (
+        "Liberty/Oppression",
+        "Liberty foundation",
+    ),
+)
+
+
+MORAL_FRAME_CANONICAL_NAMES = {
+    normalize_feature_name(alias)
+    for group in MORAL_FRAME_ALIAS_GROUPS
+    for alias in group
+}
+
+
+MORAL_FRAME_FRAMEWORK_NAMES = {
+    "basic human values",
+    "cad triad",
+    "mft",
+    "mfq",
+    "moral foundations questionnaire",
+    "moral foundations theory",
+    "morality as cooperation",
+    "schwartz basic human values",
+}
+
+
+ANNOTATION_CONCRETE_ALLOWLIST_NAMES = {
+    "appeal to fear",
+    "anger",
+    "authority subversion",
+    "care harm",
+    "disgust",
+    "fairness cheating",
+    "fear",
+    "joy",
+    "liberty oppression",
+    "loaded language",
+    "loyalty betrayal",
+    "name calling",
+    "sadness",
+    "sanctity degradation",
+} | MORAL_FRAME_CANONICAL_NAMES
+
+
+SENTIMENT_SPECIFIC_EMOTION_NAMES = {
+    "admiration",
+    "affection",
+    "amusement",
+    "anger",
+    "annoyance",
+    "anticipation",
+    "anxiety",
+    "awe",
+    "boredom",
+    "compassion",
+    "concern",
+    "contempt",
+    "contentment",
+    "confusion",
+    "delight",
+    "despair",
+    "disappointment",
+    "doubt",
+    "disgust",
+    "embarrassment",
+    "empathy",
+    "enthusiasm",
+    "envy",
+    "excitement",
+    "fear",
+    "frustration",
+    "gratitude",
+    "grief",
+    "guilt",
+    "happiness",
+    "hate",
+    "hatred",
+    "hope",
+    "humiliation",
+    "interest",
+    "irritation",
+    "jealousy",
+    "joy",
+    "loneliness",
+    "love",
+    "moral outrage",
+    "moral disgust",
+    "nostalgia",
+    "outrage",
+    "panic",
+    "pity",
+    "pleasure",
+    "pride",
+    "regret",
+    "relief",
+    "remorse",
+    "resentment",
+    "sadness",
+    "satisfaction",
+    "shame",
+    "sorrow",
+    "sympathy",
+    "surprise",
+    "trust",
+    "uncertainty",
+    "worry",
+}
+
+
+SENTIMENT_NON_EMOTION_DESCRIPTOR_TOKENS = {
+    "analysis",
+    "arousal",
+    "attitude",
+    "activation",
+    "classification",
+    "dimension",
+    "intensity",
+    "orientation",
+    "polarity",
+    "score",
+    "stance",
+    "subjectivity",
+    "tone",
+    "toxicity",
+    "valence",
+}
+
+
+def sentiment_specific_emotion_reason(
+    feature: dict[str, Any],
+    formal_definition: str,
+    short_definition: str,
+) -> str:
+    if str(feature.get("category") or "") != "sentiment_affect":
+        return ""
+    name = normalize_feature_name(str(feature.get("feature_name") or ""))
+    normalized_name = normalize_feature_name(str(feature.get("normalized_feature_name") or ""))
+    candidates = {name, normalized_name}
+    candidates.discard("")
+    if not candidates:
+        return "Sentiment/affect item is not named as a specific emotion someone can feel."
+
+    if candidates & SENTIMENT_SPECIFIC_EMOTION_NAMES:
+        return ""
+
+    for candidate in candidates:
+        if candidate in ANNOTATION_GENERIC_DESCRIPTOR_NAMES["sentiment_affect"]:
+            return f"Sentiment/affect item is a descriptor or dimension, not a specific emotion: {candidate}."
+        for token in SENTIMENT_NON_EMOTION_DESCRIPTOR_TOKENS:
+            if re.search(rf"\b{re.escape(token)}\b", candidate):
+                return f"Sentiment/affect item is a {token} descriptor, not a specific emotion someone can feel."
+
+    haystack = normalize_feature_name(
+        " ".join(
+            [
+                name,
+                formal_definition,
+                short_definition,
+            ]
+        )
+    )
+    if re.search(
+        r"\b(positive emotion|negative emotion|positive affect|negative affect|broad emotion|generic emotion|overall affect|overall emotion)\b",
+        haystack,
+    ):
+        return "Sentiment/affect item is an emotion bucket or broad affect label, not a specific emotion."
+    for emotion in SENTIMENT_SPECIFIC_EMOTION_NAMES:
+        if re.search(rf"\b{re.escape(emotion)}\b", haystack) and re.search(
+            r"\b(affective state|emotion|feeling|felt|feel|feels)\b",
+            haystack,
+        ):
+            return ""
+    return "Sentiment/affect item is not a specific emotion or affective state someone can feel."
+
+
+def is_canonical_moral_frame_feature(feature: dict[str, Any]) -> bool:
+    if str(feature.get("category") or "") != "moral_framing":
+        return False
+    candidates = {
+        normalize_feature_name(str(feature.get("feature_name") or "")),
+        normalize_feature_name(str(feature.get("normalized_feature_name") or "")),
+    }
+    candidates.discard("")
+    return bool(candidates & MORAL_FRAME_CANONICAL_NAMES)
+
+
+def moral_frame_aliases_for_feature(feature: dict[str, Any]) -> list[str]:
+    if str(feature.get("category") or "") != "moral_framing":
+        return []
+    candidates = {
+        normalize_feature_name(str(feature.get("feature_name") or "")),
+        normalize_feature_name(str(feature.get("normalized_feature_name") or "")),
+    }
+    candidates.discard("")
+    if not candidates:
+        return []
+    for aliases in MORAL_FRAME_ALIAS_GROUPS:
+        normalized_aliases = {normalize_feature_name(alias) for alias in aliases}
+        if candidates & normalized_aliases:
+            return [
+                alias
+                for alias in aliases
+                if normalize_feature_name(alias) not in candidates
+            ]
+    return []
+
+
+def annotation_descriptor_name_reason(feature: dict[str, Any]) -> str:
+    name = normalize_feature_name(str(feature.get("feature_name") or ""))
+    normalized_name = normalize_feature_name(str(feature.get("normalized_feature_name") or ""))
+    candidates = {name, normalized_name}
+    candidates.discard("")
+    if not candidates:
+        return ""
+    category = str(feature.get("category") or "")
+    if category == "moral_framing":
+        matched_frameworks = sorted(candidates & MORAL_FRAME_FRAMEWORK_NAMES)
+        if matched_frameworks:
+            return (
+                "Feature name is a moral framework or instrument, not a high-level "
+                f"moral frame: {matched_frameworks[0]}."
+            )
+    if candidates & ANNOTATION_CONCRETE_ALLOWLIST_NAMES:
+        return ""
+    blocked = set(ANNOTATION_GENERIC_DESCRIPTOR_NAMES["*"])
+    blocked.update(ANNOTATION_GENERIC_DESCRIPTOR_NAMES.get(category, set()))
+    matched = sorted(candidates & blocked)
+    if matched:
+        return f"Feature name is a broad descriptor or category label: {matched[0]}."
+    return ""
+
+
+def annotation_descriptor_definition_reason(
+    feature: dict[str, Any],
+    formal_definition: str,
+    short_definition: str,
+) -> str:
+    haystack = normalize_feature_name(
+        " ".join(
+            [
+                str(feature.get("feature_name") or ""),
+                formal_definition,
+                short_definition,
+            ]
+        )
+    )
+    if not haystack:
+        return ""
+
+    category = str(feature.get("category") or "")
+    if category == "sentiment_affect" and re.search(
+        r"\b(positive negative|negative positive|positive neutral negative|negative neutral positive|activation level|polarity|valence|sentiment score|sentiment orientation|overall sentiment)\b",
+        haystack,
+    ):
+        return "Sentiment item is a polarity/valence dimension or overall descriptor, not a concrete affect feature."
+    if category == "persuasion" and re.search(
+        r"\b(broad framing|general framing|act of framing|process of framing|selecting aspects|emphasizing aspects|overall frame|umbrella)\b",
+        haystack,
+    ):
+        return "Persuasion item is a broad framing construct or umbrella descriptor, not a concrete technique."
+    if category == "moral_framing" and not is_canonical_moral_frame_feature(feature):
+        if re.search(
+            r"\b(moral foundations theory|moral foundations questionnaire|basic human values|schwartz basic human values|cad triad|morality as cooperation|mft|mfq)\b",
+            haystack,
+        ):
+            return "Moral item is a theoretical framework or instrument, not a high-level moral frame."
+        if re.search(
+            r"\b(moral framing|moral foundation|moral foundations|moral values|umbrella|broad category)\b",
+            haystack,
+        ):
+            return "Moral item is an umbrella moral-framing construct, not a concrete moral frame."
+    if re.search(
+        r"\b(analytic task|analysis task|broad category|broad construct|category label|general category|generic descriptor|measurement dimension|parent category|umbrella category|umbrella construct)\b",
+        haystack,
+    ):
+        return "Generated definition describes an umbrella construct, descriptor, task, or parent category."
+    return ""
+
+
+def annotation_hard_exclusion_reason(
+    feature: dict[str, Any],
+    formal_definition: str,
+    short_definition: str,
+) -> str:
+    return (
+        annotation_descriptor_name_reason(feature)
+        or annotation_descriptor_definition_reason(feature, formal_definition, short_definition)
+    )
+
+
+def annotation_exclusion_reason(
+    feature: dict[str, Any],
+    formal_definition: str,
+    short_definition: str,
+) -> str:
+    return (
+        annotation_hard_exclusion_reason(feature, formal_definition, short_definition)
+        or sentiment_specific_emotion_reason(feature, formal_definition, short_definition)
+    )
+
+
+def append_annotation_note(notes: str, addition: str) -> str:
+    notes = truncate_text(str(notes or ""), 500)
+    addition = truncate_text(str(addition or ""), 300)
+    if not addition:
+        return notes
+    if not notes:
+        return addition
+    if addition.casefold() in notes.casefold():
+        return notes
+    return truncate_text(f"{notes}; {addition}", 500)
+
+
+ANNOTATION_BROAD_SYNONYM_NORMALIZED = {
+    "affect",
+    "affective",
+    "annotation label",
+    "attribute",
+    "category",
+    "emotion",
+    "emotional",
+    "feature",
+    "label",
+    "media analysis",
+    "media attribute",
+    "media framing",
+    "moral frame",
+    "moral framing",
+    "persuasion",
+    "persuasion technique",
+    "propaganda",
+    "propaganda technique",
+    "rhetoric",
+    "rhetorical technique",
+    "sentiment",
+    "sentiment affect",
+    "taxonomy label",
+    "technique",
+}
+
+
+def is_definition_like_annotation_synonym(value: str) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return True
+    words = text.split()
+    if len(text) > 80 or len(words) > 8:
+        return True
+    if re.search(r"[.!?;:]", text):
+        return True
+
+    normalized = text.casefold()
+    if len(words) > 3 and normalized.startswith(("a ", "an ", "the ")):
+        return True
+    if len(words) > 3 and re.search(
+        r"\b(are|captures|describes|indicates|involves|is|means|refers to|that|used to|uses|using|when|where)\b",
+        normalized,
+    ):
+        return True
+    return False
+
+
+def annotation_synonym_blocked_norms(feature: dict[str, Any]) -> set[str]:
+    category_labels = {
+        "persuasion": ["persuasion", "persuasion technique", "propaganda technique"],
+        "moral_framing": ["moral framing", "moral frame"],
+        "sentiment_affect": ["sentiment", "affect", "sentiment affect", "emotion"],
+    }
+    blocked = set(ANNOTATION_BROAD_SYNONYM_NORMALIZED)
+    blocked.add(normalize_feature_name(str(feature.get("feature_name") or "")))
+    blocked.add(normalize_feature_name(str(feature.get("normalized_feature_name") or "")))
+    category = str(feature.get("category") or "")
+    blocked.add(normalize_feature_name(category))
+    for label in category_labels.get(category, []):
+        blocked.add(normalize_feature_name(label))
+    for field in ("parent_category", "parent_categories", "examples", "source_titles"):
+        for value in coerce_str_list(feature.get(field)):
+            blocked.add(normalize_feature_name(value))
+    blocked.discard("")
+    return blocked
+
+
+def normalize_annotation_synonyms(raw_value: Any, feature: dict[str, Any]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    blocked = annotation_synonym_blocked_norms(feature)
+    for raw in coerce_str_list(raw_value):
+        text = re.sub(r"\s+", " ", str(raw or "")).strip().strip("\"'“”‘’")
+        if not text or is_definition_like_annotation_synonym(text):
+            continue
+        normalized = normalize_feature_name(text)
+        if not normalized or normalized in blocked or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(text)
+        if len(output) >= 12:
+            break
+    return output
+
+
+def add_moral_frame_alias_synonyms(
+    synonyms: list[str],
+    feature: dict[str, Any],
+) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    blocked = annotation_synonym_blocked_norms(feature)
+
+    def add(value: str) -> None:
+        text = re.sub(r"\s+", " ", str(value or "")).strip().strip("\"'“”‘’")
+        if not text or is_definition_like_annotation_synonym(text):
+            return
+        normalized = normalize_feature_name(text)
+        if not normalized or normalized in blocked or normalized in seen:
+            return
+        seen.add(normalized)
+        output.append(text)
+
+    for synonym in synonyms:
+        add(synonym)
+    for alias in moral_frame_aliases_for_feature(feature):
+        add(alias)
+        if len(output) >= 12:
+            break
+    return output[:12]
+
+
+def normalize_annotation_decision(
+    raw: dict[str, Any],
+    feature: dict[str, Any],
+    *,
+    model: str,
+    run_id: str,
+    annotated_at: str,
+) -> dict[str, Any]:
+    formal_definition = re.sub(r"\s+", " ", str(raw.get("formal_definition") or "")).strip()
+    short_definition = re.sub(r"\s+", " ", str(raw.get("short_definition") or "")).strip()
+    status = canonical_annotation_status(raw.get("status"), formal_definition)
+    hard_exclusion_reason = annotation_hard_exclusion_reason(
+        feature,
+        formal_definition,
+        short_definition,
+    )
+    exclusion_reason = ""
+    if status == "excluded":
+        exclusion_reason = (
+            annotation_exclusion_reason(feature, formal_definition, short_definition)
+            or hard_exclusion_reason
+        )
+    elif hard_exclusion_reason:
+        status = "excluded"
+        exclusion_reason = hard_exclusion_reason
+
+    if status == "excluded":
+        definition_basis = "excluded_descriptor"
+    elif status == "needs_review" and not raw.get("definition_basis"):
+        definition_basis = "needs_review"
+    else:
+        definition_basis = str(raw.get("definition_basis") or "evidence_synthesized").strip()
+    if status == "needs_review" and not formal_definition:
+        short_definition = short_definition or ""
+    notes = append_annotation_note(str(raw.get("notes") or ""), exclusion_reason)
+    if status == "excluded" and not notes:
+        notes = "Excluded because the item is too broad or descriptor-like for the target feature inventory."
+    synonyms = add_moral_frame_alias_synonyms(
+        normalize_annotation_synonyms(raw.get("synonyms"), feature),
+        feature,
+    )
+
+    return {
+        "feature_key": str(raw.get("feature_key") or feature.get("feature_key") or feature_key(feature)),
+        "category": str(feature.get("category") or ""),
+        "feature_name": str(feature.get("feature_name") or ""),
+        "normalized_feature_name": str(feature.get("normalized_feature_name") or ""),
+        "status": status,
+        "formal_definition": formal_definition,
+        "short_definition": short_definition,
+        "synonyms": synonyms,
+        "examples": compact_list(raw.get("examples"), 8, max_chars=180),
+        "paper_count": annotation_int(feature.get("paper_count")),
+        "mention_count": annotation_int(feature.get("mention_count")),
+        "confidence": annotation_confidence(raw.get("confidence"), status),
+        "definition_basis": definition_basis,
+        "notes": notes,
+        "model": model,
+        "run_id": run_id,
+        "annotated_at": annotated_at,
+    }
+
+
+def fallback_annotation_decision(
+    feature: dict[str, Any],
+    *,
+    model: str = "",
+    run_id: str = "",
+    annotated_at: str = "",
+) -> dict[str, Any]:
+    return normalize_annotation_decision(
+        {
+            "feature_key": feature.get("feature_key") or feature_key(feature),
+            "status": "needs_review",
+            "formal_definition": "",
+            "short_definition": "",
+            "synonyms": [],
+            "examples": [],
+            "confidence": 0.0,
+            "definition_basis": "needs_review",
+            "notes": "No model annotation returned; needs human review.",
+        },
+        feature,
+        model=model,
+        run_id=run_id,
+        annotated_at=annotated_at,
+    )
+
+
+def normalize_annotation_decisions(
+    raw_annotations: list[dict[str, Any]],
+    features: list[dict[str, Any]],
+    *,
+    model: str,
+    run_id: str,
+    annotated_at: str,
+) -> list[dict[str, Any]]:
+    features_by_key = {str(feature.get("feature_key") or feature_key(feature)): feature for feature in features}
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_annotations:
+        key = str(raw.get("feature_key") or "")
+        if key in seen:
+            continue
+        feature = features_by_key.get(key)
+        if feature is None:
+            continue
+        output.append(
+            normalize_annotation_decision(
+                raw,
+                feature,
+                model=model,
+                run_id=run_id,
+                annotated_at=annotated_at,
+            )
+        )
+        seen.add(key)
+
+    for key, feature in features_by_key.items():
+        if key not in seen:
+            output.append(
+                fallback_annotation_decision(
+                    feature,
+                    model=model,
+                    run_id=run_id,
+                    annotated_at=annotated_at,
+                )
+            )
+    return output
+
+
+def latest_annotations_by_feature(decisions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for decision in decisions:
+        key = str(decision.get("feature_key") or "")
+        if key:
+            latest[key] = decision
+    return latest
+
+
+def annotation_payload(decision: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": decision.get("status") or "needs_review",
+        "formal_definition": decision.get("formal_definition") or "",
+        "short_definition": decision.get("short_definition") or "",
+        "synonyms": decision.get("synonyms") or [],
+        "examples": decision.get("examples") or [],
+        "paper_count": annotation_int(decision.get("paper_count")),
+        "mention_count": annotation_int(decision.get("mention_count")),
+        "confidence": annotation_confidence(decision.get("confidence"), str(decision.get("status") or "")),
+        "definition_basis": decision.get("definition_basis") or "needs_review",
+        "notes": decision.get("notes") or "",
+        "model": decision.get("model") or "",
+        "run_id": decision.get("run_id") or "",
+        "annotated_at": decision.get("annotated_at") or "",
+    }
+
+
+def build_annotated_features(
+    features: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    *,
+    include_excluded: bool = False,
+) -> list[dict[str, Any]]:
+    decision_map = latest_annotations_by_feature(decisions)
+    annotated: list[dict[str, Any]] = []
+    for feature in features:
+        key = str(feature.get("feature_key") or feature_key(feature))
+        decision = decision_map.get(key) or fallback_annotation_decision(feature)
+        if not include_excluded and decision.get("status") == "excluded":
+            continue
+        annotated.append({**feature, "annotation": annotation_payload(decision)})
+    return annotated
+
+
+def flatten_annotated_feature(row: dict[str, Any]) -> dict[str, Any]:
+    output = dict(row)
+    annotation = output.get("annotation") if isinstance(output.get("annotation"), dict) else {}
+    output.update(
+        {
+            "annotation_status": annotation.get("status") or "",
+            "annotation_formal_definition": annotation.get("formal_definition") or "",
+            "annotation_short_definition": annotation.get("short_definition") or "",
+            "annotation_synonyms": annotation.get("synonyms") or [],
+            "annotation_examples": annotation.get("examples") or [],
+            "annotation_paper_count": annotation.get("paper_count") or 0,
+            "annotation_mention_count": annotation.get("mention_count") or 0,
+            "annotation_confidence": annotation.get("confidence") or 0.0,
+            "annotation_definition_basis": annotation.get("definition_basis") or "",
+            "annotation_notes": annotation.get("notes") or "",
+            "annotation_model": annotation.get("model") or "",
+            "annotation_run_id": annotation.get("run_id") or "",
+            "annotation_annotated_at": annotation.get("annotated_at") or "",
+        }
+    )
+    return output
+
+
+def annotation_row_int(row: dict[str, Any], field: str) -> int:
+    annotation = row.get("annotation") if isinstance(row.get("annotation"), dict) else {}
+    return annotation_int(annotation.get(field) or row.get(field))
+
+
+def markdown_table_cell(value: Any, max_chars: int = 180) -> str:
+    text = truncate_text(str(value or ""), max_chars)
+    text = text.replace("\n", " ")
+    text = text.replace("|", "\\|")
+    return text
+
+
+def build_excluded_annotations_markdown(
+    excluded: list[dict[str, Any]],
+    *,
+    limit_per_category: int = EXCLUDED_ANNOTATION_REPORT_LIMIT_PER_CATEGORY,
+) -> str:
+    limit = max(1, int(limit_per_category))
+    by_category: dict[str, list[dict[str, Any]]] = {}
+    for row in excluded:
+        by_category.setdefault(str(row.get("category") or "uncategorized"), []).append(row)
+
+    lines = [
+        "# Excluded Annotation Summary",
+        "",
+        f"Generated: {utc_now()}",
+        "",
+        f"Top {limit} most-mentioned excluded features per category.",
+        "",
+    ]
+    if not excluded:
+        lines.append("No excluded features.")
+        lines.append("")
+        return "\n".join(lines)
+
+    ordered_categories = [
+        category for category in CATEGORY_EXPORT_ORDER if category in by_category
+    ]
+    ordered_categories.extend(
+        category
+        for category in sorted(by_category)
+        if category not in set(ordered_categories)
+    )
+
+    for category in ordered_categories:
+        rows = sorted(
+            by_category[category],
+            key=lambda row: (
+                -annotation_row_int(row, "mention_count"),
+                -annotation_row_int(row, "paper_count"),
+                str(row.get("feature_name") or "").casefold(),
+            ),
+        )
+        lines.extend(
+            [
+                f"## {category} ({len(rows)} excluded)",
+                "",
+                "| Rank | Feature | Mentions | Papers | Exclusion reason | Definition |",
+                "| ---: | --- | ---: | ---: | --- | --- |",
+            ]
+        )
+        for rank, row in enumerate(rows[:limit], start=1):
+            annotation = row.get("annotation") if isinstance(row.get("annotation"), dict) else {}
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(rank),
+                        markdown_table_cell(row.get("feature_name"), 80),
+                        str(annotation_row_int(row, "mention_count")),
+                        str(annotation_row_int(row, "paper_count")),
+                        markdown_table_cell(annotation.get("notes"), 180),
+                        markdown_table_cell(annotation.get("short_definition") or annotation.get("formal_definition"), 180),
+                    ]
+                )
+                + " |"
+            )
+        if len(rows) > limit:
+            lines.append(f"|  | _{len(rows) - limit} more omitted_ |  |  |  |  |")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def annotation_status_label(status: str) -> str:
+    normalized = str(status or "needs_review")
+    labels = {
+        "annotated": "Kept",
+        "needs_review": "Needs review",
+        "excluded": "Cut",
+    }
+    return labels.get(normalized, normalized.replace("_", " ").title())
+
+
+def ordered_annotation_categories(rows: list[dict[str, Any]]) -> list[str]:
+    present = {str(row.get("category") or "uncategorized") for row in rows}
+    ordered = [category for category in CATEGORY_EXPORT_ORDER if category in present]
+    ordered.extend(category for category in sorted(present) if category not in set(ordered))
+    return ordered
+
+
+def annotation_status_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"annotated": 0, "needs_review": 0, "excluded": 0}
+    for row in rows:
+        annotation = row.get("annotation") if isinstance(row.get("annotation"), dict) else {}
+        status = str(annotation.get("status") or "needs_review")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def annotation_status_counts_by_category(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for row in rows:
+        category = str(row.get("category") or "uncategorized")
+        annotation = row.get("annotation") if isinstance(row.get("annotation"), dict) else {}
+        status = str(annotation.get("status") or "needs_review")
+        category_counts = counts.setdefault(
+            category,
+            {"annotated": 0, "needs_review": 0, "excluded": 0},
+        )
+        category_counts[status] = category_counts.get(status, 0) + 1
+    return counts
+
+
+def annotate_bar_values(ax: Any, values: list[int], *, horizontal: bool = False) -> None:
+    for index, value in enumerate(values):
+        if value <= 0:
+            continue
+        if horizontal:
+            ax.text(value + max(values) * 0.015, index, str(value), va="center", fontsize=9)
+        else:
+            ax.text(index, value + max(values) * 0.02, str(value), ha="center", fontsize=9)
+
+
+def write_annotation_cut_figures(
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+) -> list[Path]:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - dependency is required in pyproject
+        raise RuntimeError("Matplotlib is required for annotation cut figures.") from exc
+
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update(
+        {
+            "figure.dpi": 140,
+            "savefig.dpi": 160,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": True,
+            "grid.alpha": 0.25,
+            "font.size": 10,
+        }
+    )
+
+    written: list[Path] = []
+    statuses = ["annotated", "needs_review", "excluded"]
+    status_colors = {
+        "annotated": "#2f855a",
+        "needs_review": "#b7791f",
+        "excluded": "#c53030",
+    }
+    total_counts = annotation_status_counts(rows)
+
+    status_path = figure_dir / "annotation_status_counts.png"
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    labels = [annotation_status_label(status) for status in statuses]
+    values = [total_counts.get(status, 0) for status in statuses]
+    ax.bar(labels, values, color=[status_colors[status] for status in statuses])
+    ax.set_title("Annotation Outcomes")
+    ax.set_ylabel("Feature count")
+    ax.set_ylim(0, max(values + [1]) * 1.18)
+    annotate_bar_values(ax, values)
+    fig.tight_layout()
+    fig.savefig(status_path, bbox_inches="tight")
+    plt.close(fig)
+    written.append(status_path)
+
+    category_counts = annotation_status_counts_by_category(rows)
+    categories = ordered_annotation_categories(rows)
+    excluded_values = [
+        category_counts.get(category, {}).get("excluded", 0)
+        for category in categories
+    ]
+
+    excluded_path = figure_dir / "annotation_excluded_by_category.png"
+    fig, ax = plt.subplots(figsize=(8.8, max(4.4, 0.6 * max(len(categories), 1))))
+    display_categories = [category.replace("_", " ") for category in categories]
+    y_positions = list(range(len(categories)))
+    ax.barh(y_positions, excluded_values, color=status_colors["excluded"])
+    ax.set_yticks(y_positions, labels=display_categories)
+    ax.invert_yaxis()
+    ax.set_title("Features Cut by Category")
+    ax.set_xlabel("Cut feature count")
+    ax.set_xlim(0, max(excluded_values + [1]) * 1.18)
+    annotate_bar_values(ax, excluded_values, horizontal=True)
+    fig.tight_layout()
+    fig.savefig(excluded_path, bbox_inches="tight")
+    plt.close(fig)
+    written.append(excluded_path)
+
+    by_category_path = figure_dir / "annotation_status_by_category.png"
+    fig, ax = plt.subplots(figsize=(9.2, max(4.8, 0.65 * max(len(categories), 1))))
+    left = [0] * len(categories)
+    for status in statuses:
+        values = [
+            category_counts.get(category, {}).get(status, 0)
+            for category in categories
+        ]
+        ax.barh(
+            y_positions,
+            values,
+            left=left,
+            label=annotation_status_label(status),
+            color=status_colors[status],
+        )
+        left = [current + value for current, value in zip(left, values)]
+    ax.set_yticks(y_positions, labels=display_categories)
+    ax.invert_yaxis()
+    ax.set_title("Annotation Outcomes by Category")
+    ax.set_xlabel("Feature count")
+    ax.legend(loc="lower right", frameon=False)
+    fig.tight_layout()
+    fig.savefig(by_category_path, bbox_inches="tight")
+    plt.close(fig)
+    written.append(by_category_path)
+
+    return written
+
+
+def write_annotation_artifacts(
+    output_dir: Path,
+    features: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+) -> dict[str, int]:
+    all_rows = build_annotated_features(features, decisions, include_excluded=True)
+    excluded = [
+        row
+        for row in all_rows
+        if isinstance(row.get("annotation"), dict)
+        and row["annotation"].get("status") == "excluded"
+    ]
+    annotated = [
+        row
+        for row in all_rows
+        if not (
+            isinstance(row.get("annotation"), dict)
+            and row["annotation"].get("status") == "excluded"
+        )
+    ]
+    write_jsonl(output_dir / "annotated_features.jsonl", annotated)
+    write_json(
+        output_dir / "annotated_features.json",
+        {
+            "feature_count": len(annotated),
+            "features": annotated,
+        },
+    )
+    write_csv(
+        output_dir / "annotated_features.csv",
+        [flatten_annotated_feature(row) for row in annotated],
+        ANNOTATED_FEATURE_FIELDNAMES,
+    )
+    write_jsonl(output_dir / "excluded_annotations.jsonl", excluded)
+    write_json(
+        output_dir / "excluded_annotations.json",
+        {
+            "feature_count": len(excluded),
+            "features": excluded,
+        },
+    )
+    write_csv(
+        output_dir / "excluded_annotations.csv",
+        [flatten_annotated_feature(row) for row in excluded],
+        ANNOTATED_FEATURE_FIELDNAMES,
+    )
+    (output_dir / "excluded_annotations_by_category.md").write_text(
+        build_excluded_annotations_markdown(excluded),
+        encoding="utf-8",
+    )
+    write_annotation_cut_figures(output_dir, all_rows)
+    needs_review = sum(
+        1
+        for row in annotated
+        if isinstance(row.get("annotation"), dict)
+        and row["annotation"].get("status") == "needs_review"
+    )
+    return {
+        "annotated_features": len(annotated),
+        "needs_review_annotations": needs_review,
+        "excluded_annotations": len(excluded),
+    }
+
+
+def completed_annotation_batch_ids(
+    output_dir: Path,
+    prompt_version: str = ANNOTATION_PROMPT_VERSION,
+) -> set[str]:
+    completed: set[str] = set()
+    for row in read_jsonl(output_dir / "completed_annotation_batches.jsonl"):
+        if str(row.get("prompt_version") or "") != prompt_version:
+            continue
+        batch_id = str(row.get("batch_id") or "")
+        if batch_id:
+            completed.add(batch_id)
+    return completed
+
+
+def load_existing_annotation_decisions(
+    output_dir: Path,
+    prompt_version: str = ANNOTATION_PROMPT_VERSION,
+) -> list[dict[str, Any]]:
+    decisions: list[dict[str, Any]] = []
+    for row in read_jsonl(output_dir / "annotation_decisions.jsonl"):
+        if str(row.get("prompt_version") or "") != prompt_version:
+            continue
+        decisions.append(row)
+    return decisions
+
+
+def remove_annotation_outputs(output_dir: Path) -> None:
+    for name in [
+        "annotated_features.json",
+        "annotated_features.jsonl",
+        "annotated_features.csv",
+        "excluded_annotations.json",
+        "excluded_annotations.jsonl",
+        "excluded_annotations.csv",
+        "excluded_annotations_by_category.md",
+        "annotation_trace.json",
+        "annotation_errors.jsonl",
+        "annotation_decisions.jsonl",
+        "completed_annotation_batches.jsonl",
+    ]:
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+    for name in ANNOTATION_FIGURE_FILENAMES:
+        path = output_dir / "figures" / name
+        if path.exists():
+            path.unlink()
+
+
 def ranked_paper_preview(
     papers: dict[str, dict[str, Any]],
     limit: int = 25,
@@ -3359,6 +6021,497 @@ def run_final_curation(
     return trace
 
 
+def dry_run_annotation_trace(
+    *,
+    input_file: Path,
+    output_dir: Path,
+    features: list[dict[str, Any]],
+    batches: list[dict[str, Any]],
+    model: str,
+    run_id: str,
+    goal_path: str | None,
+    goal_text: str,
+    batch_features: int,
+    max_tokens: int,
+    timeout: float | None,
+) -> dict[str, Any]:
+    stats = AnnotationStats(
+        feature_count=len(features),
+        batch_count=len(batches),
+    )
+    trace = {
+        "project": "LitExtract",
+        "version": VERSION,
+        "prompt_version": ANNOTATION_PROMPT_VERSION,
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "dry_run": True,
+        "model": model,
+        "input_file": str(input_file),
+        "output_dir": str(output_dir),
+        "goal_path": goal_path,
+        "goal_used": bool(goal_text.strip()),
+        "config": {
+            "batch_features": batch_features,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+            "annotation_mode": "hybrid_evidence_grounded",
+        },
+        "counts": dataclasses.asdict(stats),
+        "outputs": {},
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / "annotation_trace.json", trace)
+    return trace
+
+
+def run_annotation(
+    *,
+    input_file: Path,
+    output_dir: Path | None,
+    api_key: str | None,
+    model: str,
+    base_url: str,
+    api_provider: str = "auto",
+    reasoning_effort: str | None,
+    batch_features: int,
+    goal_path: Path | None = None,
+    force: bool,
+    dry_run: bool,
+    temperature: float,
+    max_tokens: int,
+    timeout: float | None = None,
+    show_progress: bool = True,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    input_file = input_file.expanduser()
+    output_dir = output_dir.expanduser() if output_dir is not None else input_file.parent
+    if api_provider not in {"auto", "openai", "gemini"}:
+        raise ValueError("api_provider must be 'auto', 'openai', or 'gemini'.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if force:
+        remove_annotation_outputs(output_dir)
+
+    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    features = read_feature_inventory(input_file)
+    batches = prepare_annotation_batches(features, batch_size=batch_features)
+    goal_text, resolved_goal_path = load_goal_text(goal_path)
+    max_tokens = max(1, int(max_tokens))
+    if dry_run:
+        return dry_run_annotation_trace(
+            input_file=input_file,
+            output_dir=output_dir,
+            features=features,
+            batches=batches,
+            model=model,
+            run_id=run_id,
+            goal_path=resolved_goal_path,
+            goal_text=goal_text,
+            batch_features=batch_features,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+    if client is None:
+        if not api_key:
+            raise ValueError("An API key is required unless --dry-run is used.")
+        client = make_llm_client(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            reasoning_effort=reasoning_effort,
+            api_provider=api_provider,
+            input_mode="text",
+            timeout=timeout,
+        )
+
+    completed = completed_annotation_batch_ids(output_dir, prompt_version=ANNOTATION_PROMPT_VERSION)
+    decisions = load_existing_annotation_decisions(output_dir, prompt_version=ANNOTATION_PROMPT_VERSION)
+    stats = AnnotationStats(feature_count=len(features), batch_count=len(batches))
+    output_counts = write_annotation_artifacts(output_dir, features, decisions)
+    failures: list[dict[str, Any]] = []
+    pending_feature_count = sum(
+        len(batch["features"])
+        for batch in batches
+        if str(batch["batch_id"]) not in completed
+    )
+
+    with annotation_progress(total=pending_feature_count, show=show_progress) as progress:
+        for batch in batches:
+            batch_id = str(batch["batch_id"])
+            batch_rows = list(batch["features"])
+            if batch_id in completed:
+                stats.skipped_batch_count += 1
+                continue
+
+            raw_response = ""
+            try:
+                raw_response = client.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an evidence-grounded taxonomy annotation agent. "
+                                "Return only valid JSON."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": build_annotation_prompt(
+                                features=batch_rows,
+                                goal_text=goal_text,
+                            ),
+                        },
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                )
+                raw_annotations, repaired_json = parse_annotation_json_with_repair(
+                    raw_response,
+                    client=client,
+                )
+                if repaired_json:
+                    stats.repaired_json_count += 1
+                batch_decisions = normalize_annotation_decisions(
+                    raw_annotations,
+                    batch_rows,
+                    model=model,
+                    run_id=run_id,
+                    annotated_at=utc_now(),
+                )
+                for decision in batch_decisions:
+                    append_jsonl(
+                        output_dir / "annotation_decisions.jsonl",
+                        {
+                            **decision,
+                            "batch_id": batch_id,
+                            "batch_index": batch.get("batch_index"),
+                            "prompt_version": ANNOTATION_PROMPT_VERSION,
+                        },
+                    )
+                append_jsonl(
+                    output_dir / "completed_annotation_batches.jsonl",
+                    {
+                        "batch_id": batch_id,
+                        "batch_index": batch.get("batch_index"),
+                        "feature_count": len(batch_rows),
+                        "annotation_count": len(batch_decisions),
+                        "prompt_version": ANNOTATION_PROMPT_VERSION,
+                        "run_id": run_id,
+                        "completed_at": utc_now(),
+                    },
+                )
+                completed.add(batch_id)
+                decisions.extend(batch_decisions)
+                stats.completed_batch_count += 1
+                stats.annotation_count += len(batch_decisions)
+                stats.needs_review_count += sum(
+                    1 for decision in batch_decisions if decision.get("status") == "needs_review"
+                )
+                stats.excluded_count += sum(
+                    1 for decision in batch_decisions if decision.get("status") == "excluded"
+                )
+                output_counts = write_annotation_artifacts(output_dir, features, decisions)
+            except Exception as exc:
+                stats.failed_batch_count += 1
+                error_row = {
+                    "batch_id": batch_id,
+                    "batch_index": batch.get("batch_index"),
+                    "feature_keys": [
+                        str(row.get("feature_key") or feature_key(row))
+                        for row in batch_rows
+                    ],
+                    "error": str(exc),
+                    "raw_response_excerpt": raw_response[:2000] if raw_response else "",
+                    "run_id": run_id,
+                    "created_at": utc_now(),
+                }
+                failures.append(error_row)
+                append_jsonl(output_dir / "annotation_errors.jsonl", error_row)
+                LOGGER.warning("Annotation failed for %s: %s", batch_id, exc)
+            finally:
+                progress.update(len(batch_rows))
+
+    errors_path = output_dir / "annotation_errors.jsonl"
+    if not errors_path.exists():
+        errors_path.write_text("", encoding="utf-8")
+    trace = {
+        "project": "LitExtract",
+        "version": VERSION,
+        "prompt_version": ANNOTATION_PROMPT_VERSION,
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "dry_run": False,
+        "model": model,
+        "base_url": base_url,
+        "api_provider": api_provider,
+        "reasoning_effort": reasoning_effort,
+        "input_file": str(input_file),
+        "output_dir": str(output_dir),
+        "goal_path": resolved_goal_path,
+        "goal_used": bool(goal_text.strip()),
+        "config": {
+            "batch_features": batch_features,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+            "force": force,
+            "progress": show_progress,
+            "annotation_mode": "hybrid_evidence_grounded",
+            "output_mode": "new_files_only",
+        },
+        "counts": dataclasses.asdict(stats),
+        "outputs": output_counts,
+        "failures": failures,
+    }
+    write_json(output_dir / "annotation_trace.json", trace)
+    return trace
+
+
+def dry_run_scoring_trace(
+    *,
+    input_file: Path,
+    output_dir: Path,
+    features: list[dict[str, Any]],
+    batches: list[dict[str, Any]],
+    model: str,
+    run_id: str,
+    goal_path: str | None,
+    goal_text: str,
+    batch_features: int,
+    max_tokens: int,
+    timeout: float | None,
+) -> dict[str, Any]:
+    stats = ScoringStats(
+        feature_count=len(features),
+        batch_count=len(batches),
+    )
+    trace = {
+        "project": "LitExtract",
+        "version": VERSION,
+        "prompt_version": SCORING_PROMPT_VERSION,
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "dry_run": True,
+        "model": model,
+        "input_file": str(input_file),
+        "output_dir": str(output_dir),
+        "goal_path": goal_path,
+        "goal_used": bool(goal_text.strip()),
+        "config": {
+            "batch_features": batch_features,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+            "scoring_mode": "feature_quality_scores_v1",
+        },
+        "counts": dataclasses.asdict(stats),
+        "outputs": {},
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / "scoring_trace.json", trace)
+    return trace
+
+
+def run_scoring(
+    *,
+    input_file: Path,
+    output_dir: Path | None,
+    api_key: str | None,
+    model: str,
+    base_url: str,
+    api_provider: str = "auto",
+    reasoning_effort: str | None,
+    batch_features: int,
+    goal_path: Path | None = None,
+    force: bool,
+    dry_run: bool,
+    temperature: float,
+    max_tokens: int,
+    timeout: float | None = None,
+    show_progress: bool = True,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    input_file = input_file.expanduser()
+    output_dir = output_dir.expanduser() if output_dir is not None else input_file.parent
+    if api_provider not in {"auto", "openai", "gemini"}:
+        raise ValueError("api_provider must be 'auto', 'openai', or 'gemini'.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if force:
+        remove_scoring_outputs(output_dir)
+
+    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    features = read_feature_inventory(input_file)
+    batches = prepare_scoring_batches(features, batch_size=batch_features)
+    goal_text, resolved_goal_path = load_goal_text(goal_path)
+    max_tokens = max(1, int(max_tokens))
+    if dry_run:
+        return dry_run_scoring_trace(
+            input_file=input_file,
+            output_dir=output_dir,
+            features=features,
+            batches=batches,
+            model=model,
+            run_id=run_id,
+            goal_path=resolved_goal_path,
+            goal_text=goal_text,
+            batch_features=batch_features,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+    if client is None:
+        if not api_key:
+            raise ValueError("An API key is required unless --dry-run is used.")
+        client = make_llm_client(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            reasoning_effort=reasoning_effort,
+            api_provider=api_provider,
+            input_mode="text",
+            timeout=timeout,
+        )
+
+    completed = completed_scoring_batch_ids(output_dir, prompt_version=SCORING_PROMPT_VERSION)
+    decisions = load_existing_scoring_decisions(output_dir, prompt_version=SCORING_PROMPT_VERSION)
+    stats = ScoringStats(feature_count=len(features), batch_count=len(batches))
+    output_counts = write_scoring_artifacts(output_dir, features, decisions)
+    failures: list[dict[str, Any]] = []
+    pending_feature_count = sum(
+        len(batch["features"])
+        for batch in batches
+        if str(batch["batch_id"]) not in completed
+    )
+
+    with scoring_progress(total=pending_feature_count, show=show_progress) as progress:
+        for batch in batches:
+            batch_id = str(batch["batch_id"])
+            batch_rows = list(batch["features"])
+            if batch_id in completed:
+                stats.skipped_batch_count += 1
+                continue
+
+            raw_response = ""
+            try:
+                raw_response = client.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an evidence-grounded taxonomy scoring agent. "
+                                "Return only valid JSON."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": build_scoring_prompt(
+                                features=batch_rows,
+                                all_features=features,
+                                goal_text=goal_text,
+                            ),
+                        },
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                )
+                raw_scores, repaired_json = parse_scoring_json_with_repair(
+                    raw_response,
+                    client=client,
+                )
+                if repaired_json:
+                    stats.repaired_json_count += 1
+                batch_decisions = normalize_scoring_decisions(
+                    raw_scores,
+                    batch_rows,
+                    model=model,
+                    run_id=run_id,
+                    scored_at=utc_now(),
+                )
+                for decision in batch_decisions:
+                    append_jsonl(
+                        output_dir / "scoring_decisions.jsonl",
+                        {
+                            **decision,
+                            "batch_id": batch_id,
+                            "batch_index": batch.get("batch_index"),
+                            "prompt_version": SCORING_PROMPT_VERSION,
+                        },
+                    )
+                append_jsonl(
+                    output_dir / "completed_scoring_batches.jsonl",
+                    {
+                        "batch_id": batch_id,
+                        "batch_index": batch.get("batch_index"),
+                        "feature_count": len(batch_rows),
+                        "scoring_count": len(batch_decisions),
+                        "prompt_version": SCORING_PROMPT_VERSION,
+                        "run_id": run_id,
+                        "completed_at": utc_now(),
+                    },
+                )
+                completed.add(batch_id)
+                decisions.extend(batch_decisions)
+                stats.completed_batch_count += 1
+                stats.scoring_count += len(batch_decisions)
+                output_counts = write_scoring_artifacts(output_dir, features, decisions)
+            except Exception as exc:
+                stats.failed_batch_count += 1
+                error_row = {
+                    "batch_id": batch_id,
+                    "batch_index": batch.get("batch_index"),
+                    "feature_keys": [
+                        str(row.get("feature_key") or feature_key(row))
+                        for row in batch_rows
+                    ],
+                    "error": str(exc),
+                    "raw_response_excerpt": raw_response[:2000] if raw_response else "",
+                    "run_id": run_id,
+                    "created_at": utc_now(),
+                }
+                failures.append(error_row)
+                append_jsonl(output_dir / "scoring_errors.jsonl", error_row)
+                LOGGER.warning("Scoring failed for %s: %s", batch_id, exc)
+            finally:
+                progress.update(len(batch_rows))
+
+    errors_path = output_dir / "scoring_errors.jsonl"
+    if not errors_path.exists():
+        errors_path.write_text("", encoding="utf-8")
+    trace = {
+        "project": "LitExtract",
+        "version": VERSION,
+        "prompt_version": SCORING_PROMPT_VERSION,
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "dry_run": False,
+        "model": model,
+        "base_url": base_url,
+        "api_provider": api_provider,
+        "reasoning_effort": reasoning_effort,
+        "input_file": str(input_file),
+        "output_dir": str(output_dir),
+        "goal_path": resolved_goal_path,
+        "goal_used": bool(goal_text.strip()),
+        "config": {
+            "batch_features": batch_features,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+            "force": force,
+            "progress": show_progress,
+            "scoring_mode": "feature_quality_scores_v1",
+            "output_mode": "new_files_only",
+        },
+        "counts": dataclasses.asdict(stats),
+        "outputs": output_counts,
+        "failures": failures,
+    }
+    write_json(output_dir / "scoring_trace.json", trace)
+    return trace
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verbose", action="store_true", help="Show detailed progress logs.")
     parser.add_argument("--quiet", action="store_true", help="Show warnings and errors only.")
@@ -3556,6 +6709,120 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Count category candidates without making LLM calls.",
     )
+
+    annotate = subparsers.add_parser(
+        "annotate",
+        help="LLM-annotate a finalized feature inventory with polished definitions.",
+    )
+    add_common_args(annotate)
+    annotate.add_argument(
+        "--input-file",
+        required=True,
+        help="Feature inventory JSON/JSONL/CSV file to annotate.",
+    )
+    annotate.add_argument(
+        "--output-dir",
+        help="Folder for annotation artifacts. Defaults to the input file folder.",
+    )
+    annotate.add_argument(
+        "--goal",
+        help="Optional goal/taxonomy Markdown file. Defaults to ./goal.md when present.",
+    )
+    annotate.add_argument("--api-key", help="LLM API key. Defaults to env vars.")
+    annotate.add_argument("--model", default=env_model(), help="LLM model name.")
+    annotate.add_argument(
+        "--base-url",
+        default=env_base_url(),
+        help="OpenAI-compatible base URL, or Gemini native v1beta base URL with --api-provider gemini.",
+    )
+    annotate.add_argument(
+        "--api-provider",
+        default="auto",
+        choices=["auto", "openai", "gemini"],
+        help="Transport to use for the annotation LLM pass.",
+    )
+    annotate.add_argument(
+        "--reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high"],
+        help="OpenAI-compatible reasoning effort/thinking level.",
+    )
+    annotate.add_argument(
+        "--batch-features",
+        type=int,
+        default=25,
+        help="Number of features sent in each annotation request.",
+    )
+    annotate.add_argument("--temperature", type=float, default=0.0)
+    annotate.add_argument(
+        "--max-tokens",
+        type=int,
+        default=6000,
+        help="Maximum output tokens for each annotation request.",
+    )
+    annotate.add_argument("--timeout", type=float, help="LLM request timeout in seconds.")
+    annotate.add_argument("--force", action="store_true", help="Overwrite existing annotation outputs.")
+    annotate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count annotation batches without making LLM calls.",
+    )
+
+    score = subparsers.add_parser(
+        "score",
+        help="LLM-score an annotated or embedding-merged feature inventory.",
+    )
+    add_common_args(score)
+    score.add_argument(
+        "--input-file",
+        required=True,
+        help="Feature inventory JSON/JSONL/CSV file to score.",
+    )
+    score.add_argument(
+        "--output-dir",
+        help="Folder for scoring artifacts. Defaults to the input file folder.",
+    )
+    score.add_argument(
+        "--goal",
+        help="Optional goal/taxonomy Markdown file. Defaults to ./goal.md when present.",
+    )
+    score.add_argument("--api-key", help="LLM API key. Defaults to env vars.")
+    score.add_argument("--model", default=env_model(), help="LLM model name.")
+    score.add_argument(
+        "--base-url",
+        default=env_base_url(),
+        help="OpenAI-compatible base URL, or Gemini native v1beta base URL with --api-provider gemini.",
+    )
+    score.add_argument(
+        "--api-provider",
+        default="auto",
+        choices=["auto", "openai", "gemini"],
+        help="Transport to use for the scoring LLM pass.",
+    )
+    score.add_argument(
+        "--reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high"],
+        help="OpenAI-compatible reasoning effort/thinking level.",
+    )
+    score.add_argument(
+        "--batch-features",
+        type=int,
+        default=25,
+        help="Number of features sent in each scoring request.",
+    )
+    score.add_argument("--temperature", type=float, default=0.0)
+    score.add_argument(
+        "--max-tokens",
+        type=int,
+        default=6000,
+        help="Maximum output tokens for each scoring request.",
+    )
+    score.add_argument("--timeout", type=float, help="LLM request timeout in seconds.")
+    score.add_argument("--force", action="store_true", help="Overwrite existing scoring outputs.")
+    score.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count scoring batches without making LLM calls.",
+    )
     return parser.parse_args(argv)
 
 
@@ -3713,6 +6980,63 @@ def main(argv: list[str] | None = None) -> int:
                 trace.get("outputs", {}).get("final_curated_features_llm_top100_by_category", 0),
                 trace.get("outputs", {}).get("final_curated_feature_members_llm", 0),
                 trace.get("outputs", {}).get("final_rejected_features_llm", 0),
+            )
+            return 0
+        if args.command == "annotate":
+            api_key = args.api_key or env_api_key()
+            output_dir = Path(args.output_dir) if args.output_dir else None
+            trace = run_annotation(
+                input_file=Path(args.input_file),
+                output_dir=output_dir,
+                api_key=api_key,
+                model=args.model,
+                base_url=args.base_url,
+                api_provider=args.api_provider,
+                reasoning_effort=args.reasoning_effort,
+                batch_features=args.batch_features,
+                goal_path=Path(args.goal) if args.goal else None,
+                force=args.force,
+                dry_run=args.dry_run,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
+                show_progress=not args.quiet,
+            )
+            resolved_output_dir = output_dir if output_dir is not None else Path(args.input_file).parent
+            print(resolved_output_dir / "annotation_trace.json")
+            LOGGER.info(
+                "Annotation complete: %d kept features, %d needing review, %d excluded.",
+                trace.get("outputs", {}).get("annotated_features", 0),
+                trace.get("outputs", {}).get("needs_review_annotations", 0),
+                trace.get("outputs", {}).get("excluded_annotations", 0),
+            )
+            return 0
+        if args.command == "score":
+            api_key = args.api_key or env_api_key()
+            output_dir = Path(args.output_dir) if args.output_dir else None
+            trace = run_scoring(
+                input_file=Path(args.input_file),
+                output_dir=output_dir,
+                api_key=api_key,
+                model=args.model,
+                base_url=args.base_url,
+                api_provider=args.api_provider,
+                reasoning_effort=args.reasoning_effort,
+                batch_features=args.batch_features,
+                goal_path=Path(args.goal) if args.goal else None,
+                force=args.force,
+                dry_run=args.dry_run,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
+                show_progress=not args.quiet,
+            )
+            resolved_output_dir = output_dir if output_dir is not None else Path(args.input_file).parent
+            print(resolved_output_dir / "scoring_trace.json")
+            LOGGER.info(
+                "Scoring complete: %d scored features across %d categories.",
+                trace.get("outputs", {}).get("scored_features", 0),
+                trace.get("outputs", {}).get("scoring_categories", 0),
             )
             return 0
     except Exception as exc:

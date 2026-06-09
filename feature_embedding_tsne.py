@@ -23,7 +23,16 @@ DEFAULT_GEMINI_MODEL = "gemini-embedding-001"
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_TASK_TYPE = "CLUSTERING"
 DEFAULT_OUTPUT_DIMENSIONALITY = 768
-DEFAULT_TEXT_FIELDS = ("feature_name", "category", "definitions", "synonyms")
+DEFAULT_TEXT_FIELDS = (
+    "feature_name",
+    "category",
+    "annotation.formal_definition",
+    "annotation.short_definition",
+    "annotation.synonyms",
+    "annotation.examples",
+    "definitions",
+    "synonyms",
+)
 DEFAULT_RANDOM_STATE = 42
 DEFAULT_ANNOTATE_TOP = 80
 
@@ -235,7 +244,7 @@ def build_embedding_text(row: dict[str, Any], text_fields: Iterable[str]) -> str
     seen_by_field: set[tuple[str, str]] = set()
     for field in text_fields:
         values = []
-        for value in parse_jsonish_list(row.get(field)):
+        for value in parse_jsonish_list(row_field_value(row, field)):
             normalized = value.casefold()
             key = (field, normalized)
             if key in seen_by_field:
@@ -247,8 +256,43 @@ def build_embedding_text(row: dict[str, Any], text_fields: Iterable[str]) -> str
     return "\n".join(sections).strip()
 
 
+def row_field_value(row: dict[str, Any], field: str) -> Any:
+    if field in row:
+        return row.get(field)
+    if "." not in field:
+        return None
+
+    value: Any = row
+    for part in field.split("."):
+        if not isinstance(value, dict) or part not in value:
+            value = None
+            break
+        value = value.get(part)
+    if value not in (None, ""):
+        return value
+
+    # Annotated CSV exports flatten dotted annotation fields with underscores.
+    return row.get(field.replace(".", "_"))
+
+
 def human_field_name(field: str) -> str:
-    return field.replace("_", " ").strip().title()
+    return field.replace(".", " ").replace("_", " ").strip().title()
+
+
+def first_field_value(row: dict[str, Any], fields: Iterable[str]) -> Any:
+    for field in fields:
+        value = row_field_value(row, field)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def first_text_value(row: dict[str, Any], fields: Iterable[str]) -> str:
+    for field in fields:
+        values = parse_jsonish_list(row_field_value(row, field))
+        if values:
+            return values[0]
+    return ""
 
 
 def load_feature_items(path: Path, text_fields: Iterable[str]) -> list[FeatureItem]:
@@ -267,8 +311,8 @@ def load_feature_items(path: Path, text_fields: Iterable[str]) -> list[FeatureIt
                 feature_key=feature_key(row, label, category, index),
                 label=label,
                 category=category,
-                paper_count=safe_int(row.get("paper_count")),
-                mention_count=safe_int(row.get("mention_count")),
+                paper_count=safe_int(first_field_value(row, ("paper_count", "annotation.paper_count"))),
+                mention_count=safe_int(first_field_value(row, ("mention_count", "annotation.mention_count"))),
                 embedding_text=embedding_text,
                 raw_row=row,
             )
@@ -632,6 +676,7 @@ def build_interactive_html(
                 "category": item.category,
                 "paper_count": item.paper_count,
                 "mention_count": item.mention_count,
+                "short_definition": feature_short_definition(item.raw_row),
                 "x": x,
                 "y": y,
                 "embedding_text": item.embedding_text,
@@ -1108,7 +1153,10 @@ def build_interactive_html(
 
     function showTooltip(event, d) {{
       tooltip.style.display = "block";
-      tooltip.innerHTML = `<strong>${{escapeHtml(d.label)}}</strong>${{escapeHtml(d.category)}}<br>${{d.paper_count}} papers / ${{d.mention_count}} mentions`;
+      const shortDefinition = d.short_definition
+        ? `<div style="margin-top:6px">${{escapeHtml(d.short_definition)}}</div>`
+        : "";
+      tooltip.innerHTML = `<strong>${{escapeHtml(d.label)}}</strong>${{escapeHtml(d.category)}}<br>${{d.paper_count}} papers / ${{d.mention_count}} mentions${{shortDefinition}}`;
       const rect = event.currentTarget.ownerSVGElement.getBoundingClientRect();
       const wrap = event.currentTarget.ownerSVGElement.parentElement.getBoundingClientRect();
       tooltip.style.left = `${{event.clientX - wrap.left + 14}}px`;
@@ -1226,6 +1274,19 @@ def category_colors(categories: list[str]) -> dict[str, str]:
         category: palette[index % len(palette)]
         for index, category in enumerate(categories)
     }
+
+
+def feature_short_definition(row: dict[str, Any]) -> str:
+    return first_text_value(
+        row,
+        (
+            "annotation.short_definition",
+            "short_definition",
+            "annotation.formal_definition",
+            "definition",
+            "definitions",
+        ),
+    )
 
 
 def setup_plot_style(plt: Any) -> None:

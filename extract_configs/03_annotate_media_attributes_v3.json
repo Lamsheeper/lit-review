@@ -1,0 +1,15 @@
+{
+  "command": "annotate",
+  "input_file": "review_runs/media_attributes_v3/feature_extract_pdf/curated/curated_features.jsonl",
+  "output_dir": "review_runs/media_attributes_v3/feature_extract_pdf/annotated",
+  "goal": "goal.md",
+  "api_key_env": "GEMINI_API_KEY",
+  "model": "gemini-3.5-flash",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "api_provider": "gemini",
+  "reasoning_effort": "low",
+  "batch_features": 25,
+  "temperature": 0.0,
+  "max_tokens": 6000,
+  "timeout": 600
+}

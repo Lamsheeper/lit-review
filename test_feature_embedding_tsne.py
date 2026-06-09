@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from feature_embedding_tsne import (
+    DEFAULT_TEXT_FIELDS,
     FeatureItem,
     build_embedding_text,
     choose_perplexity,
@@ -106,6 +107,81 @@ class FeatureEmbeddingTsneTests(unittest.TestCase):
         self.assertIn("Definitions: Derogatory labeling.; Attacking a person or group.", text)
         self.assertIn("Synonyms: labeling; labelling", text)
 
+    def test_build_embedding_text_uses_nested_annotation_fields(self):
+        row = {
+            "feature_name": "Loaded Language",
+            "category": "persuasion",
+            "annotation": {
+                "formal_definition": "A persuasive feature using emotionally charged wording.",
+                "synonyms": ["emotive language"],
+            },
+        }
+
+        text = build_embedding_text(
+            row,
+            parse_text_fields("feature_name,annotation.formal_definition,annotation.synonyms"),
+        )
+
+        self.assertIn("Feature Name: Loaded Language", text)
+        self.assertIn(
+            "Annotation Formal Definition: A persuasive feature using emotionally charged wording.",
+            text,
+        )
+        self.assertIn("Annotation Synonyms: emotive language", text)
+
+    def test_build_embedding_text_falls_back_to_flattened_annotation_csv_fields(self):
+        row = {
+            "feature_name": "Care/Harm",
+            "category": "moral_framing",
+            "annotation_formal_definition": "A moral frame focused on suffering and protection.",
+            "annotation_synonyms": json.dumps(["care foundation"]),
+        }
+
+        text = build_embedding_text(
+            row,
+            parse_text_fields("feature_name,annotation.formal_definition,annotation.synonyms"),
+        )
+
+        self.assertIn(
+            "Annotation Formal Definition: A moral frame focused on suffering and protection.",
+            text,
+        )
+        self.assertIn("Annotation Synonyms: care foundation", text)
+
+    def test_loads_annotated_json_with_default_text_fields_and_annotation_counts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "annotated_features.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "feature_count": 1,
+                        "features": [
+                            {
+                                "feature_name": "Academic Integrity",
+                                "category": "moral_framing",
+                                "annotation": {
+                                    "formal_definition": "A normative framework concerning academic honesty.",
+                                    "short_definition": "Academic honesty and ethical conduct.",
+                                    "synonyms": ["academic honesty"],
+                                    "examples": ["plagiarism"],
+                                    "paper_count": 3,
+                                    "mention_count": 4,
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            items = load_feature_items(path, DEFAULT_TEXT_FIELDS)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].paper_count, 3)
+        self.assertEqual(items[0].mention_count, 4)
+        self.assertIn("Annotation Formal Definition: A normative framework", items[0].embedding_text)
+        self.assertIn("Annotation Examples: plagiarism", items[0].embedding_text)
+
     def test_embed_texts_with_cache_reuses_cached_vectors(self):
         with tempfile.TemporaryDirectory() as temp:
             cache_path = Path(temp) / "embedding_cache.jsonl"
@@ -161,7 +237,11 @@ class FeatureEmbeddingTsneTests(unittest.TestCase):
                 paper_count=5,
                 mention_count=8,
                 embedding_text="Feature Name: Loaded Language\nCategory: persuasion",
-                raw_row={},
+                raw_row={
+                    "annotation": {
+                        "short_definition": "Emotionally charged persuasive wording."
+                    }
+                },
             ),
             FeatureItem(
                 row_index=2,
@@ -188,6 +268,8 @@ class FeatureEmbeddingTsneTests(unittest.TestCase):
 
         self.assertIn('id="feature-search"', html)
         self.assertIn("Loaded Language", html)
+        self.assertIn("Emotionally charged persuasive wording.", html)
+        self.assertIn("short_definition", html)
         self.assertIn('"paper_count": 5', html)
         self.assertIn("Wheel zoom, drag pan", html)
 
