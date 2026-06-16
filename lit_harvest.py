@@ -36,6 +36,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
+from lit_relevance import load_relevance_profile
+
 
 VERSION = "0.1.0"
 USER_AGENT_NAME = f"LitHarvest/{VERSION}"
@@ -272,6 +274,7 @@ class WebSearchResult:
 @dataclass
 class Candidate:
     title: str
+    candidate_id: str = ""
     authors: list[str] = field(default_factory=list)
     year: int | None = None
     doi: str | None = None
@@ -283,6 +286,7 @@ class Candidate:
     candidate_pdf_urls: list[str] = field(default_factory=list)
     candidate_landing_page_urls: list[str] = field(default_factory=list)
     relevance_score: float = 0.0
+    relevance_score_breakdown: dict[str, Any] = field(default_factory=dict)
     source_score: float | None = None
     citation_count: int | None = None
     discovered_via: list[dict[str, Any]] = field(default_factory=list)
@@ -2984,6 +2988,35 @@ def candidate_keys(candidate: Candidate) -> list[str]:
     return keys
 
 
+def stable_candidate_id(candidate: Candidate) -> str:
+    if candidate.candidate_id:
+        return candidate.candidate_id
+    identity = candidate_download_identity(candidate)
+    candidate.candidate_id = "paper_" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:16]
+    return candidate.candidate_id
+
+
+def ensure_candidate_ids(candidates: list[Candidate]) -> list[Candidate]:
+    for candidate in candidates:
+        stable_candidate_id(candidate)
+    return candidates
+
+
+def partition_selected_candidates(
+    candidates: list[Candidate],
+    selected_candidate_ids: list[str] | None,
+) -> tuple[list[Candidate], list[Candidate]]:
+    if selected_candidate_ids is None:
+        return candidates, []
+    selected_ids = {str(value) for value in selected_candidate_ids}
+    selected: list[Candidate] = []
+    unselected: list[Candidate] = []
+    for candidate in candidates:
+        target = selected if stable_candidate_id(candidate) in selected_ids else unselected
+        target.append(candidate)
+    return selected, unselected
+
+
 def merge_candidate_into(target: Candidate, incoming: Candidate) -> None:
     target.source_apis = dedupe_preserve(target.source_apis + incoming.source_apis)
     target.source_ids.update({key: value for key, value in incoming.source_ids.items() if value})
@@ -3023,7 +3056,130 @@ def merge_candidate_into(target: Candidate, incoming: Candidate) -> None:
         target.source_score = incoming.source_score
 
 
-def rank_candidates(candidates: list[Candidate], terms: ExtractedTerms) -> list[Candidate]:
+def relevance_term_matches(term: str, text: str | None) -> bool:
+    term_tokens = set(content_tokens(term))
+    if not term_tokens:
+        return False
+    return term_tokens.issubset(set(content_tokens(text)))
+
+
+def metadata_relevance_signals(candidate: Candidate) -> dict[str, float]:
+    current_year = datetime.now().year
+    age = max(current_year - candidate.year, 0) if candidate.year else None
+    return {
+        "source_relevance": min(
+            math.log1p(max(candidate.source_score or 0.0, 0.0)) / 5.0,
+            1.0,
+        ),
+        "citation_impact": min(
+            math.log10(max(candidate.citation_count or 0, 0) + 1) / 4.0,
+            1.0,
+        ),
+        "recency": max(0.0, 1.0 - age / 20.0) if age is not None else 0.0,
+        "open_access": float(
+            bool(candidate.candidate_pdf_urls or candidate.candidate_landing_page_urls)
+        ),
+        "doi": float(bool(candidate.doi)),
+    }
+
+
+def profile_relevance_score(
+    candidate: Candidate,
+    profile: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    field_text = {
+        "title": candidate.title,
+        "abstract": candidate.abstract or "",
+        "matched_keywords": " ".join(candidate.matched_keywords),
+    }
+    field_weights = profile["field_weights"]
+    field_weight_total = sum(field_weights.values()) or 1.0
+    criterion_results: list[dict[str, Any]] = []
+    positive_total = 0.0
+    positive_weight = 0.0
+
+    for criterion in profile["criteria"]:
+        field_scores: dict[str, float] = {}
+        matched_terms: dict[str, list[str]] = {}
+        for field_name, field_weight in field_weights.items():
+            matches = [
+                term
+                for term in criterion["terms"]
+                if relevance_term_matches(term, field_text[field_name])
+            ]
+            field_scores[field_name] = float(bool(matches))
+            if matches:
+                matched_terms[field_name] = matches
+        criterion_score = sum(
+            field_scores[field_name] * field_weights[field_name]
+            for field_name in field_weights
+        ) / field_weight_total
+        criterion_weight = float(criterion["weight"])
+        contribution = criterion_score * criterion_weight
+        positive_total += contribution
+        positive_weight += criterion_weight
+        criterion_results.append(
+            {
+                "id": criterion["id"],
+                "label": criterion["label"],
+                "score": round(criterion_score, 5),
+                "weight": criterion_weight,
+                "contribution": round(contribution, 5),
+                "matched_terms": matched_terms,
+            }
+        )
+
+    metadata_values = metadata_relevance_signals(candidate)
+    metadata_results: dict[str, dict[str, float]] = {}
+    for signal, signal_weight in profile["metadata_weights"].items():
+        value = metadata_values[signal]
+        contribution = value * signal_weight
+        positive_total += contribution
+        positive_weight += signal_weight
+        metadata_results[signal] = {
+            "value": round(value, 5),
+            "weight": signal_weight,
+            "contribution": round(contribution, 5),
+        }
+
+    base_score = positive_total / positive_weight if positive_weight else 0.0
+    exclusion_results: list[dict[str, Any]] = []
+    exclusion_text = " ".join([candidate.title, candidate.abstract or "", candidate.venue or ""])
+    penalty = 0.0
+    for exclusion in profile["exclusions"]:
+        if relevance_term_matches(exclusion["term"], exclusion_text):
+            penalty += float(exclusion["penalty"])
+            exclusion_results.append(exclusion)
+    final_score = max(0.0, min(1.0, base_score - penalty))
+    breakdown = {
+        "mode": "generated_profile",
+        "profile_title": profile["title"],
+        "base_score": round(base_score, 5),
+        "exclusion_penalty": round(penalty, 5),
+        "criteria": criterion_results,
+        "metadata": metadata_results,
+        "matched_exclusions": exclusion_results,
+        "final_score": round(final_score, 5),
+    }
+    return round(final_score, 5), breakdown
+
+
+def rank_candidates(
+    candidates: list[Candidate],
+    terms: ExtractedTerms,
+    relevance_profile: dict[str, Any] | None = None,
+) -> list[Candidate]:
+    if relevance_profile is not None:
+        for candidate in candidates:
+            candidate.relevance_score, candidate.relevance_score_breakdown = (
+                profile_relevance_score(candidate, relevance_profile)
+            )
+        return sorted(
+            candidates,
+            key=lambda item: (item.relevance_score, item.year or 0, bool(item.doi)),
+            reverse=True,
+        )
+
     vocabulary = set(terms.keywords[:30])
     for phrase in terms.noun_phrases[:20]:
         vocabulary.update(phrase.split())
@@ -3054,6 +3210,7 @@ def rank_candidates(candidates: list[Candidate], terms: ExtractedTerms) -> list[
         if candidate.doi:
             score += 0.03
         candidate.relevance_score = round(score, 5)
+        candidate.relevance_score_breakdown = {"mode": "legacy"}
     return sorted(
         candidates,
         key=lambda item: (item.relevance_score, item.year or 0, bool(item.doi)),
@@ -3589,12 +3746,30 @@ def mark_downloads_not_attempted(
     candidates: list[Candidate],
     reason: str,
     ledger: DownloadLogLedger | None = None,
+    preserve_existing: bool = False,
+) -> None:
+    records: list[tuple[Candidate, dict[str, Any]]] = []
+    for candidate in candidates:
+        if not (preserve_existing and candidate.download):
+            candidate.download = {
+                "status": "not_attempted",
+                "reason": reason,
+                "filename": build_pdf_filename(candidate),
+            }
+        records.append((candidate, candidate.download))
+    if ledger:
+        ledger.record_many(records)
+
+
+def mark_candidates_not_selected(
+    candidates: list[Candidate],
+    ledger: DownloadLogLedger | None = None,
 ) -> None:
     records: list[tuple[Candidate, dict[str, Any]]] = []
     for candidate in candidates:
         candidate.download = {
-            "status": "not_attempted",
-            "reason": reason,
+            "status": "not_selected",
+            "reason": "not_selected",
             "filename": build_pdf_filename(candidate),
         }
         records.append((candidate, candidate.download))
@@ -4136,6 +4311,7 @@ def write_csv_report(path: Path, candidates: list[Candidate]) -> None:
         "venue",
         "source_apis",
         "relevance_score",
+        "relevance_score_breakdown",
         "landing_page_url",
         "candidate_pdf_urls",
         "candidate_landing_page_urls",
@@ -4157,6 +4333,11 @@ def write_csv_report(path: Path, candidates: list[Candidate]) -> None:
                     "venue": candidate.venue or "",
                     "source_apis": "; ".join(candidate.source_apis),
                     "relevance_score": candidate.relevance_score,
+                    "relevance_score_breakdown": json.dumps(
+                        candidate.relevance_score_breakdown,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
                     "landing_page_url": candidate.landing_page_url or "",
                     "candidate_pdf_urls": "; ".join(candidate.candidate_pdf_urls),
                     "candidate_landing_page_urls": "; ".join(
@@ -4280,7 +4461,7 @@ def candidate_from_dict(raw: dict[str, Any]) -> Candidate:
             if value is not None
         }
 
-    for key in ["pdf_resolution", "download"]:
+    for key in ["relevance_score_breakdown", "pdf_resolution", "download"]:
         if not isinstance(kwargs.get(key), dict):
             kwargs[key] = {}
 
@@ -4390,6 +4571,7 @@ def write_candidate_cache(
     search_errors: list[dict[str, Any]],
     keyword_search_counts: dict[str, Counter[str]],
     candidates: list[Candidate],
+    relevance_profile: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "project": "LitHarvest",
@@ -4404,6 +4586,7 @@ def write_candidate_cache(
         "keyword_search_counts": {
             source: dict(counter) for source, counter in keyword_search_counts.items()
         },
+        "relevance_scoring": relevance_profile,
         "candidate_count": len(candidates),
         "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
     }
@@ -4422,6 +4605,11 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
 
     draft_text = read_text_file(draft_path)
     extracted = extract_keywords(draft_text)
+    relevance_profile = None
+    if config.get("relevance_scoring"):
+        relevance_profile = load_relevance_profile(
+            Path(config["relevance_scoring"]).expanduser()
+        )
     queries = combine_search_queries(
         configured_search_queries(config.get("extra_queries")),
         build_search_queries(extracted, int(config["max_queries"])),
@@ -4505,7 +4693,10 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                             }
                         )
 
-            candidates = rank_candidates(merge_candidates(candidates), extracted)
+            candidates = merge_candidates(candidates)
+            candidates = ensure_candidate_ids(
+                rank_candidates(candidates, extracted, relevance_profile)
+            )
             write_candidate_cache(
                 candidates_json_path,
                 draft_path=draft_path,
@@ -4516,6 +4707,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                 search_errors=search_errors,
                 keyword_search_counts=keyword_search_counts,
                 candidates=candidates,
+                relevance_profile=relevance_profile,
             )
             candidate_cache = {
                 "path": str(candidates_json_path),
@@ -4528,6 +4720,29 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                 candidates_json_path,
             )
 
+        if cached and relevance_profile is not None:
+            candidates = ensure_candidate_ids(
+                rank_candidates(candidates, extracted, relevance_profile)
+            )
+            write_candidate_cache(
+                candidates_json_path,
+                draft_path=draft_path,
+                draft_text=draft_text,
+                config=config,
+                extracted=extracted,
+                queries=queries,
+                search_errors=search_errors,
+                keyword_search_counts=keyword_search_counts,
+                candidates=candidates,
+                relevance_profile=relevance_profile,
+            )
+            LOGGER.info(
+                "Re-ranked %d cached candidates with relevance profile %r.",
+                len(candidates),
+                relevance_profile["title"],
+            )
+
+        ensure_candidate_ids(candidates)
         web_searcher = build_web_pdf_searcher(config, http)
         resolver = PdfResolver(
             http,
@@ -4557,15 +4772,19 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                 retry_failed_downloads=bool(config.get("retry_failed_downloads")),
             )
 
+        selected_candidate_ids = config.get("selected_candidate_ids")
+        selected_candidates, unselected_candidates = partition_selected_candidates(
+            candidates, selected_candidate_ids
+        )
+        if selected_candidate_ids is not None:
+            mark_candidates_not_selected(unselected_candidates, ledger=download_ledger)
+
         if config.get("metadata_only"):
-            for candidate in candidates:
-                candidate.download = {
-                    "status": "not_attempted",
-                    "reason": "metadata_only mode",
-                    "filename": build_pdf_filename(candidate),
-                }
-            download_ledger.record_many(
-                [(candidate, candidate.download) for candidate in candidates]
+            mark_downloads_not_attempted(
+                selected_candidates,
+                "metadata_only mode",
+                ledger=download_ledger,
+                preserve_existing=True,
             )
         else:
             download_limit = config.get("max_downloads")
@@ -4575,7 +4794,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                 int(web_limit) if web_limit is not None else None
             )
             download_candidates(
-                candidates,
+                selected_candidates,
                 resolver=resolver,
                 downloader=downloader,
                 max_downloads=max_downloads,
@@ -4627,6 +4846,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "keyword_search_counts": {
             source: dict(counter) for source, counter in keyword_search_counts.items()
         },
+        "relevance_scoring": relevance_profile,
         "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
     }
     download_log = download_log_payload(
@@ -4893,6 +5113,7 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                 candidates_json_path,
             )
 
+        ensure_candidate_ids(candidates)
         web_searcher = build_web_pdf_searcher(config, http)
         resolver = PdfResolver(
             http,
@@ -4922,15 +5143,19 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                 retry_failed_downloads=bool(config.get("retry_failed_downloads")),
             )
 
+        selected_candidate_ids = config.get("selected_candidate_ids")
+        selected_candidates, unselected_candidates = partition_selected_candidates(
+            candidates, selected_candidate_ids
+        )
+        if selected_candidate_ids is not None:
+            mark_candidates_not_selected(unselected_candidates, ledger=download_ledger)
+
         if config.get("metadata_only"):
-            for candidate in candidates:
-                candidate.download = {
-                    "status": "not_attempted",
-                    "reason": "metadata_only mode",
-                    "filename": build_pdf_filename(candidate),
-                }
-            download_ledger.record_many(
-                [(candidate, candidate.download) for candidate in candidates]
+            mark_downloads_not_attempted(
+                selected_candidates,
+                "metadata_only mode",
+                ledger=download_ledger,
+                preserve_existing=True,
             )
         else:
             download_limit = config.get("max_downloads")
@@ -4938,7 +5163,7 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             web_limit = config.get("web_search_max_candidates")
             max_web_search_candidates = int(web_limit) if web_limit is not None else None
             download_candidates(
-                candidates,
+                selected_candidates,
                 resolver=resolver,
                 downloader=downloader,
                 max_downloads=max_downloads,
@@ -5081,6 +5306,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bibtex": False,
     "dry_run": False,
     "extra_queries": [],
+    "selected_candidate_ids": None,
+    "relevance_scoring": None,
 }
 
 
@@ -5094,6 +5321,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Harvest mode: draft search or citation-seeded core PDF expansion.",
     )
     parser.add_argument("--draft", help="Path to the input draft text or markdown file.")
+    parser.add_argument(
+        "--relevance-scoring",
+        help="Optional generated relevance_scoring.json profile for candidate ranking.",
+    )
     parser.add_argument(
         "--core-pdf",
         action="append",
@@ -5189,6 +5420,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-pdf-mb", type=int, help="Maximum accepted PDF size in MB.")
     parser.add_argument("--max-downloads", type=int, help="Maximum successful PDF downloads.")
+    parser.add_argument(
+        "--selected-candidate-id",
+        dest="selected_candidate_ids",
+        action="append",
+        help="Stable candidate ID to download. Repeatable; omitted downloads the ranked set.",
+    )
     parser.add_argument(
         "--metadata-only",
         action="store_true",

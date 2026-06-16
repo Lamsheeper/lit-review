@@ -1,8 +1,11 @@
 [console_scripts]
 comparison-plots = comparison_plots:main
 embedding-merge = embedding_merge:main
+feature-embedding-metadata = feature_embedding_metadata:main
 feature-embedding-tsne = feature_embedding_tsne:main
+known-feature-similarity = known_feature_similarity:main
 lit-extract = lit_extract:main
 lit-harvest = lit_harvest:main
 lit-log-summary = lit_log_summary:main
+lit-review-ui = lit_review_ui.app:main
 lit-synthesize = lit_synthesize:main

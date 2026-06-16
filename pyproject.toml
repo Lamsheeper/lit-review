@@ -9,16 +9,18 @@ description = "API-first literature collection and evidence-bound review synthes
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "fastapi>=0.115.0",
     "matplotlib>=3.8.0",
     "numpy>=2.0.0",
     "pypdf>=5.0.0",
     "PyMuPDF>=1.24.0",
     "scikit-learn>=1.5.0",
     "tqdm>=4.66.0",
+    "uvicorn>=0.34.0",
 ]
 
 [project.optional-dependencies]
-dev = []
+dev = ["httpx>=0.28.0"]
 
 [project.scripts]
 lit-harvest = "lit_harvest:main"
@@ -27,10 +29,19 @@ lit-log-summary = "lit_log_summary:main"
 lit-synthesize = "lit_synthesize:main"
 comparison-plots = "comparison_plots:main"
 feature-embedding-tsne = "feature_embedding_tsne:main"
+feature-embedding-metadata = "feature_embedding_metadata:main"
 embedding-merge = "embedding_merge:main"
+known-feature-similarity = "known_feature_similarity:main"
+lit-review-ui = "lit_review_ui.app:main"
 
 [tool.setuptools]
-py-modules = ["comparison_plots", "embedding_merge", "feature_embedding_tsne", "lit_extract", "lit_harvest", "lit_log_summary", "lit_pdf_service", "lit_synthesize"]
+py-modules = ["comparison_plots", "embedding_merge", "feature_embedding_metadata", "feature_embedding_tsne", "known_feature_similarity", "lit_extract", "lit_harvest", "lit_log_summary", "lit_pdf_service", "lit_relevance", "lit_synthesize", "lit_taxonomy"]
+
+[tool.setuptools.packages.find]
+include = ["lit_review_ui*"]
+
+[tool.setuptools.package-data]
+lit_review_ui = ["frontend/dist/**"]
 
 [tool.uv]
 package = true

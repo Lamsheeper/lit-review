@@ -21,9 +21,61 @@ from lit_synthesize import (
     write_llm_report,
     write_report,
 )
+from lit_pdf_service import prepare_direct_pdf_index
 
 
 class LitSynthCoreTests(unittest.TestCase):
+    def test_prepare_direct_pdf_index_does_not_create_markdown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            papers_dir = root / "papers"
+            papers_dir.mkdir()
+            pdf_path = papers_dir / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n")
+            out_dir = root / "run"
+
+            payload = prepare_direct_pdf_index(papers_dir, None, out_dir)
+
+            self.assertEqual(payload["mode"], "direct_pdf")
+            self.assertEqual(payload["paper_count"], 1)
+            self.assertTrue((out_dir / "paper_index.json").exists())
+            self.assertFalse((out_dir / "papers_md").exists())
+            self.assertEqual(payload["papers"][0]["conversion"]["status"], "direct_pdf_ready")
+
+    def test_prepare_direct_pdf_index_excludes_unselected_existing_pdfs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            papers_dir = root / "papers"
+            papers_dir.mkdir()
+            selected = papers_dir / "selected.pdf"
+            unselected = papers_dir / "unselected.pdf"
+            selected.write_bytes(b"%PDF-1.4\n")
+            unselected.write_bytes(b"%PDF-1.4\n")
+            manifest_path = papers_dir / "logs" / "manifest.json"
+            manifest_path.parent.mkdir()
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "title": "Selected",
+                                "download": {"status": "downloaded", "path": str(selected)},
+                            },
+                            {
+                                "title": "Unselected",
+                                "download": {"status": "not_selected", "path": str(unselected)},
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = prepare_direct_pdf_index(papers_dir, manifest_path, root / "run")
+
+            self.assertEqual(payload["paper_count"], 1)
+            self.assertEqual(Path(payload["papers"][0]["pdf_path"]), selected)
+
     def test_collect_paper_records_uses_litharvest_manifest_metadata(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

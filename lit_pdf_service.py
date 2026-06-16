@@ -573,6 +573,51 @@ class PdfConversionChunkingService:
             )
         return payload
 
+    def prepare_direct_pdf_index(
+        self,
+        papers_dir: Path,
+        manifest_path: Path | None,
+        out_dir: Path,
+    ) -> dict[str, Any]:
+        """Write the minimal paper index required by direct-PDF extraction."""
+        manifest = load_manifest(manifest_path)
+        records = self.collect_paper_records(
+            papers_dir, manifest=manifest, manifest_path=manifest_path
+        )
+        if manifest is not None:
+            allowed_paths: set[Path] = set()
+            for candidate in manifest.get("candidates", []):
+                download = candidate.get("download") or {}
+                if download.get("status") not in {"downloaded", "already_exists"}:
+                    continue
+                raw_path = download.get("path") or download.get("filename")
+                if raw_path:
+                    allowed_paths.add(
+                        resolve_download_path(str(raw_path), papers_dir, manifest_path).resolve()
+                    )
+            records = [
+                record
+                for record in records
+                if Path(record.pdf_path).expanduser().resolve() in allowed_paths
+            ]
+        for record in records:
+            record.md_path = None
+            record.conversion = {"status": "direct_pdf_ready"}
+        payload = {
+            "project": self.project,
+            "version": self.version,
+            "generated_at": utc_now(),
+            "mode": "direct_pdf",
+            "papers_dir": str(papers_dir),
+            "manifest_path": str(manifest_path) if manifest_path else None,
+            "paper_count": len(records),
+            "converted_count": 0,
+            "failed_count": 0,
+            "papers": [dataclasses.asdict(record) for record in records],
+        }
+        write_json(out_dir / "paper_index.json", payload)
+        return payload
+
     def split_markdown_pages(self, markdown: str) -> list[tuple[int | None, str]]:
         return split_markdown_pages(markdown)
 
@@ -628,4 +673,16 @@ def convert_pdfs_to_markdown(
         out_dir=out_dir,
         extractor=extractor,
         force=force,
+    )
+
+
+def prepare_direct_pdf_index(
+    papers_dir: Path,
+    manifest_path: Path | None,
+    out_dir: Path,
+) -> dict[str, Any]:
+    return DEFAULT_SERVICE.prepare_direct_pdf_index(
+        papers_dir=papers_dir,
+        manifest_path=manifest_path,
+        out_dir=out_dir,
     )

@@ -13,6 +13,12 @@ extract_configs/
 !extract_configs/*.json
 collected_*
 comparison_plots/
+ui_projects/
+lit_review_ui/frontend/node_modules/
+lit_review_ui/frontend/dist/
+lit_review_ui/frontend/*.tsbuildinfo
+lit_review_ui/frontend/vite.config.js
+lit_review_ui/frontend/vite.config.d.ts
 !harvest_configs/
 harvest_configs/*
 !harvest_configs/config.semeval_2020_task11_sanity.json

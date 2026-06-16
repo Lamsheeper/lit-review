@@ -7,6 +7,7 @@ import argparse
 import csv
 import copy
 import json
+import tempfile
 from decimal import Decimal
 import sys
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from feature_embedding_tsne import (
     parse_jsonish_list,
     parse_text_fields,
     positive_int,
+    read_feature_rows,
     row_field_value,
     safe_int,
     sanitize_filename_part,
@@ -167,6 +169,22 @@ class PreparedEmbeddings:
     cache_stats: Any
 
 
+@dataclass(frozen=True)
+class CategoryMergeSpec:
+    text_fields: list[str]
+    threshold: float
+    linkage: str = "complete"
+
+
+@dataclass(frozen=True)
+class PreparedCategoryEmbeddings:
+    specs: dict[str, CategoryMergeSpec]
+    raw_rows: list[dict[str, Any]]
+    items: list[FeatureItem]
+    embeddings: list[list[float]]
+    cache_stats: Any
+
+
 def threshold_value(value: str) -> float:
     try:
         parsed = float(value)
@@ -203,6 +221,52 @@ def threshold_range(start: float, end: float, step: float = 0.01) -> list[float]
 def validate_threshold_number(value: float, label: str = "threshold") -> None:
     if not 0.0 < value <= 1.0:
         raise ValueError(f"{label} must be greater than 0 and at most 1.")
+
+
+def load_category_merge_specs(path: Path) -> dict[str, CategoryMergeSpec]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        isinstance(payload, dict)
+        and set(payload) == {"categories"}
+        and isinstance(payload.get("categories"), dict)
+    ):
+        payload = payload["categories"]
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"{path} must contain a non-empty JSON object keyed by category.")
+
+    specs: dict[str, CategoryMergeSpec] = {}
+    for raw_category, raw_spec in payload.items():
+        category = str(raw_category).strip()
+        if not category:
+            raise ValueError(f"{path} contains an empty category name.")
+        if not isinstance(raw_spec, dict):
+            raise ValueError(f"Category {category!r} in {path} must map to a JSON object.")
+        if "text_fields" not in raw_spec:
+            raise ValueError(f"Category {category!r} in {path} is missing text_fields.")
+        if "threshold" not in raw_spec:
+            raise ValueError(f"Category {category!r} in {path} is missing threshold.")
+        fields = parse_text_fields(raw_spec["text_fields"])
+        try:
+            threshold = float(raw_spec["threshold"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Category {category!r} threshold must be a number.") from exc
+        validate_threshold_number(threshold, f"threshold for category {category!r}")
+        linkage = str(raw_spec.get("linkage") or "complete").strip().lower()
+        if linkage not in {"single", "complete"}:
+            raise ValueError(f"Category {category!r} linkage must be 'single' or 'complete'.")
+        specs[category] = CategoryMergeSpec(text_fields=fields, threshold=threshold, linkage=linkage)
+    return specs
+
+
+def category_specs_payload(specs: dict[str, CategoryMergeSpec]) -> dict[str, dict[str, Any]]:
+    return {
+        category: {
+            "text_fields": spec.text_fields,
+            "threshold": spec.threshold,
+            "linkage": spec.linkage,
+        }
+        for category, spec in specs.items()
+    }
 
 
 def normalized_matrix(embeddings: list[list[float]]) -> Any:
@@ -291,6 +355,32 @@ def find_similarity_pairs_from_normalized_matrix(
             items[pair.right_index].row_index,
         ),
     )
+
+
+def find_similarity_pairs_by_category_thresholds(
+    items: list[FeatureItem],
+    matrix: Any,
+    *,
+    thresholds: dict[str, float],
+    block_size: int = 512,
+) -> list[SimilarityPair]:
+    missing = sorted({item.category for item in items} - set(thresholds))
+    if missing:
+        raise ValueError(f"Missing thresholds for categories: {', '.join(missing)}.")
+    for category, threshold in thresholds.items():
+        validate_threshold_number(threshold, f"threshold for category {category!r}")
+    pairs = find_similarity_pairs_from_normalized_matrix(
+        items,
+        matrix,
+        threshold=min(thresholds.values()),
+        scope="category",
+        block_size=block_size,
+    )
+    return [
+        pair
+        for pair in pairs
+        if pair.similarity >= thresholds[items[pair.left_index].category]
+    ]
 
 
 def pairwise_similarity_histogram(
@@ -474,6 +564,7 @@ def write_similarity_distribution_plot(
     ax.set_ylabel("Pair count")
     ax.set_xlim(0.5, 1.0)
     ax.grid(True, axis="y", alpha=0.28)
+    draw_threshold_lines(ax, thresholds)
     subtitle = (
         f"{histogram['pair_count']} pairs"
         if histogram.get("mean_similarity") is None
@@ -537,6 +628,7 @@ def write_similarity_boxplot(
     ax.set_yticks([])
     ax.set_xlim(0.5, 1.0)
     ax.grid(True, axis="x", alpha=0.28)
+    draw_threshold_lines(ax, thresholds)
     subtitle = (
         f"{histogram['pair_count']} pairs"
         if histogram.get("mean_similarity") is None
@@ -593,6 +685,7 @@ def write_similarity_percentile_plot(
     else:
         ax.set_ylim(-1.0, 1.0)
     ax.grid(True, alpha=0.28)
+    draw_threshold_lines(ax, thresholds, horizontal=True)
     subtitle = (
         f"{histogram['pair_count']} pairs"
         if histogram.get("mean_similarity") is None
@@ -825,6 +918,133 @@ def write_similarity_percentile_by_category_plot(
     return path
 
 
+def category_merge_summary(
+    items: list[FeatureItem],
+    groups: list[MergeGroup],
+    *,
+    all_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    input_counts: dict[str, int] = {}
+    if all_rows is None:
+        for item in items:
+            input_counts[item.category] = input_counts.get(item.category, 0) + 1
+    else:
+        for row in all_rows:
+            category = str(row.get("category") or "").strip() or "uncategorized"
+            input_counts[category] = input_counts.get(category, 0) + 1
+
+    merged_away_counts = {category: 0 for category in input_counts}
+    for group in groups:
+        for index in group.member_indices:
+            if index == group.canonical_index:
+                continue
+            category = items[index].category
+            merged_away_counts[category] = merged_away_counts.get(category, 0) + 1
+
+    return [
+        {
+            "category": category,
+            "input_features": input_counts[category],
+            "retained_features": input_counts[category] - merged_away_counts.get(category, 0),
+            "merged_away_features": merged_away_counts.get(category, 0),
+        }
+        for category in sorted(input_counts, key=lambda value: (-input_counts[value], value.casefold()))
+    ]
+
+
+def write_category_retention_plot(path: Path, rows: list[dict[str, Any]]) -> Path:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - dependency is required by pyproject
+        raise RuntimeError("Matplotlib is required for category retention plots.") from exc
+
+    categories = [str(row["category"]) for row in rows]
+    retained = [int(row["retained_features"]) for row in rows]
+    merged_away = [int(row["merged_away_features"]) for row in rows]
+    fig_width = max(8.0, min(18.0, 5.0 + len(categories) * 1.4))
+    fig, ax = plt.subplots(figsize=(fig_width, 6.5))
+    positions = list(range(len(categories)))
+    green_bars = ax.bar(
+        positions,
+        retained,
+        color="#16a34a",
+        edgecolor="#ffffff",
+        label="Retained after merge",
+    )
+    red_bars = ax.bar(
+        positions,
+        merged_away,
+        bottom=retained,
+        color="#dc2626",
+        edgecolor="#ffffff",
+        label="Merged away",
+    )
+    ax.bar_label(green_bars, labels=[str(value) for value in retained], label_type="center", color="#ffffff")
+    max_input = max((int(row["input_features"]) for row in rows), default=0)
+    for position, retained_count, merged_away_count in zip(positions, retained, merged_away):
+        if not merged_away_count:
+            continue
+        if merged_away_count >= max(1, max_input * 0.035):
+            ax.text(
+                position,
+                retained_count + merged_away_count / 2,
+                str(merged_away_count),
+                ha="center",
+                va="center",
+                color="#ffffff",
+            )
+        else:
+            ax.text(
+                position,
+                retained_count + merged_away_count + max(2, max_input * 0.008),
+                str(merged_away_count),
+                ha="center",
+                va="bottom",
+                color="#b91c1c",
+                fontweight="bold",
+            )
+    ax.set_title("Feature Retention by Category")
+    ax.set_xlabel("Category")
+    ax.set_ylabel("Input feature count")
+    ax.set_xticks(positions, labels=[category.replace("_", " ") for category in categories], rotation=20, ha="right")
+    ax.grid(True, axis="y", alpha=0.28)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return path
+
+
+def draw_threshold_lines(ax: Any, thresholds: Iterable[float], *, horizontal: bool = False) -> None:
+    unique_thresholds = sorted({float(threshold) for threshold in thresholds})
+    for threshold in unique_thresholds:
+        label = f"threshold {threshold:.3f}"
+        if horizontal:
+            ax.axhline(
+                threshold,
+                color="#dc2626",
+                linewidth=1.4,
+                linestyle="--",
+                alpha=0.8,
+                label=label,
+            )
+        else:
+            ax.axvline(
+                threshold,
+                color="#dc2626",
+                linewidth=1.4,
+                linestyle="--",
+                alpha=0.8,
+                label=label,
+            )
+    if unique_thresholds:
+        ax.legend(loc="upper left", fontsize=8)
+
+
 class DisjointSet:
     def __init__(self, size: int) -> None:
         self.parent = list(range(size))
@@ -845,7 +1065,20 @@ class DisjointSet:
         self.parent[right_root] = left_root
 
 
-def build_merge_groups(items: list[FeatureItem], pairs: list[SimilarityPair]) -> list[MergeGroup]:
+def build_merge_groups(
+    items: list[FeatureItem],
+    pairs: list[SimilarityPair],
+    *,
+    linkage: str = "single",
+) -> list[MergeGroup]:
+    if linkage == "single":
+        return build_single_link_merge_groups(items, pairs)
+    if linkage == "complete":
+        return build_complete_link_merge_groups(items, pairs)
+    raise ValueError("linkage must be 'single' or 'complete'.")
+
+
+def build_single_link_merge_groups(items: list[FeatureItem], pairs: list[SimilarityPair]) -> list[MergeGroup]:
     dsu = DisjointSet(len(items))
     for pair in pairs:
         dsu.union(pair.left_index, pair.right_index)
@@ -874,6 +1107,55 @@ def build_merge_groups(items: list[FeatureItem], pairs: list[SimilarityPair]) ->
         )
         raw_groups.append((canonical_index, ordered_members, sorted_group_pairs(items, group_pairs)))
 
+    return indexed_merge_groups(items, raw_groups)
+
+
+def build_complete_link_merge_groups(items: list[FeatureItem], pairs: list[SimilarityPair]) -> list[MergeGroup]:
+    pair_lookup: dict[frozenset[int], SimilarityPair] = {
+        frozenset((pair.left_index, pair.right_index)): pair
+        for pair in pairs
+    }
+    clusters: list[list[int]] = []
+    for item_index in sorted(range(len(items)), key=lambda index: member_sort_key(items[index])):
+        compatible_clusters = [
+            cluster
+            for cluster in clusters
+            if all(frozenset((item_index, member_index)) in pair_lookup for member_index in cluster)
+        ]
+        if not compatible_clusters:
+            clusters.append([item_index])
+            continue
+        cluster = sorted(
+            compatible_clusters,
+            key=lambda members: (
+                -len(members),
+                member_sort_key(items[choose_canonical_index(items, members)]),
+            ),
+        )[0]
+        cluster.append(item_index)
+
+    raw_groups: list[tuple[int, list[int], list[SimilarityPair]]] = []
+    for member_indices in clusters:
+        if len(member_indices) < 2:
+            continue
+        canonical_index = choose_canonical_index(items, member_indices)
+        ordered_members = sorted(
+            member_indices,
+            key=lambda index: (0 if index == canonical_index else 1, member_sort_key(items[index])),
+        )
+        group_pairs = [
+            pair_lookup[frozenset((left_index, right_index))]
+            for offset, left_index in enumerate(member_indices)
+            for right_index in member_indices[offset + 1 :]
+        ]
+        raw_groups.append((canonical_index, ordered_members, sorted_group_pairs(items, group_pairs)))
+    return indexed_merge_groups(items, raw_groups)
+
+
+def indexed_merge_groups(
+    items: list[FeatureItem],
+    raw_groups: list[tuple[int, list[int], list[SimilarityPair]]],
+) -> list[MergeGroup]:
     raw_groups.sort(key=lambda item: member_sort_key(items[item[0]]))
     return [
         MergeGroup(
@@ -884,6 +1166,26 @@ def build_merge_groups(items: list[FeatureItem], pairs: list[SimilarityPair]) ->
         )
         for index, (canonical_index, member_indices, group_pairs) in enumerate(raw_groups, start=1)
     ]
+
+
+def build_category_merge_groups(
+    items: list[FeatureItem],
+    pairs: list[SimilarityPair],
+    specs: dict[str, CategoryMergeSpec],
+) -> list[MergeGroup]:
+    raw_groups: list[tuple[int, list[int], list[SimilarityPair]]] = []
+    for category, spec in specs.items():
+        category_pairs = [
+            pair
+            for pair in pairs
+            if items[pair.left_index].category == category
+        ]
+        category_groups = build_merge_groups(items, category_pairs, linkage=spec.linkage)
+        raw_groups.extend(
+            (group.canonical_index, group.member_indices, group.pairs)
+            for group in category_groups
+        )
+    return indexed_merge_groups(items, raw_groups)
 
 
 def choose_canonical_index(items: list[FeatureItem], member_indices: Iterable[int]) -> int:
@@ -939,14 +1241,32 @@ def pair_json(pair: SimilarityPair, items: list[FeatureItem]) -> dict[str, Any]:
     }
 
 
-def group_json(group: MergeGroup, items: list[FeatureItem], threshold: float, scope: str) -> dict[str, Any]:
+def group_threshold(
+    group: MergeGroup,
+    items: list[FeatureItem],
+    threshold: float | dict[str, float],
+) -> float:
+    if isinstance(threshold, dict):
+        categories = {items[index].category for index in group.member_indices}
+        if len(categories) != 1:
+            raise ValueError("Per-category thresholds cannot be applied to a cross-category merge group.")
+        return threshold[next(iter(categories))]
+    return threshold
+
+
+def group_json(
+    group: MergeGroup,
+    items: list[FeatureItem],
+    threshold: float | dict[str, float],
+    scope: str,
+) -> dict[str, Any]:
     canonical = items[group.canonical_index]
     members = [items[index] for index in group.member_indices]
     pair_rows = [pair_json(pair, items) for pair in group.pairs]
     similarities = [pair.similarity for pair in group.pairs]
     return {
         "group_id": group.group_id,
-        "threshold": threshold,
+        "threshold": group_threshold(group, items, threshold),
         "scope": scope,
         "canonical_feature_key": canonical.feature_key,
         "canonical_feature_name": canonical.label,
@@ -1072,8 +1392,9 @@ def build_merged_features(
     items: list[FeatureItem],
     groups: list[MergeGroup],
     *,
-    threshold: float,
+    threshold: float | dict[str, float],
     scope: str,
+    all_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     group_by_member: dict[int, MergeGroup] = {
         member_index: group
@@ -1082,7 +1403,21 @@ def build_merged_features(
     }
     output: list[dict[str, Any]] = []
     emitted_groups: set[str] = set()
-    for index, item in enumerate(items):
+    item_index_by_row_index = {
+        item.row_index: item_index
+        for item_index, item in enumerate(items)
+    }
+    rows: Iterable[tuple[int, dict[str, Any]]]
+    if all_rows is None:
+        rows = ((item.row_index, item.raw_row) for item in items)
+    else:
+        rows = enumerate(all_rows, start=1)
+    for row_index, raw_row in rows:
+        index = item_index_by_row_index.get(row_index)
+        if index is None:
+            output.append(copy.deepcopy(raw_row))
+            continue
+        item = items[index]
         group = group_by_member.get(index)
         if group is None:
             row = copy.deepcopy(item.raw_row)
@@ -1100,7 +1435,7 @@ def merged_group_row(
     items: list[FeatureItem],
     group: MergeGroup,
     *,
-    threshold: float,
+    threshold: float | dict[str, float],
     scope: str,
 ) -> dict[str, Any]:
     canonical = items[group.canonical_index]
@@ -1126,10 +1461,11 @@ def merged_group_row(
         row["annotation"]["paper_count"] = row["paper_count"]
         row["annotation"]["mention_count"] = row["mention_count"]
 
-    group_payload = group_json(group, items, threshold=threshold, scope=scope)
+    applied_threshold = group_threshold(group, items, threshold)
+    group_payload = group_json(group, items, threshold=applied_threshold, scope=scope)
     row["embedding_merge"] = {
         "group_id": group.group_id,
-        "threshold": threshold,
+        "threshold": applied_threshold,
         "scope": scope,
         "canonical_feature_key": canonical.feature_key,
         "canonical_feature_name": canonical.label,
@@ -1192,7 +1528,7 @@ def write_qualitative_markdown(
     rows: list[dict[str, Any]],
     *,
     features_path: Path,
-    threshold: float,
+    threshold: float | dict[str, float],
     scope: str,
     top_n: int,
 ) -> Path:
@@ -1287,12 +1623,48 @@ def output_paths(output_dir: Path, prefix: str) -> dict[str, Path]:
         "similarity_distribution_by_category_png": output_dir / f"{prefix}_embedding_similarity_distribution_by_category.png",
         "similarity_boxplot_by_category_png": output_dir / f"{prefix}_embedding_similarity_boxplot_by_category.png",
         "similarity_percentiles_by_category_png": output_dir / f"{prefix}_embedding_similarity_percentiles_by_category.png",
+        "category_retention_png": output_dir / f"{prefix}_embedding_merge_retention_by_category.png",
         "trace_json": output_dir / f"{prefix}_embedding_merge_trace.json",
     }
 
 
+def category_similarity_output_paths(
+    output_dir: Path,
+    prefix: str,
+    categories: Iterable[str],
+) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    used_slugs: dict[str, str] = {}
+    for category in categories:
+        slug = sanitize_filename_part(category)
+        if slug in used_slugs and used_slugs[slug] != category:
+            raise ValueError(
+                f"Categories {used_slugs[slug]!r} and {category!r} produce the same filename slug {slug!r}."
+            )
+        used_slugs[slug] = category
+        paths[f"similarity_distribution_{slug}_png"] = (
+            output_dir / f"{prefix}_embedding_similarity_distribution_{slug}.png"
+        )
+        paths[f"similarity_boxplot_{slug}_png"] = (
+            output_dir / f"{prefix}_embedding_similarity_boxplot_{slug}.png"
+        )
+        paths[f"similarity_percentiles_{slug}_png"] = (
+            output_dir / f"{prefix}_embedding_similarity_percentiles_{slug}.png"
+        )
+    return paths
+
+
 def merged_tsne_html_path(output_dir: Path, prefix: str) -> Path:
     return output_dir / f"{prefix}_embedding_merged_features_gemini_embedding_tsne.html"
+
+
+def category_merged_tsne_html_path(output_dir: Path, prefix: str, category: str) -> Path:
+    slug = sanitize_filename_part(category)
+    return output_dir / f"{prefix}_embedding_merged_features_{slug}_gemini_embedding_tsne.html"
+
+
+def combined_category_merged_tsne_html_path(output_dir: Path, prefix: str) -> Path:
+    return output_dir / f"{prefix}_embedding_merged_features_all_categories_gemini_embedding_tsne.html"
 
 
 def sweep_output_paths(output_dir: Path, prefix: str) -> dict[str, Path]:
@@ -1323,17 +1695,20 @@ def write_merge_artifacts(
     qualitative_rows: list[dict[str, Any]],
     qualitative_top: int,
     merged_features: list[dict[str, Any]],
-    threshold: float,
+    threshold: float | dict[str, float],
     scope: str,
-    text_fields: list[str],
+    text_fields: list[str] | dict[str, list[str]],
     model: str,
     task_type: str,
     output_dimensionality: int,
     cache_path: Path,
     cache_stats: Any,
-    similarity_distribution: dict[str, Any],
+    similarity_distribution: dict[str, Any] | None,
     similarity_distributions_by_category: dict[str, dict[str, Any]],
+    input_feature_count: int | None = None,
+    all_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    total_input_features = input_feature_count if input_feature_count is not None else len(items)
     pair_rows = [pair_json(pair, items) for pair in pairs]
     group_rows = [group_json(group, items, threshold=threshold, scope=scope) for group in groups]
     output_dir = paths["trace_json"].parent
@@ -1388,7 +1763,7 @@ def write_merge_artifacts(
                 "input": str(features_path),
                 "threshold": threshold,
                 "scope": scope,
-                "input_feature_count": len(items),
+                "input_feature_count": total_input_features,
                 "merged_feature_count": len(merged_features),
                 "merge_group_count": len(groups),
                 "features": merged_features,
@@ -1401,6 +1776,8 @@ def write_merge_artifacts(
     )
     write_jsonl(paths["merged_jsonl"], merged_features)
     write_csv(paths["merged_csv"], merged_features, merged_fieldnames(merged_features))
+    category_summary = category_merge_summary(items, groups, all_rows=all_rows)
+    write_category_retention_plot(paths["category_retention_png"], category_summary)
 
     trace = {
         "project": "EmbeddingMerge",
@@ -1418,20 +1795,24 @@ def write_merge_artifacts(
             "api_batches": cache_stats.api_batches,
         },
         "counts": {
-            "input_features": len(items),
+            "input_features": total_input_features,
+            "embedded_features": len(items),
+            "unembedded_features": total_input_features - len(items),
             "similarity_pairs": len(pairs),
             "merge_groups": len(groups),
             "merged_features": len(merged_features),
-            "merged_away_features": len(items) - len(merged_features),
+            "merged_away_features": total_input_features - len(merged_features),
             "qualitative_rows": len(qualitative_rows),
         },
         "qualitative_top": qualitative_top,
-        "similarity_distribution": similarity_distribution_summary(similarity_distribution),
+        "category_merge_summary": category_summary,
         "similarity_distributions_by_category": similarity_distribution_category_summary(
             similarity_distributions_by_category
         ),
         "outputs": {key: str(path) for key, path in paths.items()},
     }
+    if similarity_distribution is not None:
+        trace["similarity_distribution"] = similarity_distribution_summary(similarity_distribution)
     paths["trace_json"].write_text(json.dumps(trace, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return trace
 
@@ -1462,6 +1843,67 @@ def prepare_feature_embeddings(
     )
     return PreparedEmbeddings(
         text_fields=fields,
+        items=items,
+        embeddings=embeddings,
+        cache_stats=cache_stats,
+    )
+
+
+def prepare_category_embeddings(
+    *,
+    features_path: Path,
+    specs: dict[str, CategoryMergeSpec],
+    cache_path: Path,
+    client: EmbeddingClient | None,
+    model: str,
+    task_type: str,
+    output_dimensionality: int,
+    batch_size: int,
+) -> PreparedCategoryEmbeddings:
+    raw_rows = read_feature_rows(features_path)
+    input_categories = {
+        str(row.get("category") or "").strip() or "uncategorized"
+        for row in raw_rows
+    }
+    missing_specs = sorted(input_categories - set(specs))
+    extra_specs = sorted(set(specs) - input_categories)
+    if missing_specs:
+        raise ValueError(f"Category config is missing input categories: {', '.join(missing_specs)}.")
+    if extra_specs:
+        raise ValueError(f"Category config contains categories absent from the input: {', '.join(extra_specs)}.")
+
+    items_by_fields: dict[tuple[str, ...], list[FeatureItem]] = {}
+    items: list[FeatureItem] = []
+    for category, spec in specs.items():
+        fields_key = tuple(spec.text_fields)
+        if fields_key not in items_by_fields:
+            items_by_fields[fields_key] = load_feature_items(features_path, spec.text_fields)
+        items.extend(item for item in items_by_fields[fields_key] if item.category == category)
+    items.sort(key=lambda item: item.row_index)
+    if not items:
+        raise ValueError("No usable features found for category-isolated embedding merge.")
+
+    usable_categories = {item.category for item in items}
+    empty_categories = sorted(set(specs) - usable_categories)
+    if empty_categories:
+        raise ValueError(
+            "Configured categories have no usable embedding text for their selected fields: "
+            + ", ".join(empty_categories)
+            + "."
+        )
+
+    embeddings, cache_stats = embed_texts_with_cache(
+        [item.embedding_text for item in items],
+        cache_path=cache_path,
+        client=client,
+        model=model,
+        task_type=task_type,
+        output_dimensionality=output_dimensionality,
+        batch_size=batch_size,
+    )
+    return PreparedCategoryEmbeddings(
+        specs=specs,
+        raw_rows=raw_rows,
         items=items,
         embeddings=embeddings,
         cache_stats=cache_stats,
@@ -1784,6 +2226,43 @@ def maybe_write_merged_tsne_html(
 ) -> dict[str, Any]:
     try:
         items = load_feature_items(merged_json_path, text_fields)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "reason": str(exc),
+        }
+    return maybe_write_items_tsne_html(
+        items=items,
+        html_path=html_path,
+        title=f"{merged_json_path.stem} Gemini embedding t-SNE",
+        cache_path=cache_path,
+        client=client,
+        model=model,
+        task_type=task_type,
+        output_dimensionality=output_dimensionality,
+        batch_size=batch_size,
+        perplexity=perplexity,
+        random_state=random_state,
+        annotate_top=annotate_top,
+    )
+
+
+def maybe_write_items_tsne_html(
+    *,
+    items: list[FeatureItem],
+    html_path: Path,
+    title: str,
+    cache_path: Path,
+    client: EmbeddingClient | None,
+    model: str,
+    task_type: str,
+    output_dimensionality: int,
+    batch_size: int,
+    perplexity: float | None,
+    random_state: int,
+    annotate_top: int,
+) -> dict[str, Any]:
+    try:
         if len(items) < 3:
             return {
                 "status": "skipped",
@@ -1808,7 +2287,7 @@ def maybe_write_merged_tsne_html(
             html_path,
             items,
             coordinates,
-            title=f"{merged_json_path.stem} Gemini embedding t-SNE",
+            title=title,
             annotate_top=annotate_top,
         )
     except Exception as exc:
@@ -1829,6 +2308,280 @@ def maybe_write_merged_tsne_html(
     }
 
 
+def maybe_write_combined_category_merged_tsne_html(
+    *,
+    merged_features: list[dict[str, Any]],
+    specs: dict[str, CategoryMergeSpec],
+    output_dir: Path,
+    prefix: str,
+    cache_path: Path,
+    client: EmbeddingClient | None,
+    model: str,
+    task_type: str,
+    output_dimensionality: int,
+    batch_size: int,
+    perplexity: float | None,
+    random_state: int,
+    annotate_top: int,
+) -> dict[str, Any]:
+    try:
+        with tempfile.TemporaryDirectory(prefix="embedding-merge-combined-tsne-") as temp:
+            merged_path = Path(temp) / "all_categories.json"
+            merged_path.write_text(
+                json.dumps({"features": merged_features}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            items: list[FeatureItem] = []
+            for category, spec in specs.items():
+                items.extend(
+                    item
+                    for item in load_feature_items(merged_path, spec.text_fields)
+                    if item.category == category
+                )
+            items.sort(key=lambda item: item.row_index)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "reason": str(exc),
+        }
+
+    return maybe_write_items_tsne_html(
+        items=items,
+        html_path=combined_category_merged_tsne_html_path(output_dir, prefix),
+        title=f"{prefix} merged features, all categories, Gemini embedding t-SNE",
+        cache_path=cache_path,
+        client=client,
+        model=model,
+        task_type=task_type,
+        output_dimensionality=output_dimensionality,
+        batch_size=batch_size,
+        perplexity=perplexity,
+        random_state=random_state,
+        annotate_top=annotate_top,
+    )
+
+
+def maybe_write_category_merged_tsne_html(
+    *,
+    merged_features: list[dict[str, Any]],
+    specs: dict[str, CategoryMergeSpec],
+    output_dir: Path,
+    prefix: str,
+    cache_path: Path,
+    client: EmbeddingClient | None,
+    model: str,
+    task_type: str,
+    output_dimensionality: int,
+    batch_size: int,
+    perplexity: float | None,
+    random_state: int,
+    annotate_top: int,
+) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    with tempfile.TemporaryDirectory(prefix="embedding-merge-category-tsne-") as temp:
+        temp_dir = Path(temp)
+        for category, spec in specs.items():
+            category_rows = [
+                row
+                for row in merged_features
+                if (str(row.get("category") or "").strip() or "uncategorized") == category
+            ]
+            category_path = temp_dir / f"{sanitize_filename_part(category)}.json"
+            category_path.write_text(
+                json.dumps({"features": category_rows}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            results[category] = maybe_write_merged_tsne_html(
+                merged_json_path=category_path,
+                html_path=category_merged_tsne_html_path(output_dir, prefix, category),
+                text_fields=spec.text_fields,
+                cache_path=cache_path,
+                client=client,
+                model=model,
+                task_type=task_type,
+                output_dimensionality=output_dimensionality,
+                batch_size=batch_size,
+                perplexity=perplexity,
+                random_state=random_state,
+                annotate_top=annotate_top,
+            )
+    return results
+
+
+def run_embedding_merge_by_category(
+    *,
+    features_path: Path,
+    specs: dict[str, CategoryMergeSpec],
+    output_dir: Path,
+    prefix: str,
+    cache_path: Path,
+    client: EmbeddingClient | None,
+    model: str = DEFAULT_GEMINI_MODEL,
+    task_type: str = DEFAULT_TASK_TYPE,
+    output_dimensionality: int = DEFAULT_OUTPUT_DIMENSIONALITY,
+    batch_size: int = 50,
+    qualitative_top: int = 20,
+    write_tsne_html: bool = True,
+    tsne_perplexity: float | None = None,
+    tsne_random_state: int = DEFAULT_RANDOM_STATE,
+    tsne_annotate_top: int = DEFAULT_ANNOTATE_TOP,
+) -> dict[str, Any]:
+    prepared = prepare_category_embeddings(
+        features_path=features_path,
+        specs=specs,
+        cache_path=cache_path,
+        client=client,
+        model=model,
+        task_type=task_type,
+        output_dimensionality=output_dimensionality,
+        batch_size=batch_size,
+    )
+    thresholds = {category: spec.threshold for category, spec in specs.items()}
+    matrix = normalized_matrix(prepared.embeddings)
+    pairs = find_similarity_pairs_by_category_thresholds(
+        prepared.items,
+        matrix,
+        thresholds=thresholds,
+    )
+    groups = build_category_merge_groups(prepared.items, pairs, specs)
+    merged_features = build_merged_features(
+        prepared.items,
+        groups,
+        threshold=thresholds,
+        scope="category",
+        all_rows=prepared.raw_rows,
+    )
+    qualitative_rows = qualitative_merge_rows(prepared.items, groups, top_n=qualitative_top)
+    similarity_distributions_by_category = pairwise_similarity_histograms_by_category(prepared.items, matrix)
+
+    paths = output_paths(output_dir, prefix)
+    for key in (
+        "similarity_distribution_png",
+        "similarity_boxplot_png",
+        "similarity_percentiles_png",
+        "similarity_distribution_by_category_png",
+        "similarity_boxplot_by_category_png",
+        "similarity_percentiles_by_category_png",
+    ):
+        paths.pop(key)
+    paths.update(category_similarity_output_paths(output_dir, prefix, specs))
+
+    for category, spec in specs.items():
+        slug = sanitize_filename_part(category)
+        histogram = similarity_distributions_by_category[category]
+        display_category = category.replace("_", " ")
+        write_similarity_distribution_plot(
+            paths[f"similarity_distribution_{slug}_png"],
+            histogram,
+            title=f"{display_category} Embedding Similarity Distribution",
+            thresholds=[spec.threshold],
+        )
+        write_similarity_boxplot(
+            paths[f"similarity_boxplot_{slug}_png"],
+            histogram,
+            title=f"{display_category} Embedding Similarity Box Plot",
+            thresholds=[spec.threshold],
+        )
+        write_similarity_percentile_plot(
+            paths[f"similarity_percentiles_{slug}_png"],
+            histogram,
+            title=f"{display_category} Embedding Similarity Percentile Plot",
+            thresholds=[spec.threshold],
+        )
+
+    trace = write_merge_artifacts(
+        paths=paths,
+        features_path=features_path,
+        items=prepared.items,
+        pairs=pairs,
+        groups=groups,
+        qualitative_rows=qualitative_rows,
+        qualitative_top=qualitative_top,
+        merged_features=merged_features,
+        threshold=thresholds,
+        scope="category",
+        text_fields={category: spec.text_fields for category, spec in specs.items()},
+        model=model,
+        task_type=task_type,
+        output_dimensionality=output_dimensionality,
+        cache_path=cache_path,
+        cache_stats=prepared.cache_stats,
+        similarity_distribution=None,
+        similarity_distributions_by_category=similarity_distributions_by_category,
+        input_feature_count=len(prepared.raw_rows),
+        all_rows=prepared.raw_rows,
+    )
+    trace["mode"] = "category_config"
+    trace["category_config"] = category_specs_payload(specs)
+    embedded_row_indices = {item.row_index for item in prepared.items}
+    unembedded_by_category: dict[str, list[str]] = {}
+    for row_index, row in enumerate(prepared.raw_rows, start=1):
+        if row_index in embedded_row_indices:
+            continue
+        category = str(row.get("category") or "").strip() or "uncategorized"
+        label = str(
+            row.get("feature_name")
+            or row.get("canonical_feature_name")
+            or row.get("feature_key")
+            or f"row {row_index}"
+        ).strip()
+        unembedded_by_category.setdefault(category, []).append(label)
+    trace["unembedded_features_by_category"] = {
+        category: {
+            "count": len(labels),
+            "feature_names": labels,
+        }
+        for category, labels in unembedded_by_category.items()
+    }
+    if write_tsne_html:
+        combined_tsne_result = maybe_write_combined_category_merged_tsne_html(
+            merged_features=merged_features,
+            specs=specs,
+            output_dir=output_dir,
+            prefix=prefix,
+            cache_path=cache_path,
+            client=client,
+            model=model,
+            task_type=task_type,
+            output_dimensionality=output_dimensionality,
+            batch_size=batch_size,
+            perplexity=tsne_perplexity,
+            random_state=tsne_random_state,
+            annotate_top=tsne_annotate_top,
+        )
+        tsne_results = maybe_write_category_merged_tsne_html(
+            merged_features=merged_features,
+            specs=specs,
+            output_dir=output_dir,
+            prefix=prefix,
+            cache_path=cache_path,
+            client=client,
+            model=model,
+            task_type=task_type,
+            output_dimensionality=output_dimensionality,
+            batch_size=batch_size,
+            perplexity=tsne_perplexity,
+            random_state=tsne_random_state,
+            annotate_top=tsne_annotate_top,
+        )
+    else:
+        combined_tsne_result = {"status": "disabled"}
+        tsne_results = {
+            category: {"status": "disabled"}
+            for category in specs
+        }
+    trace["tsne_all_categories"] = combined_tsne_result
+    if combined_tsne_result.get("status") == "written":
+        trace["outputs"]["merged_tsne_all_categories_html"] = combined_tsne_result["html_path"]
+    trace["tsne_by_category"] = tsne_results
+    for category, result in tsne_results.items():
+        if result.get("status") == "written":
+            slug = sanitize_filename_part(category)
+            trace["outputs"][f"merged_tsne_{slug}_html"] = result["html_path"]
+    paths["trace_json"].write_text(json.dumps(trace, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return trace
+
+
 def run_embedding_merge(
     *,
     features_path: Path,
@@ -1843,7 +2596,7 @@ def run_embedding_merge(
     task_type: str = DEFAULT_TASK_TYPE,
     output_dimensionality: int = DEFAULT_OUTPUT_DIMENSIONALITY,
     batch_size: int = 50,
-    qualitative_top: int = 10,
+    qualitative_top: int = 20,
     write_tsne_html: bool = True,
     tsne_perplexity: float | None = None,
     tsne_random_state: int = DEFAULT_RANDOM_STATE,
@@ -2031,8 +2784,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--text-fields",
-        default=",".join(DEFAULT_TEXT_FIELDS),
+        default=None,
         help="Comma-separated row fields used to build embedding text.",
+    )
+    parser.add_argument(
+        "--category-config",
+        type=Path,
+        help=(
+            "JSON object keyed by category, with text_fields and threshold for each category. "
+            "Activates a category-isolated final merge and category-specific charts."
+        ),
     )
     parser.add_argument(
         "--scope",
@@ -2043,7 +2804,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--qualitative-top",
         type=positive_int,
-        default=10,
+        default=20,
         help="Number of most-mentioned absorbed features to report per category in single-threshold mode.",
     )
     parser.add_argument(
@@ -2089,6 +2850,12 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_cli_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     using_single_threshold = args.threshold is not None
     using_sweep_bounds = args.threshold_start is not None or args.threshold_end is not None
+    if args.category_config is not None:
+        if using_single_threshold or using_sweep_bounds:
+            parser.error("--category-config cannot be combined with threshold or sweep arguments")
+        if args.text_fields is not None:
+            parser.error("--category-config cannot be combined with --text-fields")
+        return
     if using_single_threshold and using_sweep_bounds:
         parser.error("--threshold cannot be combined with --threshold-start or --threshold-end")
     if not using_single_threshold:
@@ -2107,6 +2874,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.features.exists():
             raise FileNotFoundError(f"Feature file does not exist: {args.features}")
+        if args.category_config and not args.category_config.exists():
+            raise FileNotFoundError(f"Category config file does not exist: {args.category_config}")
         if args.timeout <= 0:
             raise ValueError("--timeout must be greater than 0.")
 
@@ -2127,11 +2896,29 @@ def main(argv: list[str] | None = None) -> int:
                 timeout=args.timeout,
             )
 
-        if args.threshold is not None:
+        if args.category_config is not None:
+            trace = run_embedding_merge_by_category(
+                features_path=args.features,
+                specs=load_category_merge_specs(args.category_config),
+                output_dir=output_dir,
+                prefix=prefix,
+                cache_path=cache_path,
+                client=client,
+                model=args.model,
+                task_type=args.task_type,
+                output_dimensionality=args.output_dimensionality,
+                batch_size=args.batch_size,
+                qualitative_top=args.qualitative_top,
+                write_tsne_html=not args.skip_tsne,
+                tsne_perplexity=args.tsne_perplexity,
+                tsne_random_state=args.tsne_random_state,
+                tsne_annotate_top=args.tsne_annotate_top,
+            )
+        elif args.threshold is not None:
             trace = run_embedding_merge(
                 features_path=args.features,
                 threshold=args.threshold,
-                text_fields=parse_text_fields(args.text_fields),
+                text_fields=parse_text_fields(args.text_fields or DEFAULT_TEXT_FIELDS),
                 scope=args.scope,
                 output_dir=output_dir,
                 prefix=prefix,
@@ -2153,7 +2940,7 @@ def main(argv: list[str] | None = None) -> int:
                 threshold_start=args.threshold_start,
                 threshold_end=args.threshold_end,
                 threshold_step=args.threshold_step,
-                text_fields=parse_text_fields(args.text_fields),
+                text_fields=parse_text_fields(args.text_fields or DEFAULT_TEXT_FIELDS),
                 scope=args.scope,
                 output_dir=output_dir,
                 prefix=prefix,
@@ -2169,8 +2956,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     counts = trace["counts"]
-    print(f"Loaded {counts['input_features']} usable features from {args.features}")
-    if args.threshold is not None:
+    print(f"Loaded {counts['input_features']} features from {args.features}")
+    if counts.get("unembedded_features"):
+        print(
+            f"Preserved {counts['unembedded_features']} features without usable selected-field text "
+            "as unmerged singletons"
+        )
+    if args.category_config is not None:
+        print(
+            f"Found {counts['similarity_pairs']} within-category similar pairs in "
+            f"{counts['merge_groups']} merge groups"
+        )
+        print(f"Wrote category-isolated merged inventory with {counts['merged_features']} features")
+    elif args.threshold is not None:
         print(f"Found {counts['similarity_pairs']} similar pairs in {counts['merge_groups']} merge groups")
         print(f"Wrote merged inventory with {counts['merged_features']} features")
         tsne = trace.get("tsne", {})

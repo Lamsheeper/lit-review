@@ -30,6 +30,7 @@ from typing import Any, Iterable
 
 from lit_pdf_service import read_json, utc_now, write_json
 from lit_synthesize import ChatCompletionClient, DEFAULT_MODEL
+from lit_taxonomy import load_taxonomy, normalize_family_key, taxonomy_category_lookup, taxonomy_prompt_payload
 
 try:
     from tqdm.auto import tqdm as _tqdm
@@ -106,6 +107,7 @@ CONFIG_ARG_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("batch_chunks", "--batch-chunks"),
         ("paper_limit", "--paper-limit"),
         ("goal", "--goal"),
+        ("taxonomy", "--taxonomy"),
         ("max_features_per_chunk", "--max-features-per-chunk"),
         ("max_features_per_pdf", "--max-features-per-pdf"),
         ("max_chunk_chars", "--max-chunk-chars"),
@@ -804,7 +806,13 @@ class GeminiGenerateContentClient:
             candidate = data["candidates"][0]
             parts = candidate.get("content", {}).get("parts", [])
             text = "".join(str(part.get("text") or "") for part in parts)
-            return text.strip()
+            text = text.strip()
+            if not text:
+                finish_reason = str(candidate.get("finishReason") or "unknown")
+                raise RuntimeError(
+                    f"Gemini returned an empty response (finish_reason={finish_reason})."
+                )
+            return text
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Unexpected Gemini API response: {data}") from exc
 
@@ -881,10 +889,15 @@ def rank_paper_records(
     return [paper for _, _, paper in ranked]
 
 
-def canonical_category(value: str | None) -> str | None:
+def canonical_category(
+    value: str | None,
+    taxonomy_lookup: dict[str, str] | None = None,
+) -> str | None:
     if not value:
         return None
     normalized = normalize_feature_name(value)
+    if taxonomy_lookup is not None:
+        return taxonomy_lookup.get(normalize_family_key(value))
     category_map = {
         "persuasion": "persuasion",
         "persuasion technique": "persuasion",
@@ -1312,8 +1325,9 @@ def normalize_feature_item(
     run_id: str,
     model: str,
     extracted_at: str,
+    taxonomy_lookup: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
-    category = canonical_category(str(item.get("category") or ""))
+    category = canonical_category(str(item.get("category") or ""), taxonomy_lookup)
     feature_name = str(
         item.get("feature_name")
         or item.get("name")
@@ -1323,9 +1337,11 @@ def normalize_feature_item(
     normalized_feature = normalize_feature_name(feature_name)
     if not category or not normalized_feature:
         return None
-    if category not in CATEGORIES:
+    if taxonomy_lookup is None and category not in CATEGORIES:
         return None
-    if not is_taxonomy_relevant(item, chunk_text=str(chunk.get("text") or ""), paper=paper):
+    if taxonomy_lookup is None and not is_taxonomy_relevant(
+        item, chunk_text=str(chunk.get("text") or ""), paper=paper
+    ):
         return None
 
     confidence = item.get("confidence")
@@ -1782,6 +1798,7 @@ def build_extraction_prompt(
     max_chunk_chars: int,
     goal_text: str = "",
     max_features_per_chunk: int = 12,
+    taxonomy: dict[str, Any] | None = None,
 ) -> str:
     prompt_payload = {
         "paper": paper_prompt_metadata(paper),
@@ -1792,14 +1809,37 @@ def build_extraction_prompt(
         if goal_text.strip()
         else "\nGOAL / TAXONOMY CONTEXT\nNo external goal file was provided.\n"
     )
+    category_shape = (
+        "one allowed family id from ALLOWED FEATURE FAMILIES"
+        if taxonomy
+        else "persuasion | moral_framing | sentiment_affect"
+    )
+    taxonomy_section = (
+        "\nALLOWED FEATURE FAMILIES\n"
+        + json.dumps(taxonomy_prompt_payload(taxonomy), ensure_ascii=False, indent=2)
+        + "\n"
+        if taxonomy
+        else ""
+    )
+    relevance_rules = (
+        "- Extract only feature concepts that fit one of the allowed feature families and the goal context.\n"
+        "- Set category to the exact allowed family id, not its label or alias."
+        if taxonomy
+        else "- Extract only features relevant to persuasion techniques, propaganda/rhetoric,\n"
+        "  moral framing, sentiment, emotion, affect, media framing, or media-analysis\n"
+        "  attributes.\n"
+        "- Use the goal context to preserve the distinction between persuasion techniques,\n"
+        "  moral framing, and sentiment/affect."
+    )
     return f"""Extract taxonomy feature mentions from the provided literature chunks.
 {goal_section}
+{taxonomy_section}
 
 Return strict JSON only with this shape:
 {{
   "features": [
     {{
-      "category": "persuasion | moral_framing | sentiment_affect",
+      "category": "{category_shape}",
       "feature_name": "named feature exactly as supported by the chunk",
       "parent_category": "optional parent/group label or empty string",
       "definition": "definition from the chunk, or empty string",
@@ -1815,11 +1855,7 @@ Return strict JSON only with this shape:
 }}
 
 Extraction rules:
-- Extract only features relevant to persuasion techniques, propaganda/rhetoric,
-  moral framing, sentiment, emotion, affect, media framing, or media-analysis
-  attributes.
-- Use the goal context to preserve the distinction between persuasion techniques,
-  moral framing, and sentiment/affect.
+{relevance_rules}
 - Named mentions are valid, but use evidence_type="named_mention" when there is
   no definition, taxonomy row, or example.
 - Do not extract generic ML/CV/signal-processing "features" unless the chunk
@@ -1882,6 +1918,7 @@ def build_pdf_extraction_prompt(
     paper: dict[str, Any],
     goal_text: str = "",
     max_features_per_pdf: int = 40,
+    taxonomy: dict[str, Any] | None = None,
 ) -> str:
     chunk_id = pdf_chunk_id(paper)
     prompt_payload = {
@@ -1896,14 +1933,37 @@ def build_pdf_extraction_prompt(
         if goal_text.strip()
         else "\nGOAL / TAXONOMY CONTEXT\nNo external goal file was provided.\n"
     )
+    category_shape = (
+        "one allowed family id from ALLOWED FEATURE FAMILIES"
+        if taxonomy
+        else "persuasion | moral_framing | sentiment_affect"
+    )
+    taxonomy_section = (
+        "\nALLOWED FEATURE FAMILIES\n"
+        + json.dumps(taxonomy_prompt_payload(taxonomy), ensure_ascii=False, indent=2)
+        + "\n"
+        if taxonomy
+        else ""
+    )
+    relevance_rules = (
+        "- Extract only feature concepts that fit one of the allowed feature families and the goal context.\n"
+        "- Set category to the exact allowed family id, not its label or alias."
+        if taxonomy
+        else "- Extract only features relevant to persuasion techniques, propaganda/rhetoric,\n"
+        "  moral framing, sentiment, emotion, affect, media framing, or media-analysis\n"
+        "  attributes.\n"
+        "- Use the goal context to preserve the distinction between persuasion techniques,\n"
+        "  moral framing, and sentiment/affect."
+    )
     return f"""Extract taxonomy feature mentions from the attached academic PDF.
 {goal_section}
+{taxonomy_section}
 
 Return strict JSON only with this shape:
 {{
   "features": [
     {{
-      "category": "persuasion | moral_framing | sentiment_affect",
+      "category": "{category_shape}",
       "feature_name": "named feature exactly as supported by the PDF",
       "parent_category": "optional parent/group label or empty string",
       "definition": "definition from the PDF, or empty string",
@@ -1921,11 +1981,7 @@ Return strict JSON only with this shape:
 }}
 
 Extraction rules:
-- Extract only features relevant to persuasion techniques, propaganda/rhetoric,
-  moral framing, sentiment, emotion, affect, media framing, or media-analysis
-  attributes.
-- Use the goal context to preserve the distinction between persuasion techniques,
-  moral framing, and sentiment/affect.
+{relevance_rules}
 - Named mentions are valid, but use evidence_type="named_mention" when there is
   no definition, taxonomy row, or example.
 - Do not extract generic ML/CV/signal-processing "features" unless the PDF
@@ -1952,6 +2008,7 @@ def build_pdf_extraction_messages(
     pdf_path: Path,
     goal_text: str = "",
     max_features_per_pdf: int = 40,
+    taxonomy: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -1977,6 +2034,7 @@ def build_pdf_extraction_messages(
                         paper,
                         goal_text=goal_text,
                         max_features_per_pdf=max_features_per_pdf,
+                        taxonomy=taxonomy,
                     ),
                 },
             ],
@@ -5131,9 +5189,11 @@ def dry_run_trace(
     model: str,
     run_id: str,
     goal_path: str | None = None,
+    taxonomy_path: str | None = None,
     goal_text: str = "",
     max_features_per_chunk: int = 12,
     max_features_per_pdf: int = 40,
+    dynamic_taxonomy: bool = False,
 ) -> dict[str, Any]:
     stats = ExtractionStats(paper_count=len(papers))
     if input_mode == "pdf":
@@ -5156,12 +5216,13 @@ def dry_run_trace(
         "run_dir": str(run_dir),
         "output_dir": str(output_dir),
         "goal_path": goal_path,
+        "taxonomy_path": taxonomy_path,
         "goal_used": bool(goal_text.strip()),
         "config": {
             "input_mode": input_mode,
             "api_provider": api_provider,
             "batch_chunks": batch_chunks_count,
-            "paper_ranking": "title_relevance",
+            "paper_ranking": "input_order" if dynamic_taxonomy else "title_relevance",
             "max_features_per_chunk": max_features_per_chunk,
             "max_features_per_pdf": max_features_per_pdf,
         },
@@ -5186,6 +5247,7 @@ def run_extraction(
     batch_chunks_count: int,
     paper_limit: int | None,
     goal_path: Path | None = None,
+    taxonomy_path: Path | None = None,
     force: bool,
     dry_run: bool,
     max_chunk_chars: int,
@@ -5208,10 +5270,12 @@ def run_extraction(
         remove_existing_outputs(output_dir)
 
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    taxonomy = load_taxonomy(taxonomy_path.expanduser()) if taxonomy_path else None
+    taxonomy_lookup = taxonomy_category_lookup(taxonomy) if taxonomy else None
     papers = load_papers(
         run_dir,
         paper_limit=paper_limit,
-        rank_by_title=True,
+        rank_by_title=taxonomy is None,
         show_progress=show_progress,
         include_pdf_failures=input_mode == "pdf",
     )
@@ -5227,9 +5291,11 @@ def run_extraction(
             model=model,
             run_id=run_id,
             goal_path=resolved_goal_path,
+            taxonomy_path=str(taxonomy_path) if taxonomy_path else None,
             goal_text=goal_text,
             max_features_per_chunk=max_features_per_chunk,
             max_features_per_pdf=max_features_per_pdf,
+            dynamic_taxonomy=bool(taxonomy),
         )
 
     if client is None:
@@ -5288,6 +5354,7 @@ def run_extraction(
                             pdf_path=pdf_path,
                             goal_text=goal_text,
                             max_features_per_pdf=max_features_per_pdf,
+                            taxonomy=taxonomy,
                         ),
                         temperature=temperature,
                         max_tokens=5000,
@@ -5308,6 +5375,7 @@ def run_extraction(
                             run_id=run_id,
                             model=model,
                             extracted_at=extracted_at,
+                            taxonomy_lookup=taxonomy_lookup,
                         )
                         if row is None:
                             stats.filtered_feature_count += 1
@@ -5391,6 +5459,7 @@ def run_extraction(
                                         max_chunk_chars=max_chunk_chars,
                                         goal_text=goal_text,
                                         max_features_per_chunk=max_features_per_chunk,
+                                        taxonomy=taxonomy,
                                     ),
                                 },
                             ],
@@ -5416,6 +5485,7 @@ def run_extraction(
                                 run_id=run_id,
                                 model=model,
                                 extracted_at=extracted_at,
+                                taxonomy_lookup=taxonomy_lookup,
                             )
                             if row is None:
                                 stats.filtered_feature_count += 1
@@ -5480,6 +5550,7 @@ def run_extraction(
         "run_dir": str(run_dir),
         "output_dir": str(output_dir),
         "goal_path": resolved_goal_path,
+        "taxonomy_path": str(taxonomy_path) if taxonomy_path else None,
         "goal_used": bool(goal_text.strip()),
         "config": {
             "input_mode": input_mode,
@@ -5493,7 +5564,8 @@ def run_extraction(
             "timeout": timeout,
             "force": force,
             "progress": show_progress,
-            "paper_ranking": "title_relevance",
+            "paper_ranking": "title_relevance" if taxonomy is None else "input_order",
+            "dynamic_taxonomy": bool(taxonomy),
         },
         "top_ranked_papers": ranked_paper_preview(papers),
         "counts": dataclasses.asdict(stats),
@@ -6575,6 +6647,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional goal/taxonomy Markdown file. Defaults to ./goal.md when present.",
     )
     run.add_argument(
+        "--taxonomy",
+        help="Optional taxonomy.json defining arbitrary allowed feature families.",
+    )
+    run.add_argument(
         "--max-features-per-chunk",
         type=int,
         default=12,
@@ -6907,6 +6983,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_chunks_count=args.batch_chunks,
                 paper_limit=args.paper_limit,
                 goal_path=Path(args.goal) if args.goal else None,
+                taxonomy_path=Path(args.taxonomy) if args.taxonomy else None,
                 force=args.force,
                 dry_run=args.dry_run,
                 max_chunk_chars=args.max_chunk_chars,

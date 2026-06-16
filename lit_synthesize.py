@@ -116,9 +116,17 @@ chunk_words = pdf_service.chunk_words
 resolve_md_path = pdf_service.resolve_md_path
 chunk_markdown_paper = pdf_service.chunk_markdown_paper
 chunk_paper_index = pdf_service.chunk_paper_index
+prepare_direct_pdf_index = pdf_service.prepare_direct_pdf_index
 
 CITATION_RE = re.compile(r"\[([A-Za-z0-9_.:-]+)\]")
 CONFIG_ARG_FIELDS: dict[str, list[tuple[str, str]]] = {
+    "prepare": [
+        ("papers", "--papers"),
+        ("manifest", "--manifest"),
+        ("out", "--out"),
+        ("verbose", "--verbose"),
+        ("quiet", "--quiet"),
+    ],
     "convert": [
         ("papers", "--papers"),
         ("manifest", "--manifest"),
@@ -1465,6 +1473,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    prepare = subparsers.add_parser(
+        "prepare",
+        help="Create a lightweight paper index for direct-PDF extraction.",
+    )
+    add_common_args(prepare)
+    prepare.add_argument("--papers", required=True, help="Folder containing collected PDFs.")
+    prepare.add_argument("--manifest", help="Optional LitHarvest manifest.json path.")
+    prepare.add_argument("--out", required=True, help="Run folder for paper_index.json.")
+
     convert = subparsers.add_parser("convert", help="Convert collected PDFs to text Markdown.")
     add_common_args(convert)
     convert.add_argument("--papers", required=True, help="Folder containing collected PDFs.")
@@ -1571,7 +1588,15 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False))
 
     try:
-        if args.command == "convert":
+        if args.command == "prepare":
+            payload = prepare_direct_pdf_index(
+                papers_dir=Path(args.papers),
+                manifest_path=Path(args.manifest) if args.manifest else None,
+                out_dir=Path(args.out),
+            )
+            print(Path(args.out) / "paper_index.json")
+            LOGGER.info("Prepared %d direct PDFs.", payload["paper_count"])
+        elif args.command == "convert":
             payload = convert_pdfs_to_markdown(
                 papers_dir=Path(args.papers),
                 manifest_path=Path(args.manifest) if args.manifest else None,

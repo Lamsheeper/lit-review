@@ -1,8 +1,13 @@
 comparison_plots
 embedding_merge
+feature_embedding_metadata
 feature_embedding_tsne
+known_feature_similarity
 lit_extract
 lit_harvest
 lit_log_summary
 lit_pdf_service
+lit_relevance
+lit_review_ui
 lit_synthesize
+lit_taxonomy

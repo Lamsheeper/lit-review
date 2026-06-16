@@ -10,13 +10,18 @@ from pathlib import Path
 from feature_embedding_tsne import FeatureItem
 
 from embedding_merge import (
+    CategoryMergeSpec,
     SimilarityPair,
     build_merge_groups,
     build_parser,
+    category_merge_summary,
     choose_canonical_index,
     find_similarity_pairs,
+    find_similarity_pairs_by_category_thresholds,
     main,
+    normalized_matrix,
     run_embedding_merge,
+    run_embedding_merge_by_category,
     run_embedding_merge_sweep,
     threshold_range,
 )
@@ -196,6 +201,30 @@ class EmbeddingMergeTests(unittest.TestCase):
 
         self.assertEqual(pairs, [])
 
+    def test_category_thresholds_are_applied_independently_without_cross_category_pairs(self):
+        items = [
+            make_item("Persuasion A", category="persuasion", row_index=1),
+            make_item("Persuasion B", category="persuasion", row_index=2),
+            make_item("Moral A", category="moral_framing", row_index=3),
+            make_item("Moral B", category="moral_framing", row_index=4),
+        ]
+        matrix = normalized_matrix(
+            [
+                [1.0, 0.0],
+                [0.98, 0.19899749],
+                [1.0, 0.0],
+                [0.98, 0.19899749],
+            ]
+        )
+
+        pairs = find_similarity_pairs_by_category_thresholds(
+            items,
+            matrix,
+            thresholds={"persuasion": 0.97, "moral_framing": 0.99},
+        )
+
+        self.assertEqual([(pair.left_index, pair.right_index) for pair in pairs], [(0, 1)])
+
     def test_connected_components_group_transitive_pairs(self):
         items = [
             make_item("A", row_index=1),
@@ -214,6 +243,53 @@ class EmbeddingMergeTests(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0].member_indices, [0, 1, 2])
         self.assertEqual([(pair.left_index, pair.right_index) for pair in groups[0].pairs], [(0, 1), (1, 2)])
+
+    def test_complete_linkage_does_not_merge_transitive_chain(self):
+        items = [
+            make_item("A", row_index=1),
+            make_item("B", row_index=2),
+            make_item("C", row_index=3),
+        ]
+
+        groups = build_merge_groups(
+            items,
+            [
+                SimilarityPair(0, 1, 0.96),
+                SimilarityPair(1, 2, 0.95),
+            ],
+            linkage="complete",
+        )
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].member_indices, [0, 1])
+
+    def test_category_merge_summary_stacks_retained_and_merged_away_counts(self):
+        items = [
+            make_item("A", category="one", row_index=1),
+            make_item("B", category="one", row_index=2),
+            make_item("C", category="two", row_index=3),
+        ]
+        groups = build_merge_groups(items, [SimilarityPair(0, 1, 0.99)])
+
+        summary = category_merge_summary(items, groups)
+
+        self.assertEqual(
+            summary,
+            [
+                {
+                    "category": "one",
+                    "input_features": 2,
+                    "retained_features": 1,
+                    "merged_away_features": 1,
+                },
+                {
+                    "category": "two",
+                    "input_features": 1,
+                    "retained_features": 1,
+                    "merged_away_features": 0,
+                },
+            ],
+        )
 
     def test_canonical_representative_prefers_support_then_shorter_name_then_row_order(self):
         items = [
@@ -312,6 +388,7 @@ class EmbeddingMergeTests(unittest.TestCase):
                 "features_embedding_similarity_distribution_by_category.png",
                 "features_embedding_similarity_boxplot_by_category.png",
                 "features_embedding_similarity_percentiles_by_category.png",
+                "features_embedding_merge_retention_by_category.png",
                 "features_embedding_merge_trace.json",
             }
             actual_paths = {path.name for path in output_dir.iterdir()}
@@ -345,6 +422,9 @@ class EmbeddingMergeTests(unittest.TestCase):
             similarity_percentiles_by_category_png_header = (
                 output_dir / "features_embedding_similarity_percentiles_by_category.png"
             ).read_bytes()[:8]
+            category_retention_png_header = (
+                output_dir / "features_embedding_merge_retention_by_category.png"
+            ).read_bytes()[:8]
 
         self.assertEqual(trace["counts"]["input_features"], 3)
         self.assertEqual(trace["counts"]["similarity_pairs"], 1)
@@ -361,10 +441,12 @@ class EmbeddingMergeTests(unittest.TestCase):
         self.assertEqual(similarity_distribution_by_category_png_header, b"\x89PNG\r\n\x1a\n")
         self.assertEqual(similarity_boxplot_by_category_png_header, b"\x89PNG\r\n\x1a\n")
         self.assertEqual(similarity_percentiles_by_category_png_header, b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(category_retention_png_header, b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(trace["category_merge_summary"][0]["merged_away_features"], 1)
         self.assertEqual(len(pair_lines), 1)
         self.assertEqual(len(merged_lines), 2)
         self.assertEqual(merged_payload["merged_feature_count"], 2)
-        self.assertEqual(qualitative_payload["top_n_per_category"], 10)
+        self.assertEqual(qualitative_payload["top_n_per_category"], 20)
         self.assertEqual(len(qualitative_payload["results"]), 1)
         self.assertEqual(len(qualitative_csv_rows), 1)
         self.assertEqual(qualitative_payload["results"][0]["merged_feature_name"], "Tone")
@@ -459,6 +541,76 @@ class EmbeddingMergeTests(unittest.TestCase):
         self.assertTrue(tsne_mock.called)
         self.assertIn("Frame", html)
         self.assertIn("Gemini embedding t-SNE", html)
+
+    def test_category_merge_generates_combined_all_category_tsne_html(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            features_path = root / "features.json"
+            features_path.write_text(
+                json.dumps(
+                    {
+                        "features": [
+                            {
+                                "feature_name": "Loaded Language",
+                                "category": "persuasion",
+                                "definitions": ["Emotionally charged persuasive wording."],
+                            },
+                            {
+                                "feature_name": "Care and Harm",
+                                "category": "moral_framing",
+                                "definitions": ["Concern with suffering and protection."],
+                            },
+                            {
+                                "feature_name": "Joy",
+                                "category": "sentiment_affect",
+                                "definitions": ["A positive emotional state."],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output_dir = root / "category_outputs"
+            specs = {
+                "persuasion": CategoryMergeSpec(["definitions"], 0.99),
+                "moral_framing": CategoryMergeSpec(["definitions"], 0.99),
+                "sentiment_affect": CategoryMergeSpec(["definitions"], 0.99),
+            }
+            client = FakeEmbeddingClient(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [-1.0, 0.0],
+                ]
+            )
+
+            with mock.patch(
+                "embedding_merge.tsne_coordinates",
+                return_value=[(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)],
+            ) as tsne_mock:
+                trace = run_embedding_merge_by_category(
+                    features_path=features_path,
+                    specs=specs,
+                    output_dir=output_dir,
+                    prefix="features",
+                    cache_path=root / "cache.jsonl",
+                    client=client,
+                )
+
+            html_path = (
+                output_dir
+                / "features_embedding_merged_features_all_categories_gemini_embedding_tsne.html"
+            )
+            html = html_path.read_text(encoding="utf-8")
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(trace["tsne_all_categories"]["status"], "written")
+        self.assertEqual(trace["tsne_all_categories"]["usable_features"], 3)
+        self.assertEqual(trace["outputs"]["merged_tsne_all_categories_html"], str(html_path))
+        self.assertTrue(tsne_mock.called)
+        self.assertIn("persuasion", html)
+        self.assertIn("moral_framing", html)
+        self.assertIn("sentiment_affect", html)
 
     def test_run_embedding_merge_sweep_embeds_once_and_writes_diagnostics(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -582,6 +734,133 @@ class EmbeddingMergeTests(unittest.TestCase):
         self.assertEqual(category_rows[(0.98, "one")]["merge_groups"], 1)
         self.assertEqual(category_rows[(0.98, "two")]["merge_groups"], 1)
         self.assertEqual(category_rows[(0.98, "three")]["merge_groups"], 0)
+
+    def test_category_config_mode_uses_separate_fields_thresholds_and_charts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            features_path = root / "features.json"
+            features_path.write_text(
+                json.dumps(
+                    {
+                        "features": [
+                            {
+                                "feature_name": "Persuasion A",
+                                "category": "persuasion",
+                                "definitions": ["persuasion definition A"],
+                                "examples": ["persuasion example A"],
+                            },
+                            {
+                                "feature_name": "Persuasion B",
+                                "category": "persuasion",
+                                "definitions": ["persuasion definition B"],
+                                "examples": ["persuasion example B"],
+                            },
+                            {
+                                "feature_name": "Moral A",
+                                "category": "moral_framing",
+                                "definitions": ["moral definition A"],
+                                "examples": ["moral example A"],
+                            },
+                            {
+                                "feature_name": "Moral B",
+                                "category": "moral_framing",
+                                "definitions": ["moral definition B"],
+                                "examples": ["moral example B"],
+                            },
+                            {
+                                "feature_name": "Affect A",
+                                "category": "sentiment_affect",
+                                "definitions": ["affect definition A"],
+                                "examples": ["affect example A"],
+                            },
+                            {
+                                "feature_name": "Affect B",
+                                "category": "sentiment_affect",
+                                "definitions": ["affect definition B"],
+                                "examples": ["affect example B"],
+                            },
+                            {
+                                "feature_name": "Affect Without Examples",
+                                "category": "sentiment_affect",
+                                "definitions": ["must remain an unmerged singleton"],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            specs = {
+                "persuasion": CategoryMergeSpec(["feature_name"], 0.99),
+                "moral_framing": CategoryMergeSpec(["definitions"], 0.99),
+                "sentiment_affect": CategoryMergeSpec(["examples"], 0.95),
+            }
+            client = FakeEmbeddingClient(
+                [
+                    [1.0, 0.0],
+                    [0.999, 0.01],
+                    [1.0, 0.0],
+                    [0.98, 0.19899749],
+                    [1.0, 0.0],
+                    [0.96, 0.28],
+                ]
+            )
+            output_dir = root / "category_outputs"
+
+            trace = run_embedding_merge_by_category(
+                features_path=features_path,
+                specs=specs,
+                output_dir=output_dir,
+                prefix="features",
+                cache_path=root / "cache.jsonl",
+                client=client,
+                write_tsne_html=False,
+            )
+
+            actual_paths = {path.name for path in output_dir.iterdir()}
+            merged_payload = json.loads((output_dir / "features_embedding_merged_features.json").read_text())
+
+        self.assertEqual(trace["mode"], "category_config")
+        self.assertEqual(trace["scope"], "category")
+        self.assertNotIn("similarity_distribution", trace)
+        self.assertEqual(trace["counts"]["similarity_pairs"], 2)
+        self.assertEqual(trace["counts"]["merge_groups"], 2)
+        self.assertEqual(trace["counts"]["input_features"], 7)
+        self.assertEqual(trace["counts"]["embedded_features"], 6)
+        self.assertEqual(trace["counts"]["unembedded_features"], 1)
+        self.assertEqual(trace["counts"]["merged_features"], 5)
+        self.assertEqual(trace["category_config"]["moral_framing"]["text_fields"], ["definitions"])
+        self.assertEqual(trace["category_config"]["moral_framing"]["linkage"], "complete")
+        self.assertEqual(
+            trace["unembedded_features_by_category"]["sentiment_affect"]["feature_names"],
+            ["Affect Without Examples"],
+        )
+        self.assertIn("Feature Name: Persuasion A", client.all_texts)
+        self.assertIn("Definitions: moral definition A", client.all_texts)
+        self.assertIn("Examples: affect example A", client.all_texts)
+        self.assertNotIn("Definitions: persuasion definition A", client.all_texts)
+        for category in specs:
+            self.assertIn(f"features_embedding_similarity_distribution_{category}.png", actual_paths)
+            self.assertIn(f"features_embedding_similarity_boxplot_{category}.png", actual_paths)
+            self.assertIn(f"features_embedding_similarity_percentiles_{category}.png", actual_paths)
+        self.assertNotIn("features_embedding_similarity_distribution.png", actual_paths)
+        self.assertNotIn("features_embedding_similarity_distribution_by_category.png", actual_paths)
+        self.assertIn("features_embedding_merge_retention_by_category.png", actual_paths)
+        category_summary = {
+            row["category"]: row
+            for row in trace["category_merge_summary"]
+        }
+        self.assertEqual(category_summary["sentiment_affect"]["input_features"], 3)
+        self.assertEqual(category_summary["sentiment_affect"]["merged_away_features"], 1)
+        merged_thresholds = {
+            row["category"]: row["embedding_merge"]["threshold"]
+            for row in merged_payload["features"]
+            if "embedding_merge" in row
+        }
+        self.assertEqual(merged_thresholds, {"persuasion": 0.99, "sentiment_affect": 0.95})
+        self.assertIn(
+            "Affect Without Examples",
+            [row["feature_name"] for row in merged_payload["features"]],
+        )
 
     def test_main_single_threshold_still_writes_full_artifacts(self):
         with tempfile.TemporaryDirectory() as temp:

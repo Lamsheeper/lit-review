@@ -35,9 +35,14 @@ from lit_harvest import (
     load_candidate_cache,
     load_config,
     merge_candidates,
+    mark_candidates_not_selected,
+    mark_downloads_not_attempted,
     normalize_doi,
     parse_args,
     parse_citation_llm_json,
+    partition_selected_candidates,
+    rank_candidates,
+    stable_candidate_id,
     validate_citation_bibliography,
     write_candidate_cache,
 )
@@ -263,6 +268,73 @@ class LitHarvestCoreTests(unittest.TestCase):
 
         self.assertCountEqual(matches, ["sensor", "fusion", "autonomous", "spacecraft"])
 
+    def test_generated_relevance_profile_controls_candidate_ranking(self):
+        terms = extract_keywords("# Legacy draft\n\npersuasion propaganda rhetoric")
+        profile = {
+            "version": 1,
+            "title": "Clinical intervention relevance",
+            "description": "Prioritize clinical intervention evidence.",
+            "criteria": [
+                {
+                    "id": "clinical_intervention",
+                    "label": "Clinical intervention",
+                    "description": "Evaluates clinical interventions.",
+                    "weight": 5.0,
+                    "terms": ["clinical intervention", "randomized trial"],
+                }
+            ],
+            "field_weights": {"title": 3.0, "abstract": 1.0, "matched_keywords": 0.0},
+            "metadata_weights": {
+                "source_relevance": 0.0,
+                "citation_impact": 0.0,
+                "recency": 0.0,
+                "open_access": 0.0,
+                "doi": 0.0,
+            },
+            "exclusions": [],
+        }
+        relevant = Candidate(title="Randomized Trial of a Clinical Intervention")
+        legacy_match = Candidate(title="Persuasion and Propaganda Rhetoric")
+
+        ranked = rank_candidates([legacy_match, relevant], terms, profile)
+
+        self.assertEqual(ranked[0], relevant)
+        self.assertGreater(relevant.relevance_score, legacy_match.relevance_score)
+        self.assertEqual(relevant.relevance_score, 0.75)
+        self.assertEqual(relevant.relevance_score_breakdown["mode"], "generated_profile")
+
+    def test_generated_relevance_profile_applies_exclusion_penalties(self):
+        terms = extract_keywords("# Clinical studies")
+        profile = {
+            "version": 1,
+            "title": "Human evidence",
+            "description": "Prefer human clinical evidence.",
+            "criteria": [
+                {
+                    "id": "clinical",
+                    "label": "Clinical",
+                    "description": "Clinical evidence.",
+                    "weight": 1.0,
+                    "terms": ["clinical trial"],
+                }
+            ],
+            "field_weights": {"title": 1.0, "abstract": 0.0, "matched_keywords": 0.0},
+            "metadata_weights": {
+                "source_relevance": 0.0,
+                "citation_impact": 0.0,
+                "recency": 0.0,
+                "open_access": 0.0,
+                "doi": 0.0,
+            },
+            "exclusions": [{"term": "animal model", "penalty": 0.75, "reason": "Human only"}],
+        }
+        candidate = Candidate(title="Clinical Trial in an Animal Model")
+
+        rank_candidates([candidate], terms, profile)
+
+        self.assertEqual(candidate.relevance_score, 0.25)
+        self.assertEqual(candidate.relevance_score_breakdown["exclusion_penalty"], 0.75)
+
     def test_merge_candidates_preserves_matched_keywords(self):
         first = Candidate(
             title="A Study",
@@ -291,6 +363,41 @@ class LitHarvestCoreTests(unittest.TestCase):
         self.assertTrue(filename.endswith(".pdf"))
         self.assertIn("2024_lovelace_sensor_fusion_radar_visual_navigation", filename)
         self.assertNotIn("/", filename)
+
+    def test_stable_candidate_id_uses_paper_identity(self):
+        first = Candidate(title="A Study", year=2024, doi="10.1000/test")
+        second = Candidate(title="Different Metadata", year=2023, doi="10.1000/test")
+        self.assertEqual(stable_candidate_id(first), stable_candidate_id(second))
+
+    def test_unselected_candidates_receive_explicit_status(self):
+        candidate = Candidate(title="Not selected")
+        mark_candidates_not_selected([candidate])
+        self.assertEqual(candidate.download["status"], "not_selected")
+
+    def test_metadata_only_rescore_preserves_existing_download_status(self):
+        downloaded = Candidate(
+            title="Already downloaded",
+            download={"status": "downloaded", "path": "/tmp/paper.pdf"},
+        )
+        new_candidate = Candidate(title="New candidate")
+
+        mark_downloads_not_attempted(
+            [downloaded, new_candidate],
+            "metadata_only mode",
+            preserve_existing=True,
+        )
+
+        self.assertEqual(downloaded.download["status"], "downloaded")
+        self.assertEqual(new_candidate.download["status"], "not_attempted")
+
+    def test_partition_selected_candidates_uses_stable_ids(self):
+        first = Candidate(title="First", doi="10.1000/first")
+        second = Candidate(title="Second", doi="10.1000/second")
+        selected, unselected = partition_selected_candidates(
+            [first, second], [stable_candidate_id(second)]
+        )
+        self.assertEqual(selected, [second])
+        self.assertEqual(unselected, [first])
 
     def test_download_generates_pdf_from_abstract_when_no_pdf_urls(self):
         candidate = Candidate(

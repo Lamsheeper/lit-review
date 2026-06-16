@@ -1,12 +1,16 @@
 README.md
 comparison_plots.py
 embedding_merge.py
+feature_embedding_metadata.py
 feature_embedding_tsne.py
+known_feature_similarity.py
 lit_extract.py
 lit_harvest.py
 lit_log_summary.py
 lit_pdf_service.py
+lit_relevance.py
 lit_synthesize.py
+lit_taxonomy.py
 pyproject.toml
 lit_review.egg-info/PKG-INFO
 lit_review.egg-info/SOURCES.txt
@@ -14,3 +18,10 @@ lit_review.egg-info/dependency_links.txt
 lit_review.egg-info/entry_points.txt
 lit_review.egg-info/requires.txt
 lit_review.egg-info/top_level.txt
+lit_review_ui/__init__.py
+lit_review_ui/app.py
+lit_review_ui/jobs.py
+lit_review_ui/store.py
+lit_review_ui/frontend/dist/index.html
+lit_review_ui/frontend/dist/assets/index-BYrFexsL.css
+lit_review_ui/frontend/dist/assets/index-WgftXoCK.js
