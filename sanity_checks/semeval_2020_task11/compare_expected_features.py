@@ -72,6 +72,8 @@ def load_expected(path: Path) -> list[dict[str, Any]]:
     for row in rows:
         aliases = [
             str(row.get("canonical_feature_name") or "").strip(),
+            *parse_jsonish_list(row.get("matching_aliases")),
+            # Support older expected inventories.
             *parse_jsonish_list(row.get("aliases")),
         ]
         expected.append(

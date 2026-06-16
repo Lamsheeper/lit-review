@@ -59,7 +59,10 @@ uv run lit-extract --config extract_configs/02_finalize_semeval_2020_task11_pdf.
 ## Coverage Check
 
 After finalization, compare the extracted feature names against the expected
-inventory:
+18-row analysis inventory. Most official merged labels are decomposed, while
+`Name calling, labeling` and `Exaggeration or minimization` remain combined to
+match the project inventory, and `Dictatorship` is excluded. Original merged
+labels are retained in `source_merged_label`:
 
 ```bash
 uv run python sanity_checks/semeval_2020_task11/compare_expected_features.py

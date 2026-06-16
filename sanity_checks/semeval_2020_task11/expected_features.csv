@@ -1,15 +1,19 @@
-feature_id,canonical_feature_name,aliases,category,source_note
-semeval2020_task11_01,Loaded language,Loaded Language|loaded_language,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_02,"Name calling, labeling","Name calling or labeling|Name Calling|Name_Calling|labeling|labelling",persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_03,Repetition,Repetition|repetition,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_04,Exaggeration or minimization,"Exaggeration, minimization|Exaggeration or minimisation|Exaggeration|Minimization|Minimisation",persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_05,Doubt,Doubt|doubt,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_06,Appeal to fear/prejudice,Appeal to fear|Appeal to fear-prejudice|Appeal to fear and prejudice|Appeal to prejudice,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_07,Flag-waving,Flag waving|Flag_Waving|flag-waving,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_08,Causal oversimplification,Causal Oversimplification|causal_oversimplification|scapegoating,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_09,Slogans,Slogan|Slogans|slogans,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_10,Appeal to authority,Appeal to Authority|appeal_to_authority|testimonial,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_11,"Black-and-white fallacy, dictatorship","Black-and-white fallacy|Black and white fallacy|Dictatorship|Black_And_White_Fallacy",persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_12,Thought-terminating cliche,Thought terminating cliche|Thought-terminating cliche|Thought_Terminating_Cliche,persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_13,"Whataboutism, straw man, red herring","Whataboutism|Straw man|Red herring|Whataboutism, straw man, red herring",persuasion,Official SemEval-2020 Task 11 merged technique inventory
-semeval2020_task11_14,"Bandwagon, reductio ad hitlerum","Bandwagon|Reductio ad hitlerum|Bandwagon, reductio ad hitlerum",persuasion,Official SemEval-2020 Task 11 merged technique inventory
+feature_id,canonical_feature_name,matching_aliases,category,source_merged_label,source_note
+semeval2020_task11_01,Loaded language,Loaded Language|loaded_language,persuasion,,Official SemEval-2020 Task 11 atomic technique
+semeval2020_task11_02,"Name calling, labeling","Name calling or labeling|Name Calling|Name_Calling|labeling|labelling",persuasion,"Name calling, labeling",Official SemEval-2020 Task 11 combined technique retained as one analysis feature
+semeval2020_task11_03,Repetition,repetition,persuasion,,Official SemEval-2020 Task 11 atomic technique
+semeval2020_task11_04,Exaggeration or minimization,"Exaggeration, minimization|Exaggeration or minimisation|Exaggeration|Minimization|Minimisation",persuasion,Exaggeration or minimization,Official SemEval-2020 Task 11 combined technique retained as one analysis feature
+semeval2020_task11_05,Doubt,doubt,persuasion,,Official SemEval-2020 Task 11 atomic technique
+semeval2020_task11_06a,Appeal to fear,,persuasion,Appeal to fear/prejudice,Atomic component of an official SemEval-2020 Task 11 merged label
+semeval2020_task11_06b,Appeal to prejudice,,persuasion,Appeal to fear/prejudice,Atomic component of an official SemEval-2020 Task 11 merged label
+semeval2020_task11_07,Flag-waving,Flag waving|Flag_Waving|flag-waving,persuasion,,Official SemEval-2020 Task 11 atomic technique
+semeval2020_task11_08,Causal oversimplification,Causal Oversimplification|causal_oversimplification,persuasion,,Official SemEval-2020 Task 11 atomic technique
+semeval2020_task11_09,Slogans,Slogan|slogans,persuasion,,Official SemEval-2020 Task 11 atomic technique
+semeval2020_task11_10,Appeal to authority,Appeal to Authority|appeal_to_authority,persuasion,,Official SemEval-2020 Task 11 atomic technique
+semeval2020_task11_11a,Black-and-white fallacy,Black and white fallacy|Black_And_White_Fallacy,persuasion,"Black-and-white fallacy, dictatorship",Atomic component of an official SemEval-2020 Task 11 merged label
+semeval2020_task11_12,Thought-terminating cliche,Thought terminating cliche|Thought_Terminating_Cliche,persuasion,,Official SemEval-2020 Task 11 atomic technique
+semeval2020_task11_13a,Whataboutism,,persuasion,"Whataboutism, straw man, red herring",Atomic component of an official SemEval-2020 Task 11 merged label
+semeval2020_task11_13b,Straw man,Straw Man,persuasion,"Whataboutism, straw man, red herring",Atomic component of an official SemEval-2020 Task 11 merged label
+semeval2020_task11_13c,Red herring,Red Herring,persuasion,"Whataboutism, straw man, red herring",Atomic component of an official SemEval-2020 Task 11 merged label
+semeval2020_task11_14a,Bandwagon,,persuasion,"Bandwagon, reductio ad hitlerum",Atomic component of an official SemEval-2020 Task 11 merged label
+semeval2020_task11_14b,Reductio ad hitlerum,,persuasion,"Bandwagon, reductio ad hitlerum",Atomic component of an official SemEval-2020 Task 11 merged label

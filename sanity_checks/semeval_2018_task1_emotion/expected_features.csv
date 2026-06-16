@@ -1,0 +1,12 @@
+feature_id,canonical_feature_name,matching_aliases,related_terms,category,source_note
+semeval2018_task1_ec_01,Anger,,annoyance|rage,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say anger also includes annoyance and rage"
+semeval2018_task1_ec_02,Anticipation,,interest|vigilance,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say anticipation also includes interest and vigilance"
+semeval2018_task1_ec_03,Disgust,,disinterest|dislike|loathing,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say disgust also includes disinterest, dislike, and loathing"
+semeval2018_task1_ec_04,Fear,,apprehension|anxiety|terror,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say fear also includes apprehension, anxiety, and terror"
+semeval2018_task1_ec_05,Joy,,serenity|ecstasy,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say joy also includes serenity and ecstasy"
+semeval2018_task1_ec_06,Love,,affection,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say love also includes affection"
+semeval2018_task1_ec_07,Optimism,,hopefulness|confidence,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say optimism also includes hopefulness and confidence"
+semeval2018_task1_ec_08,Pessimism,,cynicism|no confidence,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say pessimism also includes cynicism and no confidence"
+semeval2018_task1_ec_09,Sadness,,pensiveness|grief,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say sadness also includes pensiveness and grief"
+semeval2018_task1_ec_10,Surprise,,distraction|amazement,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say surprise also includes distraction and amazement"
+semeval2018_task1_ec_11,Trust,,acceptance|liking|admiration,sentiment_affect,"SemEval-2018 Task 1 annotation instructions say trust also includes acceptance, liking, and admiration"

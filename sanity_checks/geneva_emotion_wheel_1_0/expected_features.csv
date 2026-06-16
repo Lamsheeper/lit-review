@@ -1,0 +1,17 @@
+feature_id,canonical_feature_name,matching_aliases,category,source_note
+gew1_01,Anger,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_02,Contempt,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_03,Disgust,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_04,Envy,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_05,Guilt,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_06,Shame,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_07,Fear,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_08,Sadness,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_09,Surprise,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_10,Interest,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_11,Hope,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_12,Relief,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_13,Satisfaction,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_14,Joy,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_15,Elation,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
+gew1_16,Pride,,sentiment_affect,Geneva Emotion Wheel prototype 1.0 atomic emotion term
