@@ -35,7 +35,59 @@ uv run lit-extract --help
 uv run lit-log-summary --help
 uv run comparison-plots --help
 uv run feature-embedding-tsne --help
+uv run known-feature-similarity --help
+uv run lit-review-ui
 ```
+
+## Local Guided UI
+
+The local UI guides a review from a broad feature request through direct-PDF
+extraction without exposing curation or chunk-index controls.
+
+Build the React frontend once, then start the API and bundled application:
+
+```bash
+cd lit_review_ui/frontend
+npm install
+npm run build
+cd ../..
+uv run lit-review-ui
+```
+
+Open `http://127.0.0.1:8765`. Projects and reproducible configs are stored
+under `ui_projects/`, which is ignored by Git. The app can use credentials from
+environment variables or masked session-only overrides; it never writes
+session credentials into project configs, SQLite, logs, or command arguments.
+The local UI credential panel exposes only Gemini and Semantic Scholar.
+
+The v1 workflow supports:
+
+- generated and editable `draft.md`, `goal.md`, `taxonomy.json`, and
+  `relevance_scoring.json`
+- arbitrary feature families with stable snake-case IDs
+- draft-based metadata search with project-specific candidate relevance
+  scoring and manual candidate selection
+- full-PDF download with abstract fallbacks disabled
+- direct-PDF extraction and read-only raw feature inspection/export
+
+Each workflow tab presents one primary step action and reveals a green Next
+button only after the required saved artifacts exist and the step is no longer
+running. Later tabs remain locked until their prerequisites are ready.
+
+Changing `relevance_scoring.json` does not require another external paper
+search. Return to Collect and run **Re-score cached candidates**. LitHarvest
+loads `papers/logs/candidates.json` and recalculates the rankings locally.
+Enable **Refresh metadata candidates** only when you intentionally want to
+repeat the scholarly-source searches.
+
+The Collect step's API contact email is optional but recommended. LitHarvest
+includes it in its HTTP user agent, sends it as contact metadata to OpenAlex
+and Crossref, and uses it as the fallback email for Unpaywall DOI lookups.
+Providing one can improve API reliability and open-access PDF discovery. It is
+not a secret and is saved in the project's collection config.
+
+For frontend development, run `npm run dev` in `lit_review_ui/frontend` while
+`uv run lit-review-ui` serves the API.
 
 For live harvests and LLM-backed extraction, set the credentials you need:
 
@@ -70,6 +122,21 @@ taxonomy with three major categories:
 Edit these files before starting a new feature-set run. The more explicit the
 target labels and exclusion criteria are, the less cleanup the curation stages
 need later.
+
+The local UI also generates `relevance_scoring.json`: a validated declarative
+ranking algorithm containing setting-specific topical criteria, field weights,
+metadata-signal weights, and exclusion penalties. LitHarvest applies it
+deterministically and stores a score breakdown on each candidate. Existing CLI
+workflows retain the legacy ranking formula unless a profile is supplied.
+Within a criterion, terms are interchangeable indicators; use separate
+criteria for concepts that a paper should satisfy independently:
+
+```bash
+uv run lit-harvest \
+  --draft draft.md \
+  --relevance-scoring relevance_scoring.json \
+  --output papers
+```
 
 ## 3. Harvest Candidate Papers
 
@@ -516,6 +583,289 @@ By default, embedding text is built from `feature_name`, `category`,
 `definitions`, and `synonyms`. Override that with `--text-fields` if your export
 uses different columns.
 
+### Category-isolated embedding merging
+
+Use `embedding-merge --category-config` when each category needs its own
+embedding attributes and final merge threshold. This mode disables
+cross-category merging and writes a separate similarity histogram, box plot,
+and percentile plot for each category. It also writes a category-specific
+merged-set tSNE HTML when that category has enough features. A shared
+`_embedding_merged_features_all_categories_gemini_embedding_tsne.html`
+projection shows every category together, using distinct category colors and
+the configured embedding fields for each category.
+
+Create a JSON config containing every category in the input:
+
+```json
+{
+  "persuasion": {
+    "text_fields": ["feature_name", "synonyms"],
+    "threshold": 0.92,
+    "linkage": "complete"
+  },
+  "moral_framing": {
+    "text_fields": ["feature_name", "definitions"],
+    "threshold": 0.90
+  },
+  "sentiment_affect": {
+    "text_fields": ["feature_name", "examples"],
+    "threshold": 0.94
+  }
+}
+```
+
+`linkage` defaults to `complete`, which requires every pair inside a merge
+group to meet the category threshold and prevents above-threshold chains from
+collapsing unrelated features into one group. Set it to `single` only when
+transitive connected-component merging is intentional. Features with no
+content in their category's selected fields are preserved as unmerged
+singletons and counted as `unembedded_features` in the trace.
+
+Then run the final merge without global threshold or text-field arguments:
+
+```bash
+uv run embedding-merge \
+  review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
+  --category-config category_merge_config.json \
+  --output-dir review_runs/media_attributes_v3/feature_extract_pdf/embedding_merge
+```
+
+The category-specific PNG filenames end with the sanitized category name, such
+as `_embedding_similarity_distribution_persuasion.png`. The trace records each
+category's selected fields, threshold, distribution summary, and tSNE result,
+plus the shared projection under `tsne_all_categories`.
+Qualitative merge reports include the 20 most-mentioned absorbed features per
+category by default; override this with `--qualitative-top`.
+
+Final merge runs also write
+`<prefix>_embedding_merge_retention_by_category.png`. Each category is shown as
+a stacked bar: green is the number of features retained after merging and red
+is the number absorbed into other features.
+
+### Generate independent embedding metadata
+
+The evidence-grounded production annotations and known-set attribute experiment
+have different purposes. To reproduce the known-set metadata treatment on a
+production inventory without overwriting its annotations, generate a parallel
+embedding inventory:
+
+```bash
+uv run feature-embedding-metadata \
+  review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
+  --categories sentiment_affect \
+  --output-dir review_runs/media_attributes_v3/feature_extract_pdf/embedding_metadata/sentiment_affect
+```
+
+For each selected feature, this command sends only `feature_name` and
+`category`, then requires one definition, at least one close synonym, and two
+or more examples. It writes those generated values to the top-level
+`definitions`, `synonyms`, and `examples` fields while preserving the original
+`annotation` object and all other rows. Generation is cached.
+
+If a small number of unusual labels repeatedly fail strict validation, provide
+reviewed metadata with `--overrides merge_configs/embedding_metadata_overrides.json`.
+Completed generated rows remain cached, so rerunning requests only missing rows
+and applies the reviewed overrides.
+
+Merge the generated inventory with a config that selects those top-level fields
+for the generated category:
+
+```bash
+uv run embedding-merge \
+  review_runs/media_attributes_v3/feature_extract_pdf/embedding_metadata/sentiment_affect/annotated_features_embedding_metadata_features.json \
+  --category-config merge_configs/v1_generated_metadata.json \
+  --output-dir review_runs/media_attributes_v3/feature_extract_pdf/embedding_merge/generated_metadata
+```
+
+This makes the production merge experiment methodologically closer to the
+known-set attribute comparison. It does not make embedding similarity a
+guarantee of synonymy, so complete-link grouping and qualitative review remain
+important.
+
+## 15. Experiment With A Known Feature Set
+
+Use `known-feature-similarity` to measure the pairwise embedding-similarity
+distribution within an authoritative inventory. The command keeps exactly one
+experiment row per known label, enriches it from matching annotated rows when
+available, and falls back to the known-set metadata when no match exists.
+
+Run the SemEval-2020 Task 11 experiment:
+
+```bash
+uv run known-feature-similarity \
+  sanity_checks/semeval_2020_task11/expected_features.csv \
+  --annotated-features review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
+  --output-dir review_runs/known_feature_similarity/semeval_2020_task11
+```
+
+When synonym controls are needed and the review is missing or incomplete, the
+command automatically launches the interactive review before continuing the
+experiment. It proposes two terms at a time and supports approve, manual
+replacement, regeneration with feedback, skip, and save-and-quit. Every action
+is written immediately to `<prefix>_synonym_review.json`; rerunning the same
+command resumes an interrupted or timed-out review and continues the experiment
+once every feature is approved. Approval rejects self-labels, duplicates,
+malformed phrases, and collisions with another canonical feature or approved
+control.
+
+Use `--review-synonyms` only when you want to review terms without running the
+experiment afterward. Use `--synonym-review PATH` to override the review
+location. Use `--distinct-only` to analyze only distinct features without
+requiring a review or writing synonym-control artifacts.
+
+The command writes:
+
+```text
+<prefix>_synonym_review.json
+<prefix>_resolved_features.json
+<prefix>_resolved_features.jsonl
+<prefix>_pairwise_similarities.csv
+<prefix>_pairwise_similarities.jsonl
+<prefix>_most_similar_distinct_features.md
+<prefix>_similarity_matrix.csv
+<prefix>_similarity_heatmap.png
+<prefix>_similarity_histogram.png
+<prefix>_similarity_boxplot.png
+<prefix>_synonym_control_rows.json
+<prefix>_synonym_control_rows.jsonl
+<prefix>_synonym_pairwise_similarities.csv
+<prefix>_synonym_pairwise_similarities.jsonl
+<prefix>_synonym_similarity_histogram.png
+<prefix>_synonym_similarity_boxplot.png
+<prefix>_similarity_distribution_comparison.png
+<prefix>_feature_set_precision_recall_f1.png
+<prefix>_similarity_trace.json
+```
+
+SemEval's official inventory includes merged labels such as
+`Whataboutism, straw man, red herring`. The expected inventory decomposes these
+into separate techniques where appropriate while retaining `Name calling,
+labeling` and `Exaggeration or minimization` as combined analysis features,
+matching the project inventory, and excludes `Dictatorship`. The resulting set
+contains 18 analysis rows.
+Each CSV row is always one analysis feature; punctuation is never used to infer
+components. `matching_aliases` and legacy `aliases` are resolution-only and
+never create controls or enter the canonical row's synonym field.
+
+The command also creates a positive-control distribution for rows that should
+merge. For every atomic feature, it generates one canonical control row plus
+exactly two human-approved synonym-label rows. Each label resolves its metadata
+independently, and approved terms are never inserted into the canonical row's
+synonym field. Similarities are calculated only within each three-row group;
+pair exports distinguish the two `canonical_synonym` pairs and one
+`synonym_synonym` pair.
+The comparison figure places horizontal box plots for distinct known features
+and within-feature synonyms on the same cosine-similarity axis, making their
+medians, spread, whiskers, and outliers directly comparable.
+The most-similar-distinct-features Markdown lists the top 20 distinct pairs in
+the order they become pairwise merge-eligible as the threshold is lowered.
+When synonym controls are available, the feature-set metrics chart applies
+complete-link merging at each threshold and compares the produced feature
+inventory with the actual known feature inventory. Produced clusters are
+one-to-one matched to actual features using their control provenance. Extra
+duplicate outputs lower precision; collapsed or missing actual features lower
+recall. The chart marks the best-F1 point. A `--distinct-only` run still writes the
+Markdown report but omits the metrics chart because it cannot construct a
+produced inventory with duplicate controls.
+
+For a similarly sized affective benchmark, use the eleven-label SemEval-2018
+Task 1 emotion-classification inventory:
+
+```bash
+uv run known-feature-similarity \
+  sanity_checks/semeval_2018_task1_emotion/expected_features.csv \
+  --annotated-features review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
+  --text-fields feature_name \
+  --output-dir review_runs/known_feature_similarity/semeval_2018_task1_emotion/name_only
+```
+
+Its broad “also includes” terms are retained as `related_terms` provenance and
+are not automatically treated as synonyms.
+
+For a similarly sized Geneva benchmark, use the 16 atomic emotions from Geneva
+Emotion Wheel prototype 1.0:
+
+```bash
+uv run known-feature-similarity \
+  sanity_checks/geneva_emotion_wheel_1_0/expected_features.csv \
+  --annotated-features review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
+  --embed-attribute-comparison \
+  --output-dir review_runs/known_feature_similarity/geneva_emotion_wheel_1_0
+```
+
+GEW 2.0 remains available as a separate 40-row atomic inventory. Its original
+20 pairings are retained only in `source_family`.
+
+### Compare embedding text attributes
+
+Use `--embed-attribute-comparison` to evaluate every non-empty combination of
+feature name, synonyms, definitions, and examples:
+
+```bash
+uv run known-feature-similarity \
+  sanity_checks/geneva_emotion_wheel_2_0/expected_features.csv \
+  --annotated-features review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
+  --embed-attribute-comparison \
+  --synonym-review review_runs/known_feature_similarity/geneva_emotion_wheel_2_0/expected_features_synonym_review.json \
+  --output-dir review_runs/known_feature_similarity/geneva_emotion_wheel_2_0/attribute_comparison
+```
+
+Before embedding, comparison mode independently generates a definition, one to
+five extremely close substitutable synonyms, and two to three examples for
+every unique canonical or approved-control label. Each generation request
+receives only that label and its category. It does not receive the approved
+synonym family, existing annotations, or other source metadata. This prevents
+the known should-merge relationship and shared annotation text from being
+injected into the comparison.
+
+Generated synonyms are filtered using the annotation pipeline's strict cleanup
+rules, which remove self-labels, duplicates, broad category terms,
+definition-like phrases, sentences, and loosely formatted candidates. Rows
+missing a definition, a synonym, or two examples are retried twice, then the
+command fails before embedding so all combinations evaluate the same row
+population. Generated metadata is cached and can be regenerated with
+`--refresh-generated-attributes`. Use `--attribute-generation-model` or
+`--attribute-generation-cache` to override their defaults. Comparison mode
+cannot be combined with `--text-fields`.
+
+The output directory contains:
+
+```text
+combinations/
+  name/
+  synonyms/
+  definitions/
+  examples/
+  ...
+  name_synonyms_definitions_examples/
+<prefix>_generated_attribute_cache.jsonl
+<prefix>_generated_attributes.json
+<prefix>_generated_attributes.jsonl
+<prefix>_attribute_generation_trace.json
+<prefix>_synonym_controls.md
+<prefix>_attribute_comparison_rankings.csv
+<prefix>_attribute_comparison_rankings.json
+<prefix>_attribute_comparison_ranking.png
+<prefix>_attribute_comparison_trace.json
+<prefix>_gemini_embedding_cache.jsonl
+```
+
+Each of the 15 combination folders contains the full standard similarity
+experiment artifacts. The ranking treats within-feature synonym-control pairs
+as positives and distinct known-feature pairs as negatives. Its primary metric
+is ROC AUC: the probability that a randomly selected should-merge pair receives
+a higher similarity than a randomly selected distinct-feature pair. Mean
+similarity gap breaks AUC ties, followed by fewer fields and the combination
+name. The ranking exports also report median gap, standardized mean gap,
+Cliff's delta, and the threshold with the best produced-feature-set F1 together
+with its precision and recall.
+The horizontal ranking chart annotates each bar with its actual ROC AUC.
+
+The synonym-controls Markdown groups every canonical feature with its two
+human-approved controls. It also shows each label's independently generated
+embedding metadata, making the controls easy to inspect without reading JSONL
+artifacts.
+
 ## Testing
 
 Run the test suite:
@@ -532,6 +882,7 @@ uv run python -m py_compile \
   lit_synthesize.py \
   lit_extract.py \
   comparison_plots.py \
+  known_feature_similarity.py \
   lit_log_summary.py
 ```
 
