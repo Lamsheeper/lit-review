@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from feature_embedding_tsne import FeatureItem
+from feature_embedding_tsne import EmbeddingTextCleanup, FeatureItem
 
 from embedding_merge import (
     CategoryMergeSpec,
@@ -18,6 +18,7 @@ from embedding_merge import (
     choose_canonical_index,
     find_similarity_pairs,
     find_similarity_pairs_by_category_thresholds,
+    load_category_merge_specs,
     main,
     normalized_matrix,
     run_embedding_merge,
@@ -83,6 +84,60 @@ class EmbeddingMergeTests(unittest.TestCase):
             threshold_range(0.95, 0.90)
         with self.assertRaisesRegex(ValueError, "step"):
             threshold_range(0.90, 0.95, 0.0)
+
+    def test_category_config_without_cleanup_still_loads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "category_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "persuasion": {
+                            "text_fields": ["definitions"],
+                            "threshold": 0.95,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            specs = load_category_merge_specs(config_path)
+
+        self.assertEqual(specs["persuasion"].text_fields, ["definitions"])
+        self.assertEqual(specs["persuasion"].threshold, 0.95)
+        self.assertEqual(specs["persuasion"].linkage, "complete")
+        self.assertIsNone(specs["persuasion"].embedding_text_cleanup)
+
+    def test_category_config_loads_embedding_text_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "category_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "persuasion": {
+                            "text_fields": ["definitions"],
+                            "threshold": 0.95,
+                            "linkage": "complete",
+                            "embedding_text_cleanup": {
+                                "strip_builtins": ["persuasion_high_confidence_boilerplate"],
+                                "min_chars": 24,
+                                "fallback": "original",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            specs = load_category_merge_specs(config_path)
+
+        self.assertEqual(
+            specs["persuasion"].embedding_text_cleanup,
+            EmbeddingTextCleanup(
+                strip_builtins=("persuasion_high_confidence_boilerplate",),
+                min_chars=24,
+                fallback="original",
+            ),
+        )
 
     def test_selected_text_fields_use_nested_annotation_short_definition(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -861,6 +916,97 @@ class EmbeddingMergeTests(unittest.TestCase):
             "Affect Without Examples",
             [row["feature_name"] for row in merged_payload["features"]],
         )
+
+    def test_category_config_cleanup_applies_only_to_configured_category(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            features_path = root / "features.json"
+            features_path.write_text(
+                json.dumps(
+                    {
+                        "features": [
+                            {
+                                "feature_name": "Persuasion A",
+                                "category": "persuasion",
+                                "definitions": [
+                                    "A persuasive technique that repeats a slogan to increase salience."
+                                ],
+                            },
+                            {
+                                "feature_name": "Persuasion B",
+                                "category": "persuasion",
+                                "definitions": [
+                                    "The deliberate use of urgent, time-limited scarcity language."
+                                ],
+                            },
+                            {
+                                "feature_name": "Moral A",
+                                "category": "moral_framing",
+                                "definitions": [
+                                    "The use of care language as moral framing."
+                                ],
+                            },
+                            {
+                                "feature_name": "Moral B",
+                                "category": "moral_framing",
+                                "definitions": [
+                                    "A persuasive technique that frames authority as morally necessary."
+                                ],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cleanup = EmbeddingTextCleanup(
+                strip_builtins=("persuasion_high_confidence_boilerplate",),
+                min_chars=24,
+                fallback="original",
+            )
+            specs = {
+                "persuasion": CategoryMergeSpec(
+                    ["definitions"],
+                    0.99,
+                    embedding_text_cleanup=cleanup,
+                ),
+                "moral_framing": CategoryMergeSpec(["definitions"], 0.99),
+            }
+            client = FakeEmbeddingClient(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [0.0, -1.0],
+                    [-1.0, 0.0],
+                ]
+            )
+
+            trace = run_embedding_merge_by_category(
+                features_path=features_path,
+                specs=specs,
+                output_dir=root / "category_outputs",
+                prefix="features",
+                cache_path=root / "cache.jsonl",
+                client=client,
+                write_tsne_html=False,
+            )
+
+        joined_texts = "\n".join(client.all_texts)
+        self.assertIn("Definitions: repeats a slogan to increase salience.", joined_texts)
+        self.assertIn("Definitions: urgent, time-limited scarcity language.", joined_texts)
+        self.assertIn("Definitions: The use of care language as moral framing.", joined_texts)
+        self.assertIn(
+            "Definitions: A persuasive technique that frames authority as morally necessary.",
+            joined_texts,
+        )
+        self.assertEqual(
+            trace["category_config"]["persuasion"]["embedding_text_cleanup"],
+            {
+                "strip_builtins": ["persuasion_high_confidence_boilerplate"],
+                "min_chars": 24,
+                "fallback": "original",
+            },
+        )
+        self.assertNotIn("embedding_text_cleanup", trace["category_config"]["moral_framing"])
 
     def test_main_single_threshold_still_writes_full_artifacts(self):
         with tempfile.TemporaryDirectory() as temp:

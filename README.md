@@ -621,6 +621,27 @@ transitive connected-component merging is intentional. Features with no
 content in their category's selected fields are preserved as unmerged
 singletons and counted as `unembedded_features` in the trace.
 
+Optionally add `embedding_text_cleanup` to a category to strip generic
+lead-in boilerplate before embedding while leaving the source feature rows
+unchanged. For persuasion definitions, the built-in high-confidence cleanup
+removes scaffolding such as "A persuasive technique" and "The use of" but
+preserves fallacy and argument wording:
+
+```json
+{
+  "persuasion": {
+    "text_fields": ["definitions"],
+    "threshold": 0.95,
+    "linkage": "complete",
+    "embedding_text_cleanup": {
+      "strip_builtins": ["persuasion_high_confidence_boilerplate"],
+      "min_chars": 24,
+      "fallback": "original"
+    }
+  }
+}
+```
+
 Then run the final merge without global threshold or text-field arguments:
 
 ```bash

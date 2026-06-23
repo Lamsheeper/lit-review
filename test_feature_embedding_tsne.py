@@ -6,6 +6,7 @@ from pathlib import Path
 
 from feature_embedding_tsne import (
     DEFAULT_TEXT_FIELDS,
+    EmbeddingTextCleanup,
     FeatureItem,
     build_embedding_text,
     choose_perplexity,
@@ -147,6 +148,80 @@ class FeatureEmbeddingTsneTests(unittest.TestCase):
             text,
         )
         self.assertIn("Annotation Synonyms: care foundation", text)
+
+    def test_build_embedding_text_strips_high_confidence_boilerplate_only(self):
+        cleanup = EmbeddingTextCleanup(
+            strip_builtins=("persuasion_high_confidence_boilerplate",),
+            min_chars=24,
+            fallback="original",
+        )
+        row = {
+            "feature_name": "Ad Hominem",
+            "category": "persuasion",
+            "definitions": [
+                (
+                    "A persuasive tactic or logical fallacy where an argument is rebutted "
+                    "by attacking the person rather than addressing the substance of the argument."
+                ),
+                "The use of offensive language to demean an opponent.",
+            ],
+        }
+
+        text = build_embedding_text(row, ["definitions"], cleanup=cleanup)
+
+        self.assertNotIn("A persuasive tactic", text)
+        self.assertNotIn("The use of", text)
+        self.assertIn("logical fallacy where an argument is rebutted", text)
+        self.assertIn("rather than addressing the substance of the argument", text)
+        self.assertIn("offensive language to demean an opponent", text)
+
+    def test_build_embedding_text_strips_sentiment_boilerplate_without_losing_valence(self):
+        cleanup = EmbeddingTextCleanup(
+            strip_builtins=("sentiment_affect_high_confidence_boilerplate",),
+            min_chars=24,
+            fallback="original",
+        )
+        row = {
+            "feature_name": "Sadness",
+            "category": "sentiment_affect",
+            "definitions": [
+                (
+                    "An emotional state characterized by feelings of sorrow, "
+                    "grief, disappointment, or downcast spirits."
+                ),
+                "An unpleasant emotional state characterized by blame and regret.",
+            ],
+        }
+
+        text = build_embedding_text(row, ["definitions"], cleanup=cleanup)
+
+        self.assertNotIn("An emotional state characterized by feelings of sorrow", text)
+        self.assertIn("Definitions: feelings of sorrow, grief", text)
+        self.assertIn("An unpleasant emotional state characterized by", text)
+
+    def test_build_embedding_text_can_scope_cleanup_to_specific_fields(self):
+        cleanup = EmbeddingTextCleanup(
+            strip_builtins=("persuasion_high_confidence_boilerplate",),
+            min_chars=24,
+            fallback="original",
+        )
+        row = {
+            "feature_name": "A persuasive technique label",
+            "category": "persuasion",
+            "definitions": ["A persuasive technique that repeats a slogan to increase salience."],
+            "synonyms": ["A persuasive technique synonym"],
+        }
+
+        text = build_embedding_text(
+            row,
+            ["feature_name", "definitions", "synonyms"],
+            cleanup=cleanup,
+            cleanup_fields=["definitions"],
+        )
+
+        self.assertIn("Feature Name: A persuasive technique label", text)
+        self.assertIn("Definitions: repeats a slogan to increase salience.", text)
+        self.assertIn("Synonyms: A persuasive technique synonym", text)
 
     def test_loads_annotated_json_with_default_text_fields_and_annotation_counts(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -23,7 +23,9 @@ from feature_embedding_tsne import (
     DEFAULT_GEMINI_MODEL,
     DEFAULT_OUTPUT_DIMENSIONALITY,
     DEFAULT_TASK_TYPE,
+    EMBEDDING_TEXT_CLEANUP_BUILTINS,
     EmbeddingClient,
+    EmbeddingTextCleanup,
     GeminiEmbeddingClient,
     embed_texts_with_cache,
     gemini_api_key,
@@ -76,6 +78,53 @@ CANDIDATE_NAME_FIELDS = (
     "canonical_feature_name",
     "normalized_feature_name",
 )
+
+
+def embedding_text_cleanup_from_args(
+    *,
+    strip_builtins: Iterable[str] | None,
+    min_chars: int,
+    fallback: str,
+) -> EmbeddingTextCleanup | None:
+    builtins = tuple(str(item).strip() for item in (strip_builtins or []) if str(item).strip())
+    if not builtins:
+        return None
+    unknown = sorted(set(builtins) - set(EMBEDDING_TEXT_CLEANUP_BUILTINS))
+    if unknown:
+        raise ValueError("Unknown embedding text cleanup builtin(s): " + ", ".join(unknown))
+    if min_chars < 0:
+        raise ValueError("--embedding-text-cleanup-min-chars must be non-negative.")
+    fallback = fallback.strip().lower()
+    if fallback not in {"original", "empty"}:
+        raise ValueError("--embedding-text-cleanup-fallback must be 'original' or 'empty'.")
+    return EmbeddingTextCleanup(
+        strip_builtins=builtins,
+        min_chars=min_chars,
+        fallback=fallback,
+    )
+
+
+def embedding_text_cleanup_trace_payload(
+    cleanup: EmbeddingTextCleanup | None,
+    cleanup_fields: Iterable[str] | None,
+    selected_fields: Iterable[str] | None = None,
+) -> dict[str, Any] | None:
+    if cleanup is None:
+        return None
+    cleanup_field_list = list(parse_text_fields(cleanup_fields)) if cleanup_fields is not None else None
+    payload: dict[str, Any] = {
+        "strip_builtins": list(cleanup.strip_builtins),
+        "min_chars": cleanup.min_chars,
+        "fallback": cleanup.fallback,
+        "fields": cleanup_field_list,
+    }
+    if selected_fields is not None:
+        selected = list(parse_text_fields(selected_fields))
+        cleanup_field_set = set(cleanup_field_list) if cleanup_field_list is not None else set(selected)
+        payload["applied_to_selected_fields"] = [
+            field for field in selected if field in cleanup_field_set
+        ]
+    return payload
 
 
 def unicode_normalize_key(value: Any) -> str:
@@ -1741,6 +1790,8 @@ def run_known_feature_similarity(
     synonym_control_rows_override: list[dict[str, Any]] | None = None,
     annotated_candidate_count_override: int | None = None,
     trace_context: dict[str, Any] | None = None,
+    embedding_text_cleanup: EmbeddingTextCleanup | None = None,
+    embedding_text_cleanup_fields: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     known_rows = read_feature_rows(known_set_path)
     if len(known_rows) < 2:
@@ -1781,7 +1832,17 @@ def run_known_feature_similarity(
     write_resolved_rows(paths, known_set_path, resolved_rows)
 
     fields = parse_text_fields(text_fields)
-    items = load_feature_items(paths["resolved_json"], fields)
+    cleanup_fields = (
+        parse_text_fields(embedding_text_cleanup_fields)
+        if embedding_text_cleanup is not None and embedding_text_cleanup_fields is not None
+        else None
+    )
+    items = load_feature_items(
+        paths["resolved_json"],
+        fields,
+        cleanup=embedding_text_cleanup,
+        cleanup_fields=cleanup_fields,
+    )
     if len(items) != len(resolved_rows):
         raise ValueError("One or more resolved known-set rows produced empty embedding text.")
     embeddings, cache_stats = embed_texts_with_cache(
@@ -1819,7 +1880,12 @@ def run_known_feature_similarity(
             json.dumps({"rows": synonym_control_rows}, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        synonym_items = load_feature_items(paths["synonym_control_rows_json"], fields)
+        synonym_items = load_feature_items(
+            paths["synonym_control_rows_json"],
+            fields,
+            cleanup=embedding_text_cleanup,
+            cleanup_fields=cleanup_fields,
+        )
         if len(synonym_items) != len(synonym_control_rows):
             raise ValueError("One or more synonym-control rows produced empty embedding text.")
         synonym_embeddings, synonym_cache_stats = embed_texts_with_cache(
@@ -1897,6 +1963,11 @@ def run_known_feature_similarity(
         "known_set": str(known_set_path),
         "annotated_features": str(annotated_features_path) if annotated_features_path else None,
         "text_fields": fields,
+        "embedding_text_cleanup": embedding_text_cleanup_trace_payload(
+            embedding_text_cleanup,
+            cleanup_fields,
+            selected_fields=fields,
+        ),
         "model": model,
         "task_type": task_type,
         "output_dimensionality": output_dimensionality,
@@ -2288,6 +2359,8 @@ def run_attribute_comparison(
     output_dimensionality: int = DEFAULT_OUTPUT_DIMENSIONALITY,
     batch_size: int = 50,
     refresh_generated_attributes: bool = False,
+    embedding_text_cleanup: EmbeddingTextCleanup | None = None,
+    embedding_text_cleanup_fields: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     known_rows = read_feature_rows(known_set_path)
     if len(known_rows) < 2:
@@ -2331,6 +2404,11 @@ def run_attribute_comparison(
 
     ranking_rows: list[dict[str, Any]] = []
     expected_counts: tuple[int, int, int, int] | None = None
+    cleanup_fields = (
+        parse_text_fields(embedding_text_cleanup_fields)
+        if embedding_text_cleanup is not None and embedding_text_cleanup_fields is not None
+        else None
+    )
     for fields in attribute_combinations():
         slug = attribute_combination_slug(fields)
         combination_dir = output_dir / "combinations" / slug
@@ -2349,6 +2427,8 @@ def run_attribute_comparison(
             resolved_rows_override=generated_known_rows,
             synonym_control_rows_override=generated_control_rows,
             annotated_candidate_count_override=len(annotated_rows),
+            embedding_text_cleanup=embedding_text_cleanup,
+            embedding_text_cleanup_fields=cleanup_fields,
             trace_context={
                 "mode": "embed_attribute_comparison",
                 "combination": slug,
@@ -2356,6 +2436,11 @@ def run_attribute_comparison(
                 "generated_attribute_model": attribute_generation_model,
                 "generated_attribute_cache": str(attribute_cache_path),
                 "generated_attribute_input_fields": ["feature_name", "category"],
+                "embedding_text_cleanup": embedding_text_cleanup_trace_payload(
+                    embedding_text_cleanup,
+                    cleanup_fields,
+                    selected_fields=fields,
+                ),
                 "synonym_review": {
                     "path": str(synonym_review_path),
                     "inventory_fingerprint": review.get("inventory_fingerprint"),
@@ -2422,6 +2507,10 @@ def run_attribute_comparison(
             "generation_model": review.get("generation_model"),
         },
         "comparison_fields": list(ATTRIBUTE_COMPARISON_FIELDS),
+        "embedding_text_cleanup": embedding_text_cleanup_trace_payload(
+            embedding_text_cleanup,
+            cleanup_fields,
+        ),
         "combination_count": len(ranking_rows),
         "generated_attribute_row_count": len(generated_rows),
         "population_counts": {
@@ -2463,6 +2552,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--text-fields",
         default=None,
         help="Comma-separated resolved-row fields used to build embedding text.",
+    )
+    parser.add_argument(
+        "--embedding-text-cleanup-builtin",
+        action="append",
+        choices=sorted(EMBEDDING_TEXT_CLEANUP_BUILTINS),
+        help=(
+            "Named embedding-text cleanup builtin to apply before embedding. "
+            "May be repeated. By default no cleanup is applied."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-text-cleanup-fields",
+        default="definitions",
+        help=(
+            "Comma-separated row fields to clean when cleanup is enabled. "
+            "Defaults to definitions so non-definition attribute combinations remain controls."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-text-cleanup-min-chars",
+        type=int,
+        default=24,
+        help="Use the original field value if cleanup leaves fewer than this many characters.",
+    )
+    parser.add_argument(
+        "--embedding-text-cleanup-fallback",
+        choices=["original", "empty"],
+        default="original",
+        help="Fallback when cleanup removes too much text.",
     )
     parser.add_argument(
         "--embed-attribute-comparison",
@@ -2552,6 +2670,16 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--embed-attribute-comparison cannot be used with --distinct-only.")
         if args.embed_attribute_comparison and args.text_fields is not None:
             raise ValueError("--text-fields cannot be used with --embed-attribute-comparison.")
+        embedding_text_cleanup = embedding_text_cleanup_from_args(
+            strip_builtins=args.embedding_text_cleanup_builtin,
+            min_chars=args.embedding_text_cleanup_min_chars,
+            fallback=args.embedding_text_cleanup_fallback,
+        )
+        embedding_text_cleanup_fields = (
+            parse_text_fields(args.embedding_text_cleanup_fields)
+            if embedding_text_cleanup is not None
+            else None
+        )
         api_key = gemini_api_key(args.gemini_api_key)
         client: EmbeddingClient | None = None
         attribute_client: Any | None = None
@@ -2621,6 +2749,8 @@ def main(argv: list[str] | None = None) -> int:
                 output_dimensionality=args.output_dimensionality,
                 batch_size=args.batch_size,
                 refresh_generated_attributes=args.refresh_generated_attributes,
+                embedding_text_cleanup=embedding_text_cleanup,
+                embedding_text_cleanup_fields=embedding_text_cleanup_fields,
             )
         else:
             trace = run_known_feature_similarity(
@@ -2637,6 +2767,8 @@ def main(argv: list[str] | None = None) -> int:
                 task_type=args.task_type,
                 output_dimensionality=args.output_dimensionality,
                 batch_size=args.batch_size,
+                embedding_text_cleanup=embedding_text_cleanup,
+                embedding_text_cleanup_fields=embedding_text_cleanup_fields,
             )
     except Exception as exc:
         print(f"known_feature_similarity: {exc}", file=sys.stderr)

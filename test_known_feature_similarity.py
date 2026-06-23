@@ -46,7 +46,7 @@ from known_feature_similarity import (
     write_attribute_ranking_plot,
     write_feature_set_metrics_plot,
 )
-from feature_embedding_tsne import FeatureItem, load_feature_items
+from feature_embedding_tsne import EmbeddingTextCleanup, FeatureItem, load_feature_items
 
 
 class FakeEmbeddingClient:
@@ -1265,6 +1265,70 @@ class KnownFeatureSimilarityTests(unittest.TestCase):
 
             self.assertEqual(client.calls, [])
             self.assertFalse((root / "out").exists())
+
+    def test_run_known_feature_similarity_scopes_cleanup_to_definitions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            known_path = root / "known.csv"
+            known_path.write_text(
+                "feature_id,canonical_feature_name,category\none,One,persuasion\ntwo,Two,persuasion\n",
+                encoding="utf-8",
+            )
+            client = DeterministicEmbeddingClient()
+            cleanup = EmbeddingTextCleanup(
+                strip_builtins=("persuasion_high_confidence_boilerplate",),
+                min_chars=24,
+                fallback="original",
+            )
+
+            trace = run_known_feature_similarity(
+                known_set_path=known_path,
+                annotated_features_path=None,
+                text_fields=["feature_name", "definitions", "synonyms"],
+                output_dir=root / "out",
+                prefix="known",
+                cache_path=root / "cache.jsonl",
+                client=client,
+                distinct_only=True,
+                resolved_rows_override=[
+                    {
+                        "feature_key": "persuasion::one",
+                        "feature_name": "A persuasive technique label",
+                        "category": "persuasion",
+                        "resolution": {"status": "test_override"},
+                        "definitions": [
+                            "A persuasive technique that repeats a slogan to increase salience."
+                        ],
+                        "synonyms": ["A persuasive technique synonym"],
+                    },
+                    {
+                        "feature_key": "persuasion::two",
+                        "feature_name": "Two",
+                        "category": "persuasion",
+                        "resolution": {"status": "test_override"},
+                        "definitions": ["A persuasive tactic that uses urgent scarcity language."],
+                        "synonyms": ["urgent appeal"],
+                    },
+                ],
+                annotated_candidate_count_override=0,
+                embedding_text_cleanup=cleanup,
+                embedding_text_cleanup_fields=["definitions"],
+            )
+
+        joined_texts = "\n".join(text for call in client.calls for text in call)
+        self.assertIn("Feature Name: A persuasive technique label", joined_texts)
+        self.assertIn("Definitions: repeats a slogan to increase salience.", joined_texts)
+        self.assertIn("Synonyms: A persuasive technique synonym", joined_texts)
+        self.assertEqual(
+            trace["embedding_text_cleanup"],
+            {
+                "strip_builtins": ["persuasion_high_confidence_boilerplate"],
+                "min_chars": 24,
+                "fallback": "original",
+                "fields": ["definitions"],
+                "applied_to_selected_fields": ["definitions"],
+            },
+        )
 
     def test_run_writes_artifacts_and_reuses_embedding_cache(self):
         with tempfile.TemporaryDirectory() as temp:

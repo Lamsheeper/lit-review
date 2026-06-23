@@ -22,7 +22,9 @@ from feature_embedding_tsne import (
     DEFAULT_RANDOM_STATE,
     DEFAULT_TASK_TYPE,
     DEFAULT_TEXT_FIELDS,
+    EMBEDDING_TEXT_CLEANUP_BUILTINS,
     EmbeddingClient,
+    EmbeddingTextCleanup,
     FeatureItem,
     GeminiEmbeddingClient,
     embed_texts_with_cache,
@@ -174,6 +176,7 @@ class CategoryMergeSpec:
     text_fields: list[str]
     threshold: float
     linkage: str = "complete"
+    embedding_text_cleanup: EmbeddingTextCleanup | None = None
 
 
 @dataclass(frozen=True)
@@ -254,18 +257,71 @@ def load_category_merge_specs(path: Path) -> dict[str, CategoryMergeSpec]:
         linkage = str(raw_spec.get("linkage") or "complete").strip().lower()
         if linkage not in {"single", "complete"}:
             raise ValueError(f"Category {category!r} linkage must be 'single' or 'complete'.")
-        specs[category] = CategoryMergeSpec(text_fields=fields, threshold=threshold, linkage=linkage)
+        cleanup = parse_embedding_text_cleanup(raw_spec.get("embedding_text_cleanup"), path, category)
+        specs[category] = CategoryMergeSpec(
+            text_fields=fields,
+            threshold=threshold,
+            linkage=linkage,
+            embedding_text_cleanup=cleanup,
+        )
     return specs
 
 
+def parse_embedding_text_cleanup(raw_cleanup: Any, path: Path, category: str) -> EmbeddingTextCleanup | None:
+    if raw_cleanup in (None, ""):
+        return None
+    if not isinstance(raw_cleanup, dict):
+        raise ValueError(f"Category {category!r} embedding_text_cleanup in {path} must be a JSON object.")
+
+    raw_builtins = raw_cleanup.get("strip_builtins", [])
+    if not isinstance(raw_builtins, list):
+        raise ValueError(f"Category {category!r} embedding_text_cleanup.strip_builtins must be a list.")
+    strip_builtins = tuple(str(item).strip() for item in raw_builtins if str(item).strip())
+    unknown_builtins = sorted(set(strip_builtins) - set(EMBEDDING_TEXT_CLEANUP_BUILTINS))
+    if unknown_builtins:
+        raise ValueError(
+            f"Category {category!r} embedding_text_cleanup has unknown strip_builtins: "
+            + ", ".join(unknown_builtins)
+        )
+
+    raw_min_chars = raw_cleanup.get("min_chars", 0)
+    try:
+        min_chars = int(raw_min_chars)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Category {category!r} embedding_text_cleanup.min_chars must be an integer.") from exc
+    if min_chars < 0:
+        raise ValueError(f"Category {category!r} embedding_text_cleanup.min_chars must be non-negative.")
+
+    fallback = str(raw_cleanup.get("fallback") or "original").strip().lower()
+    if fallback not in {"original", "empty"}:
+        raise ValueError(f"Category {category!r} embedding_text_cleanup.fallback must be 'original' or 'empty'.")
+
+    return EmbeddingTextCleanup(
+        strip_builtins=strip_builtins,
+        min_chars=min_chars,
+        fallback=fallback,
+    )
+
+
 def category_specs_payload(specs: dict[str, CategoryMergeSpec]) -> dict[str, dict[str, Any]]:
-    return {
-        category: {
+    payload: dict[str, dict[str, Any]] = {}
+    for category, spec in specs.items():
+        row = {
             "text_fields": spec.text_fields,
             "threshold": spec.threshold,
             "linkage": spec.linkage,
         }
-        for category, spec in specs.items()
+        if spec.embedding_text_cleanup is not None:
+            row["embedding_text_cleanup"] = embedding_text_cleanup_payload(spec.embedding_text_cleanup)
+        payload[category] = row
+    return payload
+
+
+def embedding_text_cleanup_payload(cleanup: EmbeddingTextCleanup) -> dict[str, Any]:
+    return {
+        "strip_builtins": list(cleanup.strip_builtins),
+        "min_chars": cleanup.min_chars,
+        "fallback": cleanup.fallback,
     }
 
 
@@ -1872,12 +1928,16 @@ def prepare_category_embeddings(
     if extra_specs:
         raise ValueError(f"Category config contains categories absent from the input: {', '.join(extra_specs)}.")
 
-    items_by_fields: dict[tuple[str, ...], list[FeatureItem]] = {}
+    items_by_fields: dict[tuple[tuple[str, ...], EmbeddingTextCleanup | None], list[FeatureItem]] = {}
     items: list[FeatureItem] = []
     for category, spec in specs.items():
-        fields_key = tuple(spec.text_fields)
+        fields_key = (tuple(spec.text_fields), spec.embedding_text_cleanup)
         if fields_key not in items_by_fields:
-            items_by_fields[fields_key] = load_feature_items(features_path, spec.text_fields)
+            items_by_fields[fields_key] = load_feature_items(
+                features_path,
+                spec.text_fields,
+                cleanup=spec.embedding_text_cleanup,
+            )
         items.extend(item for item in items_by_fields[fields_key] if item.category == category)
     items.sort(key=lambda item: item.row_index)
     if not items:
@@ -2214,6 +2274,7 @@ def maybe_write_merged_tsne_html(
     merged_json_path: Path,
     html_path: Path,
     text_fields: Iterable[str],
+    cleanup: EmbeddingTextCleanup | None = None,
     cache_path: Path,
     client: EmbeddingClient | None,
     model: str,
@@ -2225,7 +2286,7 @@ def maybe_write_merged_tsne_html(
     annotate_top: int,
 ) -> dict[str, Any]:
     try:
-        items = load_feature_items(merged_json_path, text_fields)
+        items = load_feature_items(merged_json_path, text_fields, cleanup=cleanup)
     except Exception as exc:
         return {
             "status": "failed",
@@ -2335,7 +2396,11 @@ def maybe_write_combined_category_merged_tsne_html(
             for category, spec in specs.items():
                 items.extend(
                     item
-                    for item in load_feature_items(merged_path, spec.text_fields)
+                    for item in load_feature_items(
+                        merged_path,
+                        spec.text_fields,
+                        cleanup=spec.embedding_text_cleanup,
+                    )
                     if item.category == category
                 )
             items.sort(key=lambda item: item.row_index)
@@ -2395,6 +2460,7 @@ def maybe_write_category_merged_tsne_html(
                 merged_json_path=category_path,
                 html_path=category_merged_tsne_html_path(output_dir, prefix, category),
                 text_fields=spec.text_fields,
+                cleanup=spec.embedding_text_cleanup,
                 cache_path=cache_path,
                 client=client,
                 model=model,

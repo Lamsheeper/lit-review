@@ -36,6 +36,51 @@ DEFAULT_TEXT_FIELDS = (
 DEFAULT_RANDOM_STATE = 42
 DEFAULT_ANNOTATE_TOP = 80
 
+PERSUASION_HIGH_CONFIDENCE_BOILERPLATE = (
+    "A persuasive communication technique",
+    "A persuasive communication strategy",
+    "A persuasive framing technique",
+    "A persuasive linguistic technique",
+    "A persuasive technique",
+    "A persuasive tactic",
+    "A persuasive strategy",
+    "A persuasive method",
+    "A persuasive approach",
+    "A persuasion technique",
+    "A persuasion tactic",
+    "A persuasion strategy",
+    "The strategic use of",
+    "The deliberate use of",
+    "The practice of",
+    "The process of",
+    "The use of",
+    "The act of",
+)
+
+SENTIMENT_AFFECT_HIGH_CONFIDENCE_BOILERPLATE = (
+    "An emotional state characterized by",
+    "An emotional state of",
+    "An emotional state",
+    "An affective state of",
+    "An affective state",
+    "An intense feeling of",
+    "An intense feeling",
+    "A strong feeling of",
+    "A strong feeling",
+    "A feeling of",
+    "A feeling",
+    "The state of",
+    "A state of",
+    "A state",
+)
+
+EMBEDDING_TEXT_CLEANUP_BUILTINS = {
+    "persuasion_high_confidence_boilerplate": PERSUASION_HIGH_CONFIDENCE_BOILERPLATE,
+    "sentiment_affect_high_confidence_boilerplate": (
+        SENTIMENT_AFFECT_HIGH_CONFIDENCE_BOILERPLATE
+    ),
+}
+
 
 @dataclass(frozen=True)
 class FeatureItem:
@@ -47,6 +92,13 @@ class FeatureItem:
     mention_count: int
     embedding_text: str
     raw_row: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class EmbeddingTextCleanup:
+    strip_builtins: tuple[str, ...] = ()
+    min_chars: int = 0
+    fallback: str = "original"
 
 
 @dataclass(frozen=True)
@@ -239,21 +291,88 @@ def parse_text_fields(value: str | Iterable[str]) -> list[str]:
     return parsed
 
 
-def build_embedding_text(row: dict[str, Any], text_fields: Iterable[str]) -> str:
+def build_embedding_text(
+    row: dict[str, Any],
+    text_fields: Iterable[str],
+    cleanup: EmbeddingTextCleanup | None = None,
+    cleanup_fields: Iterable[str] | None = None,
+) -> str:
     sections: list[str] = []
     seen_by_field: set[tuple[str, str]] = set()
+    cleanup_field_set = (
+        {str(field).strip() for field in cleanup_fields if str(field).strip()}
+        if cleanup_fields is not None
+        else None
+    )
     for field in text_fields:
         values = []
+        field_cleanup = cleanup if cleanup_field_set is None or field in cleanup_field_set else None
         for value in parse_jsonish_list(row_field_value(row, field)):
-            normalized = value.casefold()
+            cleaned_value = clean_embedding_text_value(value, field_cleanup)
+            if not cleaned_value:
+                continue
+            normalized = cleaned_value.casefold()
             key = (field, normalized)
             if key in seen_by_field:
                 continue
             seen_by_field.add(key)
-            values.append(value)
+            values.append(cleaned_value)
         if values:
             sections.append(f"{human_field_name(field)}: {'; '.join(values)}")
     return "\n".join(sections).strip()
+
+
+def clean_embedding_text_value(value: str, cleanup: EmbeddingTextCleanup | None) -> str:
+    original = re.sub(r"\s+", " ", value).strip()
+    if cleanup is None or not cleanup.strip_builtins:
+        return original
+
+    cleaned = original
+    phrases = cleanup_builtin_phrases(cleanup.strip_builtins)
+    for _ in range(4):
+        for phrase in phrases:
+            stripped = strip_leading_phrase(cleaned, phrase)
+            if stripped == cleaned:
+                continue
+            cleaned = normalize_after_leading_strip(stripped)
+            break
+        else:
+            break
+
+    if not cleaned or (cleanup.min_chars and len(cleaned) < cleanup.min_chars):
+        return original if cleanup.fallback == "original" else ""
+    return cleaned
+
+
+def cleanup_builtin_phrases(strip_builtins: Iterable[str]) -> list[str]:
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for builtin in strip_builtins:
+        if builtin not in EMBEDDING_TEXT_CLEANUP_BUILTINS:
+            raise ValueError(f"Unknown embedding text cleanup builtin: {builtin}")
+        for phrase in EMBEDDING_TEXT_CLEANUP_BUILTINS[builtin]:
+            key = phrase.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            phrases.append(phrase)
+    return phrases
+
+
+def strip_leading_phrase(text: str, phrase: str) -> str:
+    flexible_phrase = r"\s+".join(re.escape(part) for part in phrase.split())
+    pattern = re.compile(rf"^\s*{flexible_phrase}(?:\b|(?=\W))", flags=re.IGNORECASE)
+    match = pattern.match(text)
+    if not match:
+        return text
+    return text[match.end() :].lstrip(" \t,;:-.")
+
+
+def normalize_after_leading_strip(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = re.sub(r"^(?:and|or)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(?:that|where)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" \t,;:-")
 
 
 def row_field_value(row: dict[str, Any], field: str) -> Any:
@@ -295,12 +414,17 @@ def first_text_value(row: dict[str, Any], fields: Iterable[str]) -> str:
     return ""
 
 
-def load_feature_items(path: Path, text_fields: Iterable[str]) -> list[FeatureItem]:
+def load_feature_items(
+    path: Path,
+    text_fields: Iterable[str],
+    cleanup: EmbeddingTextCleanup | None = None,
+    cleanup_fields: Iterable[str] | None = None,
+) -> list[FeatureItem]:
     rows = read_feature_rows(path)
     fields = parse_text_fields(text_fields)
     items: list[FeatureItem] = []
     for index, row in enumerate(rows, start=1):
-        embedding_text = build_embedding_text(row, fields)
+        embedding_text = build_embedding_text(row, fields, cleanup=cleanup, cleanup_fields=cleanup_fields)
         if not embedding_text:
             continue
         label = feature_label(row)
