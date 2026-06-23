@@ -61,6 +61,22 @@ class UiApiTests(unittest.TestCase):
         self.assertEqual(sum(bool(row["selected"]) for row in rows), 1)
         self.assertTrue(rows[0]["candidate_id"].startswith("paper_"))
 
+    def test_project_delete_removes_project_and_refuses_active_jobs(self):
+        project = self.client.post("/api/projects", json={"name": "Delete API"}).json()
+        path = app_module.store.project_dir(project["id"])
+        job = app_module.store.create_job(project["id"], "collection_search", path / "jobs" / "job.log")
+
+        response = self.client.delete(f"/api/projects/{project['id']}")
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(path.exists())
+
+        app_module.store.update_job(job["id"], status="completed")
+        response = self.client.delete(f"/api/projects/{project['id']}")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["deleted"])
+        self.assertFalse(path.exists())
+        self.assertEqual(self.client.get(f"/api/projects/{project['id']}").status_code, 404)
+
     def test_document_generation_creates_relevance_scoring_profile(self):
         project = self.client.post("/api/projects", json={"name": "Generated"}).json()
         generated = {
@@ -179,6 +195,53 @@ class UiApiTests(unittest.TestCase):
         payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertNotIn("api_key", payload)
         self.assertEqual(payload["api_key_env"], "GEMINI_API_KEY")
+
+    def test_extraction_prompt_preview_uses_current_direct_pdf_prompt(self):
+        project = self.client.post("/api/projects", json={"name": "Prompt Preview"}).json()
+        project_id = project["id"]
+        path = app_module.store.project_dir(project_id)
+        (path / "goal.md").write_text("# Goal\nExtract the exact target features.\n", encoding="utf-8")
+        taxonomy = {
+            "version": 1,
+            "title": "Prompt taxonomy",
+            "families": [
+                {
+                    "id": "prompt_family",
+                    "label": "Prompt family",
+                    "description": "Features relevant to prompt preview.",
+                    "aliases": [],
+                }
+            ],
+        }
+        app_module.store.write_json(path / "taxonomy.json", taxonomy)
+        pdf_path = path / "papers" / "preview.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        app_module.store.write_json(
+            path / "papers/logs/manifest.json",
+            {
+                "candidates": [
+                    {
+                        "title": "Preview Paper",
+                        "year": 2026,
+                        "doi": "10.1000/preview",
+                        "download": {"status": "downloaded", "path": str(pdf_path)},
+                    }
+                ]
+            },
+        )
+
+        response = self.client.post(
+            f"/api/projects/{project_id}/extraction/prompt-preview",
+            json={"max_features_per_pdf": 7},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["attachment_filename"], "preview.pdf")
+        self.assertIn("taxonomy extraction agent", payload["system_prompt"])
+        self.assertIn("Preview Paper", payload["user_prompt"])
+        self.assertIn("prompt_family", payload["user_prompt"])
+        self.assertIn("Return at most 7 features from this PDF", payload["user_prompt"])
 
     def test_relevance_scoring_profile_lifecycle_and_harvest_config(self):
         project = self.client.post("/api/projects", json={"name": "Relevance"}).json()

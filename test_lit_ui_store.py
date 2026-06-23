@@ -24,6 +24,25 @@ class ProjectStoreTests(unittest.TestCase):
             restarted = ProjectStore(Path(temp))
             self.assertEqual(restarted.get_job(second["id"])["status"], "interrupted")
 
+    def test_delete_project_removes_record_and_files_after_jobs_finish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = ProjectStore(Path(temp))
+            project = store.create_project("Delete Me")
+            path = Path(temp) / project["slug"]
+            job = store.create_job(project["id"], "search", path / "jobs" / "job.log")
+
+            with self.assertRaises(ValueError):
+                store.delete_project(project["id"])
+            self.assertTrue(path.exists())
+
+            store.update_job(job["id"], status="completed")
+            deleted = store.delete_project(project["id"])
+
+            self.assertEqual(deleted["id"], project["id"])
+            self.assertFalse(path.exists())
+            with self.assertRaises(KeyError):
+                store.get_project(project["id"])
+
 
 if __name__ == "__main__":
     unittest.main()

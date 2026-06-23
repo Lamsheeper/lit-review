@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -144,6 +145,24 @@ class ProjectStore:
         self.write_json(self.project_dir(project_id) / "project.json", project)
         return project
 
+    def delete_project(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        active = self.active_job(project_id)
+        if active:
+            raise ValueError(f"Project has an active {active['kind']} job.")
+
+        path = (self.root / project["slug"]).resolve()
+        if path == self.root or self.root not in path.parents:
+            raise ValueError("Refusing to delete a project outside the projects directory.")
+
+        with self.connect() as conn:
+            conn.execute("DELETE FROM jobs WHERE project_id=?", (project_id,))
+            conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+
+        if path.exists():
+            shutil.rmtree(path)
+        return project
+
     def touch_project(self, project_id: str) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE projects SET updated_at=? WHERE id=?", (utc_now(), project_id))
@@ -228,4 +247,3 @@ class ProjectStore:
                 (project_id,),
             ).fetchall()
         return [dict(row) for row in rows]
-

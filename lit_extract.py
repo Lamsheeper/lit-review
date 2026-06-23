@@ -43,6 +43,10 @@ PROMPT_VERSION = "lit_extract_v1"
 ANNOTATION_PROMPT_VERSION = "lit_extract_annotation_v5"
 SCORING_PROMPT_VERSION = "lit_extract_scoring_v1"
 LOGGER = logging.getLogger("litextract")
+PDF_EXTRACTION_SYSTEM_PROMPT = (
+    "You are an evidence-bound taxonomy extraction agent. Return only "
+    "valid JSON. Extract named feature mentions from academic PDFs."
+)
 PDF_INPUT_MAX_BYTES = 50 * 1024 * 1024
 
 CATEGORIES = {"persuasion", "moral_framing", "sentiment_affect"}
@@ -2013,10 +2017,7 @@ def build_pdf_extraction_messages(
     return [
         {
             "role": "system",
-            "content": (
-                "You are an evidence-bound taxonomy extraction agent. Return only "
-                "valid JSON. Extract named feature mentions from academic PDFs."
-            ),
+            "content": PDF_EXTRACTION_SYSTEM_PROMPT,
         },
         {
             "role": "user",

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +13,17 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
-from lit_extract import make_llm_client
+from lit_extract import (
+    PDF_EXTRACTION_SYSTEM_PROMPT,
+    build_pdf_extraction_prompt,
+    load_goal_text,
+    make_llm_client,
+)
 from lit_harvest import candidate_from_dict, stable_candidate_id
+from lit_pdf_service import prepare_direct_pdf_index
 from lit_relevance import validate_relevance_profile
 from lit_synthesize import extract_json_object
-from lit_taxonomy import validate_taxonomy
+from lit_taxonomy import load_taxonomy, validate_taxonomy
 
 from .jobs import JobManager
 from .store import ProjectStore
@@ -390,6 +397,17 @@ def update_project(project_id: str, payload: ProjectUpdate) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str) -> dict[str, Any]:
+    try:
+        project = store.delete_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Project not found.") from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"deleted": True, "project": {"id": project["id"], "name": project["name"]}}
+
+
 @app.get("/api/projects/{project_id}/documents")
 def get_documents(project_id: str) -> dict[str, str]:
     path = project_dir(project_id)
@@ -705,6 +723,51 @@ def save_extraction_config(project_id: str, payload: ExtractionConfig) -> dict[s
     path = project_dir(project_id) / "configs/extraction.json"
     write_config(path, payload.model_dump())
     return read_json(path)
+
+
+@app.post("/api/projects/{project_id}/extraction/prompt-preview")
+def preview_extraction_prompt(project_id: str, payload: ExtractionConfig) -> dict[str, Any]:
+    path = project_dir(project_id)
+    goal_path = path / "goal.md"
+    taxonomy_path = path / "taxonomy.json"
+    if not taxonomy_path.exists():
+        raise HTTPException(422, "Define a valid taxonomy first.")
+    if not goal_path.exists() or not goal_path.read_text(encoding="utf-8").strip():
+        raise HTTPException(422, "Define an extraction goal first.")
+
+    try:
+        taxonomy = load_taxonomy(taxonomy_path)
+        goal_text, _ = load_goal_text(goal_path)
+        manifest_path = path / "papers/logs/manifest.json"
+        with tempfile.TemporaryDirectory(prefix="lit-review-prompt-") as temp:
+            paper_index = prepare_direct_pdf_index(
+                path / "papers",
+                manifest_path if manifest_path.exists() else None,
+                Path(temp),
+            )
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    papers = [
+        paper for paper in paper_index.get("papers", [])
+        if isinstance(paper, dict) and paper.get("pdf_path")
+    ]
+    if not papers:
+        raise HTTPException(422, "Download at least one full PDF first.")
+    paper = papers[0]
+    return {
+        "system_prompt": PDF_EXTRACTION_SYSTEM_PROMPT,
+        "user_prompt": build_pdf_extraction_prompt(
+            paper,
+            goal_text=goal_text,
+            max_features_per_pdf=payload.max_features_per_pdf,
+            taxonomy=taxonomy,
+        ),
+        "attachment_filename": Path(str(paper.get("pdf_path") or "")).name,
+        "paper": paper,
+        "paper_count": len(papers),
+        "max_features_per_pdf": payload.max_features_per_pdf,
+    }
 
 
 @app.post("/api/projects/{project_id}/extraction/run")

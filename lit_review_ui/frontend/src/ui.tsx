@@ -6,9 +6,9 @@ import CodeMirror from "@uiw/react-codemirror";
 import { markdown } from "@codemirror/lang-markdown";
 import ReactMarkdown from "react-markdown";
 import { createColumnHelper, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, ChevronDown, Download, FileSearch, LoaderCircle, Plus, Save, Sparkles, Square, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, ChevronDown, Download, Eye, FileSearch, LoaderCircle, Plus, Save, Sparkles, Square, Trash2, X } from "lucide-react";
 import clsx from "clsx";
-import { api, Family, Job, json, Project, RelevanceProfile, Taxonomy, Workflow, WorkflowStep } from "./api";
+import { api, ExtractionPromptPreview, Family, Job, json, Project, RelevanceProfile, Taxonomy, Workflow, WorkflowStep } from "./api";
 
 export function AppShell() {
   return (
@@ -63,6 +63,10 @@ export function ProjectsPage() {
     mutationFn: () => api<Project>("/api/projects", json("POST", { name })),
     onSuccess: (project) => { client.invalidateQueries({ queryKey: ["projects"] }); navigate(`/projects/${project.id}`); },
   });
+  const deleteProject = useMutation({
+    mutationFn: (project: Project) => api<{ deleted: boolean }>(`/api/projects/${project.id}`, { method: "DELETE" }),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["projects"] }),
+  });
   return <main className="mx-auto max-w-7xl px-6 py-14">
     <div className="grid gap-12 lg:grid-cols-[1fr_420px]">
       <section>
@@ -70,12 +74,18 @@ export function ProjectsPage() {
         <h1 className="mt-3 text-4xl font-semibold tracking-tight text-slate-950">From a broad question to evidence-backed features.</h1>
         <p className="mt-4 max-w-2xl text-slate-600">Define a taxonomy, choose the literature that matters, and extract features directly from full PDFs.</p>
         <div className="mt-9 grid gap-4 md:grid-cols-2">
-          {(projects.data || []).map((project) => <Link className="card group" to={`/projects/${project.id}`} key={project.id}>
-            <div className="flex items-start justify-between"><h2 className="text-lg font-semibold group-hover:text-blue-700">{project.name}</h2><span className="badge">{project.progress.downloaded} PDFs</span></div>
-            <p className="mt-2 line-clamp-2 text-sm text-slate-500">{project.description || "No description yet."}</p>
-            <Progress project={project} />
-          </Link>)}
+          {(projects.data || []).map((project) => <article className="card" key={project.id}>
+            <Link className="block group" to={`/projects/${project.id}`}>
+              <div className="flex items-start justify-between gap-4"><h2 className="text-lg font-semibold group-hover:text-blue-700">{project.name}</h2><span className="badge">{project.progress.downloaded} PDFs</span></div>
+              <p className="mt-2 line-clamp-2 text-sm text-slate-500">{project.description || "No description yet."}</p>
+              <Progress project={project} />
+            </Link>
+            <div className="mt-5 flex justify-end border-t border-slate-100 pt-4">
+              <button className="button-secondary border-red-100 text-red-700 hover:border-red-200 hover:bg-red-50" disabled={deleteProject.isPending} onClick={() => { if (window.confirm(`Delete "${project.name}" and its local files?`)) deleteProject.mutate(project); }}><Trash2 size={14} /> Delete</button>
+            </div>
+          </article>)}
         </div>
+        <Error mutation={deleteProject} />
       </section>
       <aside className="card h-fit bg-slate-950 text-white">
         <p className="text-xs font-semibold uppercase tracking-[.2em] text-blue-300">Start a project</p>
@@ -276,12 +286,17 @@ function Extract({ projectId, status, onNext }: { projectId: string; status: Wor
   const client = useQueryClient();
   const config = useQuery({ queryKey: ["extractConfig", projectId], queryFn: () => api<Record<string, any>>(`/api/projects/${projectId}/extraction/config`) });
   const [value, setValue] = useState<Record<string, any>>({});
+  const [promptPreview, setPromptPreview] = useState<ExtractionPromptPreview | null>(null);
   const candidates = useQuery({ queryKey: ["extractCandidateCounts", projectId], queryFn: () => api<{ items: Candidate[]; total: number }>(`/api/projects/${projectId}/collection/candidates?page_size=500`) });
   useEffect(() => { if (config.data) setValue(config.data); }, [config.data]);
   const save = useMutation({ mutationFn: () => api(`/api/projects/${projectId}/extraction/config`, json("PUT", value)) });
   const run = useMutation({ mutationFn: async () => { await save.mutateAsync(); return api<Job>(`/api/projects/${projectId}/extraction/run`, { method: "POST" }); }, onSuccess: () => client.invalidateQueries({ queryKey: ["workflow", projectId] }) });
+  const preview = useMutation({
+    mutationFn: () => api<ExtractionPromptPreview>(`/api/projects/${projectId}/extraction/prompt-preview`, json("POST", value)),
+    onSuccess: (data) => setPromptPreview(data),
+  });
   const set = (key: string, next: any) => setValue({ ...value, [key]: next });
-  return <section className="stage"><StepHeader eyebrow="Step 4 · Direct PDF extraction" title="Extract raw features from the selected full PDFs." description="This runs lightweight direct-PDF preparation followed by evidence-bound feature extraction. No Markdown conversion, chunk indexing, or curation is performed." status={status} onNext={onNext} action={<button className="button-primary" disabled={run.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => run.mutate()}>{run.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <Sparkles size={16} />} Extract raw features</button>} />
+  return <section className="stage"><StepHeader eyebrow="Step 4 · Direct PDF extraction" title="Extract raw features from the selected full PDFs." description="This runs lightweight direct-PDF preparation followed by evidence-bound feature extraction. No Markdown conversion, chunk indexing, or curation is performed." status={status} onNext={onNext} action={<><button className="button-secondary" disabled={preview.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => preview.mutate()}>{preview.isPending ? <LoaderCircle className="animate-spin" size={16} /> : <Eye size={16} />} View prompt</button><button className="button-primary" disabled={run.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => run.mutate()}>{run.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <Sparkles size={16} />} Extract raw features</button></>} />
     <div className="grid gap-5 lg:grid-cols-[1fr_420px]"><div className="card"><div className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900"><strong>Input mode: Direct PDF.</strong> The lightweight preparation step creates only the paper index required by extraction.<div className="mt-2 text-xs font-semibold">{candidates.data?.items.filter(row => row.selected).length || 0} selected · {candidates.data?.items.filter(row => ["downloaded", "already_exists"].includes(row.download_status)).length || 0} downloaded</div></div><div className="form-grid mt-6">
       <Field label="Provider"><select className="input" value={value.provider || "gemini"} onChange={(e) => set("provider", e.target.value)}><option value="gemini">Gemini</option><option value="openai">OpenAI-compatible</option></select></Field>
       <Field label="Model"><input className="input" value={value.model || ""} onChange={(e) => set("model", e.target.value)} /></Field>
@@ -289,7 +304,17 @@ function Extract({ projectId, status, onNext }: { projectId: string; status: Wor
       <Field label="Maximum features per PDF"><input className="input" type="number" value={value.max_features_per_pdf || 40} onChange={(e) => set("max_features_per_pdf", Number(e.target.value))} /></Field>
       <Field label="Temperature"><input className="input" type="number" step=".1" value={value.temperature ?? .1} onChange={(e) => set("temperature", Number(e.target.value))} /></Field>
       <Field label="Timeout seconds"><input className="input" type="number" value={value.timeout || 600} onChange={(e) => set("timeout", Number(e.target.value))} /></Field>
-    </div><details className="details"><summary>Advanced transport <ChevronDown size={15} /></summary><Field label="Base URL"><input className="input mt-3" placeholder="Use provider default" value={value.base_url || ""} onChange={(e) => set("base_url", e.target.value)} /></Field></details><Error mutation={run} /></div><JobPanel projectId={projectId} kind="direct_pdf_extraction" /></div>
+    </div><details className="details"><summary>Advanced transport <ChevronDown size={15} /></summary><Field label="Base URL"><input className="input mt-3" placeholder="Use provider default" value={value.base_url || ""} onChange={(e) => set("base_url", e.target.value)} /></Field></details><Error mutation={preview} /><Error mutation={run} /></div><JobPanel projectId={projectId} kind="direct_pdf_extraction" /></div>
+    {promptPreview && <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/30" onClick={() => setPromptPreview(null)}><aside className="h-full w-full max-w-4xl overflow-auto bg-white p-8 shadow-2xl" onClick={event => event.stopPropagation()}>
+      <button className="icon-button float-right" onClick={() => setPromptPreview(null)}><X size={18} /></button>
+      <p className="eyebrow">Direct PDF extraction</p>
+      <h2 className="mt-3 text-2xl font-semibold">Feature extraction prompt</h2>
+      <div className="mt-4 flex flex-wrap gap-2"><span className="badge">{promptPreview.attachment_filename}</span><span className="badge">{promptPreview.paper_count} eligible PDFs</span><span className="badge">{promptPreview.max_features_per_pdf} max features</span></div>
+      <div className="mt-7 space-y-5">
+        <section><h3 className="label">System message</h3><pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950 p-4 text-xs leading-5 text-slate-100">{promptPreview.system_prompt}</pre></section>
+        <section><h3 className="label">User message</h3><pre className="mt-2 max-h-[70vh] overflow-auto whitespace-pre-wrap break-words rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-700">{promptPreview.user_prompt}</pre></section>
+      </div>
+    </aside></div>}
   </section>;
 }
 

@@ -49,6 +49,15 @@ export type Workflow = {
   steps: Record<"define" | "collect" | "candidates" | "extract" | "results", WorkflowStep>;
 };
 
+export type ExtractionPromptPreview = {
+  system_prompt: string;
+  user_prompt: string;
+  attachment_filename: string;
+  paper: Record<string, any>;
+  paper_count: number;
+  max_features_per_pdf: number;
+};
+
 export type Family = { id: string; label: string; description: string; aliases: string[] };
 export type Taxonomy = { version: 1; title: string; families: Family[] };
 export type RelevanceProfile = {
