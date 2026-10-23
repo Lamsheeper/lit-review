@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "output_root": "../../runs/review",
+  "inputs": {
+    "papers": "../fixtures/papers",
+    "goal": "../fixtures/goal.md"
+  },
+  "stages": [
+    {
+      "id": "convert",
+      "operation": "evidence.convert"
+    },
+    {
+      "id": "index",
+      "operation": "evidence.index",
+      "options": {
+        "chunk_words": 100,
+        "overlap_words": 10,
+        "min_chunk_words": 5
+      }
+    },
+    {
+      "id": "write",
+      "operation": "evidence.write"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+include README.md pyproject.toml uv.lock scripts/verify_release.py
+recursive-include src/lit_review *.py
+recursive-include src/lit_review/ui/frontend/dist *
+recursive-include examples *.json *.jsonl *.md *.pdf
+recursive-include tests *.py
+recursive-include sanity_checks *.csv *.md *.py
+include docs/architecture.md docs/migration.md docs/workflows.md docs/development.md
+recursive-include docs/assets *.gif *.png
+include scripts/render_readme.py
+prune src/lit_review/ui/frontend/node_modules
+prune src/lit_review/ui/frontend/src
+prune docs/history
+prune collected_media_attribute_papers_v3
+prune review_runs
+prune faculty_publications
+global-exclude __pycache__ *.py[cod] .DS_Store

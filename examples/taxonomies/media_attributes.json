@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "title": "Media attributes",
+  "families": [
+    {
+      "id": "persuasion",
+      "label": "Persuasion techniques",
+      "description": "Named rhetorical and persuasive techniques.",
+      "aliases": []
+    },
+    {
+      "id": "moral_framing",
+      "label": "Moral frames",
+      "description": "Annotatable moral-frame classes.",
+      "aliases": []
+    },
+    {
+      "id": "sentiment_affect",
+      "label": "Affective states",
+      "description": "Specific emotions and felt affective states.",
+      "aliases": []
+    }
+  ]
+}

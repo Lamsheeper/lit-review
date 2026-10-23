@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="330" viewBox="0 0 900 330" role="img" aria-labelledby="title desc">
+  <title id="title">Selected feature-count milestones</title>
+  <desc id="desc">Bars compare counts from distinct pipeline stages; they are not one monotonic run.</desc>
+  <rect width="900" height="330" fill="white"/>
+  <g font-family="Arial, sans-serif">
+    <text x="25" y="30" font-size="20" font-weight="bold">Selected feature-count milestones</text>
+    <text x="25" y="52" font-size="12" fill="#555">Separate historical runs; labels identify the relevant stage.</text>
+    <g font-size="13" fill="#222">
+      <text x="25" y="91">Early top-~300 raw (slides)</text><rect x="240" y="76" width="607" height="19" fill="#7aa6d8"/><text x="855" y="91">3,035</text>
+      <text x="25" y="128">v3 c2 annotation-retained</text><rect x="240" y="113" width="453" height="19" fill="#6f8fc4"/><text x="701" y="128">2,265</text>
+      <text x="25" y="165">Historical keyword curated</text><rect x="240" y="150" width="414" height="19" fill="#62a879"/><text x="662" y="165">2,071</text>
+      <text x="25" y="202">Annotated retained set</text><rect x="240" y="187" width="329" height="19" fill="#9575bd"/><text x="577" y="202">1,646</text>
+      <text x="25" y="239">v3 LLM-merged output</text><rect x="240" y="224" width="283" height="19" fill="#d07b69"/><text x="531" y="239">1,416</text>
+      <text x="25" y="276">Citation-route curated</text><rect x="240" y="261" width="87" height="19" fill="#d4a743"/><text x="335" y="276">433</text>
+    </g>
+    <line x1="240" y1="296" x2="847" y2="296" stroke="#333"/>
+    <g font-size="11" fill="#555" text-anchor="middle"><text x="240" y="313">0</text><text x="442" y="313">1,000</text><text x="644" y="313">2,000</text><text x="847" y="313">3,000</text></g>
+  </g>
+</svg>

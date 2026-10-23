@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "output_root": "../../runs/analysis",
+  "stages": [
+    {
+      "id": "comparison",
+      "operation": "analysis.compare",
+      "options": {
+        "feature_set_1": "../fixtures/features_a.jsonl",
+        "feature_set_2": "../fixtures/features_b.jsonl",
+        "label_1": "Reference",
+        "label_2": "Expanded"
+      }
+    }
+  ]
+}

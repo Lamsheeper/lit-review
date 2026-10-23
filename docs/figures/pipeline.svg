@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="210" viewBox="0 0 1100 210" role="img" aria-labelledby="title desc">
+  <title id="title">Literature review pipeline</title>
+  <desc id="desc">A seven-stage flow from research scope through knowledge graph extension.</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#52606d"/></marker></defs>
+  <rect width="1100" height="210" rx="14" fill="#f7f9fc"/>
+  <g font-family="Arial, sans-serif" font-size="15" text-anchor="middle">
+    <g fill="#e7f0ff" stroke="#3568a8"><rect x="25" y="65" width="125" height="75" rx="10"/><text x="87" y="95"><tspan x="87">Define three</tspan><tspan x="87" dy="20">families</tspan></text></g>
+    <g fill="#e8f6ef" stroke="#287a50"><rect x="180" y="65" width="125" height="75" rx="10"/><text x="242" y="95"><tspan x="242">Harvest papers</tspan><tspan x="242" dy="20">by two routes</tspan></text></g>
+    <g fill="#fff3da" stroke="#a66b00"><rect x="335" y="65" width="125" height="75" rx="10"/><text x="397" y="95"><tspan x="397">Extract from</tspan><tspan x="397" dy="20">full PDFs</tspan></text></g>
+    <g fill="#f4eaff" stroke="#7750a8"><rect x="490" y="65" width="125" height="75" rx="10"/><text x="552" y="95"><tspan x="552">Curate and</tspan><tspan x="552" dy="20">annotate</tspan></text></g>
+    <g fill="#ffe9e5" stroke="#a84b3b"><rect x="645" y="65" width="125" height="75" rx="10"/><text x="707" y="95"><tspan x="707">Embed and</tspan><tspan x="707" dy="20">merge</tspan></text></g>
+    <g fill="#e8f7f8" stroke="#23777c"><rect x="800" y="65" width="125" height="75" rx="10"/><text x="862" y="95"><tspan x="862">Generate and</tspan><tspan x="862" dy="20">validate</tspan></text></g>
+    <g fill="#f1f1f1" stroke="#555"><rect x="955" y="65" width="120" height="75" rx="10"/><text x="1015" y="95"><tspan x="1015">Map to</tspan><tspan x="1015" dy="20">Wikidata</tspan></text></g>
+    <g stroke="#52606d" stroke-width="2" marker-end="url(#arrow)"><line x1="150" y1="102" x2="177" y2="102"/><line x1="305" y1="102" x2="332" y2="102"/><line x1="460" y1="102" x2="487" y2="102"/><line x1="615" y1="102" x2="642" y2="102"/><line x1="770" y1="102" x2="797" y2="102"/><line x1="925" y1="102" x2="952" y2="102"/></g>
+  </g>
+</svg>

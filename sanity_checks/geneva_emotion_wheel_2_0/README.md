@@ -23,25 +23,15 @@ Sources:
   Rating Study*. University of Geneva, Swiss Center for Affective Sciences:
   <https://www.unige.ch/cisa/download_file/view/136/245>
 
-Run a distinct-feature-only experiment:
+Preview a name-only calibration experiment through the consolidated toolkit:
 
 ```bash
-uv run known-feature-similarity \
-  sanity_checks/geneva_emotion_wheel_2_0/expected_features.csv \
-  --annotated-features review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
-  --text-fields feature_name \
-  --distinct-only \
-  --output-dir review_runs/known_feature_similarity/geneva_emotion_wheel_2_0/name_only
+uv run lit-review analysis calibrate \
+  --output-root runs/benchmarks/geneva_emotion_wheel_2_0 \
+  --set known_set=sanity_checks/geneva_emotion_wheel_2_0/expected_features.csv \
+  --set text_fields=feature_name \
+  --set distinct_only=true \
+  --dry-run
 ```
 
-Run an experiment using names, definitions, and synonyms. The command
-automatically starts or resumes the required human synonym review:
-
-```bash
-uv run known-feature-similarity \
-  sanity_checks/geneva_emotion_wheel_2_0/expected_features.csv \
-  --annotated-features review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
-  --text-fields feature_name,definitions,synonyms \
-  --synonym-review review_runs/known_feature_similarity/geneva_emotion_wheel_2_0/expected_features_synonym_review.json \
-  --output-dir review_runs/known_feature_similarity/geneva_emotion_wheel_2_0/name_def_synonyms
-```
+Remove `--dry-run` to execute with configured embedding credentials. For approved synonym controls and attribute-combination experiments, see [analysis configuration](../../docs/workflows.md#analysis). Source-related labels in this inventory remain provenance, not automatically approved synonyms.

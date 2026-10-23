@@ -4,44 +4,44 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lit-review"
-version = "0.1.0"
-description = "API-first literature collection and evidence-bound review synthesis tools."
+version = "0.2.0"
+description = "Evidence-backed literature collection, feature discovery, and taxonomy analysis."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "certifi>=2024.8.30",
     "fastapi>=0.115.0",
-    "matplotlib>=3.8.0",
+    "pydantic>=2.0",
     "numpy>=2.0.0",
     "pypdf>=5.0.0",
     "PyMuPDF>=1.24.0",
-    "scikit-learn>=1.5.0",
     "tqdm>=4.66.0",
     "uvicorn>=0.34.0",
 ]
 
 [project.optional-dependencies]
-dev = ["httpx>=0.28.0"]
+analysis = ["matplotlib>=3.8.0", "scikit-learn>=1.5.0"]
+dev = ["httpx>=0.28.0", "build>=1.2", "ruff>=0.11", "setuptools>=68", "wheel", "pillow>=10"]
 
 [project.scripts]
-lit-harvest = "lit_harvest:main"
-lit-extract = "lit_extract:main"
-lit-log-summary = "lit_log_summary:main"
-lit-synthesize = "lit_synthesize:main"
-comparison-plots = "comparison_plots:main"
-feature-embedding-tsne = "feature_embedding_tsne:main"
-feature-embedding-metadata = "feature_embedding_metadata:main"
-embedding-merge = "embedding_merge:main"
-known-feature-similarity = "known_feature_similarity:main"
-lit-review-ui = "lit_review_ui.app:main"
+lit-review = "lit_review.cli:main"
 
 [tool.setuptools]
-py-modules = ["comparison_plots", "embedding_merge", "feature_embedding_metadata", "feature_embedding_tsne", "known_feature_similarity", "lit_extract", "lit_harvest", "lit_log_summary", "lit_pdf_service", "lit_relevance", "lit_synthesize", "lit_taxonomy"]
+include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["lit_review_ui*"]
+where = ["src"]
+include = ["lit_review*"]
+exclude = ["*.node_modules*", "*.frontend*"]
 
 [tool.setuptools.package-data]
-lit_review_ui = ["frontend/dist/**"]
+"lit_review.ui" = ["frontend/dist/**"]
 
 [tool.uv]
 package = true
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["F"]

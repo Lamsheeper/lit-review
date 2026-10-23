@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "output_root": "../../runs/collection",
+  "inputs": {
+    "draft": "../fixtures/draft.md"
+  },
+  "stages": [
+    {
+      "id": "collect",
+      "operation": "collect.search",
+      "options": {
+        "max_queries": 2,
+        "top_k_per_query": 3,
+        "max_downloads": 3,
+        "allow_abstract_fallback": false
+      }
+    },
+    {
+      "id": "summary",
+      "operation": "collect.summary"
+    }
+  ]
+}

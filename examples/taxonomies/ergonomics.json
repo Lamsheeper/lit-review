@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "title": "Workplace ergonomics",
+  "families": [
+    {
+      "id": "ergonomics",
+      "label": "Ergonomic factors",
+      "description": "Named posture and workstation factors observable during seated work.",
+      "aliases": [
+        "posture"
+      ]
+    }
+  ]
+}

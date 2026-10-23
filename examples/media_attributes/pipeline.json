@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "output_root": "../../runs/media_attributes",
+  "inputs": {
+    "papers": "../fixtures/papers",
+    "taxonomy": "../taxonomies/media_attributes.json",
+    "goal": "goal.md"
+  },
+  "providers": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash",
+    "api_key_env": "GEMINI_API_KEY"
+  },
+  "stages": [
+    {
+      "id": "prepare",
+      "operation": "evidence.prepare"
+    },
+    {
+      "id": "extract",
+      "operation": "features.extract"
+    },
+    {
+      "id": "filter",
+      "operation": "features.filter"
+    },
+    {
+      "id": "annotate",
+      "operation": "features.annotate"
+    },
+    {
+      "id": "merge",
+      "operation": "features.merge"
+    }
+  ],
+  "profile": "media_attributes"
+}

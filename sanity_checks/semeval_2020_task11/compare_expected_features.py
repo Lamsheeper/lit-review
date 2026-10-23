@@ -14,19 +14,11 @@ from typing import Any
 
 DEFAULT_EXPECTED = Path("sanity_checks/semeval_2020_task11/expected_features.csv")
 DEFAULT_FEATURE_CANDIDATES = [
-    Path(
-        "review_runs/semeval_2020_task11_sanity/feature_extract_pdf/"
-        "final_curated_features_llm_top100_by_category.jsonl"
-    ),
-    Path(
-        "review_runs/semeval_2020_task11_sanity/feature_extract_pdf/"
-        "final_curated_features_llm_top100_by_category.csv"
-    ),
-    Path(
-        "review_runs/semeval_2020_task11_sanity/feature_extract_pdf/"
-        "final_curated_features_top100_by_category.csv"
-    ),
+    Path("runs/media_attributes/stages/merge/llm_merged_features.jsonl"),
+    Path("runs/media_attributes/stages/filter/filtered_features.jsonl"),
+    Path("runs/media_attributes/stages/extract/features.jsonl"),
 ]
+
 NAME_FIELDS = (
     "feature_name",
     "normalized_feature_name",
@@ -134,7 +126,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--features",
         type=Path,
         default=default_features_path(),
-        help="Final feature CSV or JSONL to compare. Defaults to the SemEval PDF final output.",
+        help="Final feature CSV or JSONL to compare. Defaults to the current media-profile merged output.",
     )
     parser.add_argument(
         "--show-unmatched",
@@ -172,7 +164,9 @@ def main(argv: list[str] | None = None) -> int:
             overlap = set(item["aliases"]) & terms
             if overlap:
                 label_alias = normalize(row_label(row))
-                alias = label_alias if label_alias in overlap else sorted(overlap, key=lambda x: (-len(x), x))[0]
+                alias = (
+                    label_alias if label_alias in overlap else sorted(overlap, key=lambda x: (-len(x), x))[0]
+                )
                 found = (row, alias)
                 break
         if found:

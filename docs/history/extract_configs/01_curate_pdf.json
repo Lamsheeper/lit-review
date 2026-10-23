@@ -1,0 +1,13 @@
+{
+  "command": "curate",
+  "input_dir": "review_runs/media_attributes_v3/feature_extract_pdf",
+  "output_dir": "review_runs/media_attributes_v3/feature_extract_pdf",
+  "goal": "goal.md",
+  "api_key_env": "GEMINI_API_KEY",
+  "model": "gemini-3.5-flash",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+  "reasoning_effort": "low",
+  "batch_features": 40,
+  "merge_style": "moderate",
+  "temperature": 0.1
+}

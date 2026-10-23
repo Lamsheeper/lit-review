@@ -13,12 +13,15 @@ Source:
   Rating Study*. University of Geneva, Swiss Center for Affective Sciences:
   <https://www.unige.ch/cisa/download_file/view/136/245>
 
-Run the full attribute comparison. It automatically starts or resumes the
-durable human synonym review before continuing:
+Preview a name-only calibration experiment through the consolidated toolkit:
 
 ```bash
-uv run known-feature-similarity \
-  sanity_checks/geneva_emotion_wheel_1_0/expected_features.csv \
-  --embed-attribute-comparison \
-  --output-dir review_runs/known_feature_similarity/geneva_emotion_wheel_1_0
+uv run lit-review analysis calibrate \
+  --output-root runs/benchmarks/geneva_emotion_wheel_1_0 \
+  --set known_set=sanity_checks/geneva_emotion_wheel_1_0/expected_features.csv \
+  --set text_fields=feature_name \
+  --set distinct_only=true \
+  --dry-run
 ```
+
+Remove `--dry-run` to execute with configured embedding credentials. For approved synonym controls and attribute-combination experiments, see [analysis configuration](../../docs/workflows.md#analysis). Source-related labels in this inventory remain provenance, not automatically approved synonyms.

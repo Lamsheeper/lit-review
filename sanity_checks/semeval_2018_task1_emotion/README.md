@@ -31,25 +31,15 @@ Source:
 - ACL Anthology: <https://aclanthology.org/S18-1001/>
 - DOI: <https://doi.org/10.18653/v1/S18-1001>
 
-Run a name-only experiment:
+Preview a name-only calibration experiment through the consolidated toolkit:
 
 ```bash
-uv run known-feature-similarity \
-  sanity_checks/semeval_2018_task1_emotion/expected_features.csv \
-  --annotated-features review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
-  --text-fields feature_name \
-  --distinct-only \
-  --output-dir review_runs/known_feature_similarity/semeval_2018_task1_emotion/name_only
+uv run lit-review analysis calibrate \
+  --output-root runs/benchmarks/semeval_2018_task1_emotion \
+  --set known_set=sanity_checks/semeval_2018_task1_emotion/expected_features.csv \
+  --set text_fields=feature_name \
+  --set distinct_only=true \
+  --dry-run
 ```
 
-Run an experiment using names, definitions, and synonyms. The command
-automatically starts or resumes the required human synonym review:
-
-```bash
-uv run known-feature-similarity \
-  sanity_checks/semeval_2018_task1_emotion/expected_features.csv \
-  --annotated-features review_runs/media_attributes_v3/feature_extract_pdf/annotated/annotated_features.json \
-  --text-fields feature_name,definitions,synonyms \
-  --synonym-review review_runs/known_feature_similarity/semeval_2018_task1_emotion/expected_features_synonym_review.json \
-  --output-dir review_runs/known_feature_similarity/semeval_2018_task1_emotion/name_def_synonyms
-```
+Remove `--dry-run` to execute with configured embedding credentials. For approved synonym controls and attribute-combination experiments, see [analysis configuration](../../docs/workflows.md#analysis). Source-related labels in this inventory remain provenance, not automatically approved synonyms.

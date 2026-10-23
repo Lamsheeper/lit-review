@@ -1,0 +1,22 @@
+{
+  "command": "merge",
+  "input_file": "review_runs/media_attributes_v3/feature_extract_pdf-c2/annotated/annotated_features.json",
+  "output_dir": "review_runs/media_attributes_v3/feature_extract_pdf-c2/llm_merge",
+  "goal": "goal.md",
+  "api_key_env": "GEMINI_API_KEY",
+  "embedding_api_key_env": "GEMINI_API_KEY",
+  "model": "gemini-3.5-flash",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "api_provider": "gemini",
+  "reasoning_effort": "low",
+  "category_config": "merge_configs/v1.json",
+  "top_k": 10,
+  "batch_pairs": 25,
+  "embedding_model": "gemini-embedding-001",
+  "embedding_task_type": "CLUSTERING",
+  "embedding_output_dimensionality": 768,
+  "embedding_batch_size": 100,
+  "temperature": 0.0,
+  "max_tokens": 6000,
+  "timeout": 600
+}
