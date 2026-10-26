@@ -1,4 +1,4 @@
-# Discovering features from existing literature
+# Discovering features from literature collection
 
 Collect research papers and build a feature inventory with definitions and supporting evidence.
 
