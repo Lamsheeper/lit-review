@@ -2,7 +2,7 @@
 
 Collect research papers and build a feature inventory with definitions and supporting evidence.
 
-![A research question moves through paper collection, PDF selection, extraction, filtering, annotation, merging, and inventory export.](docs/assets/workflow.gif)
+![The question “What emotions are described in psychology research?” stays visible through collection, PDF selection, extraction, filtering, annotation, and merging into an emotion inventory.](docs/assets/workflow.gif)
 
 ## Install and open the UI
 
