@@ -13,6 +13,12 @@ import zipfile
 from pathlib import Path
 
 
+def create_environment(path: Path) -> Path:
+    # A copied uv-managed Python 3.10 binary can lose its stdlib path on Linux.
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(path)
+    return path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
 def verify_wheel(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -45,8 +51,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="lit-review-release-") as temporary:
         root = Path(temporary).resolve()
         environment = root / "environment"
-        venv.EnvBuilder(with_pip=False).create(environment)
-        python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        python = create_environment(environment)
         subprocess.run(
             ["uv", "pip", "install", "--python", str(python), "--no-deps", str(wheel)], check=True, cwd=root
         )
