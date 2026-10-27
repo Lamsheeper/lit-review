@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import urllib.error
@@ -17,6 +16,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
+
+from lit_review.core.google_auth import ADCAuth, use_vertex, vertex_model_url
 
 from lit_review.profiles.embedding_cleanup import EMBEDDING_TEXT_CLEANUP_BUILTINS
 
@@ -135,6 +136,8 @@ class VertexEmbeddingClient:
         output_dimensionality: int,
         timeout: float,
     ) -> None:
+        self.url = vertex_model_url(project, location, model) + ":predict"
+        self.auth = ADCAuth()
         self.project = project.strip()
         self.location = location.strip()
         self.model = model_resource_name(model).removeprefix("models/")
@@ -143,32 +146,11 @@ class VertexEmbeddingClient:
         self.timeout = timeout
 
     def access_token(self) -> str:
-        try:
-            result = subprocess.run(
-                ["gcloud", "auth", "application-default", "print-access-token"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-            detail = getattr(exc, "stderr", "") or str(exc)
-            raise RuntimeError(
-                "Vertex AI authentication failed. Run "
-                "`gcloud auth application-default login` and try again: "
-                f"{detail.strip()}"
-            ) from exc
-        token = result.stdout.strip()
-        if not token:
-            raise RuntimeError("Vertex AI authentication returned an empty access token.")
-        return token
+        # Kept for callers that used the original Vertex client helper.
+        return self.auth.headers(self.url)["authorization"].removeprefix("Bearer ")
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        token = self.access_token()
-        url = (
-            f"https://{self.location}-aiplatform.googleapis.com/v1/projects/"
-            f"{self.project}/locations/{self.location}/publishers/google/models/"
-            f"{self.model}:predict"
-        )
+        url = self.url
         values: list[list[float]] = []
         # Vertex currently accepts one input per request for gemini-embedding-001.
         for text in texts:
@@ -180,7 +162,7 @@ class VertexEmbeddingClient:
                 url,
                 data=json.dumps(payload).encode("utf-8"),
                 headers={
-                    "Authorization": f"Bearer {token}",
+                    **self.auth.headers(url),
                     "Content-Type": "application/json; charset=utf-8",
                 },
                 method="POST",
@@ -202,6 +184,33 @@ class VertexEmbeddingClient:
                 raise RuntimeError(f"Unexpected Vertex AI embeddings response: {data}")
             values.append([float(value) for value in vector])
         return values
+
+
+def make_embedding_client(
+    *, api_key: str | None, model: str, base_url: str,
+    task_type: str, output_dimensionality: int, timeout: float,
+    auth_mode: str = "auto", vertex_project: str | None = None,
+    vertex_location: str | None = None,
+) -> EmbeddingClient | None:
+    if use_vertex(api_key, auth_mode=auth_mode, project=vertex_project):
+        return VertexEmbeddingClient(
+            project=vertex_project or os.getenv("GOOGLE_CLOUD_PROJECT", ""),
+            location=vertex_location or os.getenv("GOOGLE_CLOUD_LOCATION") or "us-central1",
+            model=model, task_type=task_type,
+            output_dimensionality=output_dimensionality, timeout=timeout,
+        )
+    if not api_key:
+        return None  # Analysis can run entirely from an existing embedding cache.
+    return GeminiEmbeddingClient(
+        api_key=api_key, model=model, base_url=base_url, task_type=task_type,
+        output_dimensionality=output_dimensionality, timeout=timeout,
+    )
+
+
+def add_google_auth_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--auth-mode", choices=["auto", "api_key", "adc"], default="auto")
+    parser.add_argument("--vertex-project", help="Vertex AI project (or GOOGLE_CLOUD_PROJECT).")
+    parser.add_argument("--vertex-location", help="Vertex AI region (or GOOGLE_CLOUD_LOCATION; default us-central1).")
 
 
 def read_feature_rows(path: Path) -> list[dict[str, Any]]:

@@ -194,12 +194,15 @@ def compile_pipeline(config: PipelineConfig) -> list[dict]:
             if op.endswith("write"):
                 provider = config.providers
                 options.update(
+                    provider=provider.provider,
+                    auth_mode=provider.auth_mode,
+                    vertex_project=provider.vertex_project,
+                    vertex_location=provider.vertex_location,
                     model=provider.model,
-                    api_key_env=provider.api_key_env
-                    or ("GEMINI_API_KEY" if provider.provider == "gemini" else "OPENAI_API_KEY"),
+                    api_key_env=provider.api_key_env,
                     base_url=provider.base_url
                     or (
-                        "https://generativelanguage.googleapis.com/v1beta/openai"
+                        "https://generativelanguage.googleapis.com/v1beta"
                         if provider.provider == "gemini"
                         else "https://api.openai.com/v1"
                     ),
@@ -208,6 +211,15 @@ def compile_pipeline(config: PipelineConfig) -> list[dict]:
                 )
                 options["goal"] = config.inputs.get("goal")
         elif op.startswith("collect."):
+            if op == "collect.citations":
+                options.update(
+                    llm_provider=config.providers.provider,
+                    llm_model=config.providers.model,
+                    api_key_env=config.providers.api_key_env,
+                    auth_mode=config.providers.auth_mode,
+                    vertex_project=config.providers.vertex_project,
+                    vertex_location=config.providers.vertex_location,
+                )
             options.update(
                 {
                     k: v
@@ -220,6 +232,12 @@ def compile_pipeline(config: PipelineConfig) -> list[dict]:
                 {"logs_dir": str(Path(manifest).parent)}
                 if manifest
                 else {k: v for k, v in config.inputs.items() if k == "logs_dir"}
+            )
+        if op.startswith("analysis.") and op != "analysis.wikidata":
+            options.update(
+                auth_mode=config.providers.auth_mode,
+                vertex_project=config.providers.vertex_project,
+                vertex_location=config.providers.vertex_location,
             )
         if config.profile and op.startswith(("analysis.", "evidence.write")):
             options["profile"] = config.profile

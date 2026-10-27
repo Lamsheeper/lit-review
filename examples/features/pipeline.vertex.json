@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "output_root": "../../runs/features-vertex",
+  "inputs": {
+    "papers": "../fixtures/papers",
+    "taxonomy": "../taxonomies/ergonomics.json",
+    "goal": "../fixtures/goal.md"
+  },
+  "providers": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash",
+    "auth_mode": "adc"
+  },
+  "stages": [
+    { "id": "prepare", "operation": "evidence.prepare" },
+    { "id": "extract", "operation": "features.extract" },
+    { "id": "filter", "operation": "features.filter" },
+    { "id": "annotate", "operation": "features.annotate" },
+    { "id": "merge", "operation": "features.merge" }
+  ]
+}

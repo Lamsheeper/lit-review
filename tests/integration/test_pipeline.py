@@ -155,6 +155,66 @@ class PipelineTests(unittest.TestCase):
         )
         return execute_operation(operation, options, **kwargs, **runtime)
 
+    def test_vertex_feature_pipeline_without_api_keys_uses_generation_and_embeddings(self):
+        import io
+        import os
+        from lit_review.core.google_auth import ADCAuth
+        from lit_review.core.settings import ProviderSettings
+
+        self.config.providers = ProviderSettings(
+            auth_mode="adc", vertex_project="test-project", vertex_location="us-central1"
+        )
+        requests = []
+
+        def send(request, **kwargs):
+            requests.append(request)
+            payload = json.loads(request.data)
+            if request.full_url.endswith(":predict"):
+                response = {"predictions": [{"embeddings": {"values": [1.0, 0.01]}}]}
+            else:
+                prompt = "".join(part.get("text", "") for part in payload["contents"][-1]["parts"])
+                content = self.client.chat([{"role": "user", "content": prompt}])
+                response = {"candidates": [{"content": {"parts": [{"text": content}]}, "finishReason": "STOP"}]}
+            return io.BytesIO(json.dumps(response).encode())
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            ADCAuth, "headers", return_value={"authorization": "Bearer test-adc-token"}
+        ), patch("urllib.request.urlopen", side_effect=send):
+            result = run_pipeline(self.config)
+
+        self.assertEqual(set(result["stages"]), {"prepare", "extract", "filter", "annotate", "merge", "score"})
+        merged = read_jsonl(self.config.output_root / "stages/merge/llm_merged_features.jsonl")
+        self.assertEqual(len(merged), 1)
+        self.assertTrue(any(request.full_url.endswith(":predict") for request in requests))
+        self.assertTrue(any(request.full_url.endswith(":generateContent") for request in requests))
+        for request in requests:
+            self.assertIn("/projects/test-project/locations/us-central1/", request.full_url)
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-adc-token")
+            self.assertIsNone(request.get_header("X-goog-api-key"))
+        for path in self.config.output_root.rglob("*.json"):
+            self.assertNotIn("test-adc-token", path.read_text())
+
+    def test_citation_stage_inherits_cloud_provider_configuration(self):
+        import os
+        from lit_review.core.settings import ProviderSettings
+
+        self.config.providers = ProviderSettings(
+            auth_mode="adc", vertex_project="test-project", vertex_location="us-central1"
+        )
+        self.config.stages = [StageSpec(
+            id="citations", operation="collect.citations", options={"core_pdf": [str(self.papers / "workplace.pdf")]}
+        )]
+        stage = compile_pipeline(self.config)[0]
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "lit_review.collection.harvest.run_harvest", return_value={}
+        ) as harvest:
+            execute_operation(stage["operation"], stage["options"], output_dir=Path(stage["output_dir"]))
+        config = harvest.call_args.args[0]
+        self.assertIsNone(config["llm_api_key"])
+        self.assertEqual(config["auth_mode"], "adc")
+        self.assertEqual(config["vertex_project"], "test-project")
+        self.assertEqual(config["llm_provider"], "gemini")
+
     def test_arbitrary_taxonomy_end_to_end_optional_scoring_and_resume(self):
         result = run_pipeline(
             self.config, stages=["prepare", "extract", "filter", "annotate", "merge"], executor=self.executor

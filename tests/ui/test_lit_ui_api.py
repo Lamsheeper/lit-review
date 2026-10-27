@@ -123,12 +123,24 @@ class UiApiTests(unittest.TestCase):
             def chat(self, *args, **kwargs):
                 return json.dumps(generated)
 
-        app_module.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "test-key"
-        with mock.patch.object(app_module, "make_llm_client", return_value=FakeClient()):
-            response = self.client.post(
-                f"/api/projects/{project['id']}/documents/generate",
-                json={"request": "Find requested topic features"},
-            )
+        for auth_mode in ("api_key", "adc"):
+            with self.subTest(auth_mode=auth_mode):
+                app_module.SESSION_CREDENTIALS.clear()
+                if auth_mode == "api_key":
+                    app_module.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "test-key"
+                with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(
+                    app_module, "make_llm_client", return_value=FakeClient()
+                ) as factory:
+                    response = self.client.post(
+                        f"/api/projects/{project['id']}/documents/generate",
+                        json={"request": "Find requested topic features", "auth_mode": auth_mode,
+                              **({"vertex_project": "test-project"} if auth_mode == "adc" else {})},
+                    )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(factory.call_args.kwargs["auth_mode"], auth_mode)
+                if auth_mode == "adc":
+                    self.assertIsNone(factory.call_args.kwargs["api_key"])
+                    self.assertEqual(factory.call_args.kwargs["vertex_project"], "test-project")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["relevance_scoring"]["title"], "Generated relevance")
@@ -141,6 +153,19 @@ class UiApiTests(unittest.TestCase):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn("Lit Review Studio", response.text)
+
+    def test_document_generation_returns_actionable_adc_authentication_error(self):
+        project = self.client.post("/api/projects", json={"name": "Cloud"}).json()
+        with mock.patch.object(app_module, "make_llm_client") as factory:
+            factory.return_value.chat.side_effect = RuntimeError(
+                "Vertex AI authentication failed. Run `gcloud auth application-default login`."
+            )
+            response = self.client.post(
+                f"/api/projects/{project['id']}/documents/generate",
+                json={"request": "Find workplace factors", "auth_mode": "adc", "vertex_project": "project"},
+            )
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("gcloud auth application-default login", response.json()["detail"])
 
     def test_frontend_cannot_serve_files_outside_its_bundle(self):
         if not app_module.FRONTEND_DIST.exists():

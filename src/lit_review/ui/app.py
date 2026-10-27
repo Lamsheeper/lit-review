@@ -19,6 +19,7 @@ from lit_review.features.extraction import PDF_EXTRACTION_SYSTEM_PROMPT
 from lit_review.features.prompts import build_pdf_extraction_prompt
 from lit_review.features.records import load_goal_text
 from lit_review.core.llm import make_llm_client
+from lit_review.core.google_auth import use_vertex, vertex_model_url
 from lit_review.collection.harvest import candidate_from_dict, stable_candidate_id
 from lit_review.evidence.pdf import prepare_direct_pdf_index
 from lit_review.collection.relevance import validate_relevance_profile
@@ -65,7 +66,10 @@ class DocumentsPayload(BaseModel):
 
 class GeneratePayload(BaseModel):
     request: str
-    provider: str = "gemini"
+    provider: Literal["gemini", "openai"] = "gemini"
+    auth_mode: Literal["auto", "api_key", "adc"] = "auto"
+    vertex_project: str | None = None
+    vertex_location: str | None = None
     model: str = "gemini-2.5-flash"
     reasoning_effort: str | None = "low"
     base_url: str | None = None
@@ -173,8 +177,23 @@ def launch_job(
 
 def provider_key(provider: str) -> str | None:
     if provider == "gemini":
-        return SESSION_CREDENTIALS.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+        return SESSION_CREDENTIALS.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     return SESSION_CREDENTIALS.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+
+def require_provider_configuration(config: dict) -> None:
+    provider = config.get("provider", "gemini")
+    key = os.getenv(config["api_key_env"]) if config.get("api_key_env") else provider_key(provider)
+    vertex = provider == "gemini" and use_vertex(
+        key, auth_mode=config.get("auth_mode", "auto"), project=config.get("vertex_project")
+    )
+    if not key and not vertex:
+        raise HTTPException(422, "Configure an API key or Google Cloud ADC for the selected provider")
+    if vertex:
+        try:
+            vertex_model_url(config.get("vertex_project"), config.get("vertex_location"), config.get("model", "gemini-2.5-flash"))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
 
 def default_base_url(provider: str) -> str:
@@ -305,17 +324,26 @@ def generate_documents(project_id: str, payload: GeneratePayload) -> dict[str, A
     if not request_text:
         raise HTTPException(422, "A feature request is required.")
     api_key = provider_key(payload.provider)
-    if not api_key:
-        raise HTTPException(422, f"No {payload.provider} API key is available.")
-    client = make_llm_client(
-        api_key=api_key,
-        model=payload.model,
-        base_url=payload.base_url or default_base_url(payload.provider),
-        reasoning_effort=payload.reasoning_effort,
-        api_provider=payload.provider,
-        input_mode="text",
-        timeout=180,
+    vertex = payload.provider == "gemini" and use_vertex(
+        api_key, auth_mode=payload.auth_mode, project=payload.vertex_project
     )
+    if not api_key and not vertex:
+        raise HTTPException(422, f"No {payload.provider} API key or Vertex AI configuration is available.")
+    try:
+        client = make_llm_client(
+            api_key=api_key,
+            model=payload.model,
+            base_url=payload.base_url or default_base_url(payload.provider),
+            reasoning_effort=payload.reasoning_effort,
+            api_provider=payload.provider,
+            input_mode="text",
+            timeout=180,
+            auth_mode=payload.auth_mode,
+            vertex_project=payload.vertex_project,
+            vertex_location=payload.vertex_location,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     prompt = f"""Turn the user's broad literature feature request into two actionable Markdown documents, a structured taxonomy, and a candidate-paper relevance scoring profile.
 
 Return one strict JSON object with keys:
@@ -353,12 +381,15 @@ The relevance criteria must distinguish papers that can answer this specific req
 USER REQUEST:
 {request_text}
 """
-    raw = client.chat(
-        [{"role": "system", "content": "Return only valid JSON."}, {"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=8000,
-        response_format={"type": "json_object"},
-    )
+    try:
+        raw = client.chat(
+            [{"role": "system", "content": "Return only valid JSON."}, {"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=8000,
+            response_format={"type": "json_object"},
+        )
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
     try:
         generated = extract_json_object(raw)
         taxonomy = validate_taxonomy(generated.get("taxonomy"))
@@ -419,10 +450,10 @@ def credential_status() -> dict[str, Any]:
     keys = ["GEMINI_API_KEY", "OPENAI_API_KEY", "SEMANTIC_SCHOLAR_API_KEY"]
     return {
         key: {
-            "available": bool(SESSION_CREDENTIALS.get(key) or os.getenv(key)),
+            "available": bool(SESSION_CREDENTIALS.get(key) or os.getenv(key) or (os.getenv("GOOGLE_API_KEY") if key == "GEMINI_API_KEY" else None)),
             "source": "session"
             if SESSION_CREDENTIALS.get(key)
-            else ("environment" if os.getenv(key) else None),
+            else ("environment" if os.getenv(key) or (key == "GEMINI_API_KEY" and os.getenv("GOOGLE_API_KEY")) else None),
         }
         for key in keys
     }
@@ -1001,8 +1032,7 @@ def start_extraction(project_id: str) -> dict:
     if not project_workflow_status(project_id)["steps"]["candidates"]["complete"]:
         raise HTTPException(422, "Download at least one selected full PDF first")
     config = get_extraction_config(project_id)
-    if not provider_key(config.get("provider", "gemini")):
-        raise HTTPException(422, "Configure the selected provider credential")
+    require_provider_configuration(config)
     return pipeline_job(
         project_id, "direct_pdf_extraction", feature_pipeline_config(project_id), ["prepare", "extract"]
     )
@@ -1056,8 +1086,7 @@ def run_stage(project_id: str, stage: str) -> dict:
     if not workflow["steps"][previous]["complete"]:
         raise HTTPException(409, f"Complete {previous} with current inputs first")
     config = get_stage_config(project_id, stage)
-    if not provider_key(config.get("provider", "gemini")):
-        raise HTTPException(422, "Configure the selected provider credential")
+    require_provider_configuration(config)
     return pipeline_job(project_id, stage, feature_pipeline_config(project_id), [stage])
 
 

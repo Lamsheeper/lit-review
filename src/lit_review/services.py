@@ -25,6 +25,9 @@ PROVIDER_FIELDS = {
     "model",
     "base_url",
     "api_key_env",
+    "auth_mode",
+    "vertex_project",
+    "vertex_location",
     "reasoning_effort",
     "temperature",
     "timeout",
@@ -52,6 +55,9 @@ FEATURE_FIELDS = {
         "batch_pairs",
         "embedding_model",
         "embedding_api_key_env",
+        "embedding_auth_mode",
+        "embedding_vertex_project",
+        "embedding_vertex_location",
         "embedding_base_url",
         "embedding_task_type",
         "embedding_output_dimensionality",
@@ -160,7 +166,7 @@ def execute_feature(
 ) -> dict:
     from lit_review.features import extraction, filtering, annotation, merging, scoring
     from lit_review.features.records import read_feature_inventory
-    from lit_review.embeddings.core import GeminiEmbeddingClient
+    from lit_review.embeddings.core import make_embedding_client
 
     config = feature_options(operation, options)
     taxonomy = load_taxonomy(config.taxonomy)
@@ -212,16 +218,21 @@ def execute_feature(
                     )
         if embedding_client is None and source and rows:
             key = os.getenv(config.embedding_api_key_env)
-            if not key:
-                raise ValueError(f"Missing embedding credential: {config.embedding_api_key_env}")
-            embedding_client = GeminiEmbeddingClient(
+            if not key and config.embedding_api_key_env == "GEMINI_API_KEY":
+                key = os.getenv("GOOGLE_API_KEY")
+            embedding_client = make_embedding_client(
                 api_key=key,
+                auth_mode=config.embedding_auth_mode or config.auth_mode,
+                vertex_project=config.embedding_vertex_project or config.vertex_project,
+                vertex_location=config.embedding_vertex_location or config.vertex_location,
                 model=config.embedding_model,
                 base_url=config.embedding_base_url,
                 task_type=config.embedding_task_type,
                 output_dimensionality=config.embedding_output_dimensionality,
                 timeout=config.timeout,
             )
+            if embedding_client is None:
+                raise ValueError(f"Missing embedding credential: {config.embedding_api_key_env}; or configure Vertex AI ADC")
         kwargs.update(
             category_config=config.category_config,
             top_k=config.top_k,
@@ -286,8 +297,7 @@ def execute_operation(
         write_json(output_dir / "service_summary.json", payload)
         return payload
     if operation in {"collect.search", "collect.citations"}:
-        from lit_review.collection.harvest import run_harvest
-        from lit_review.collection.citations import llm_provider_default_model, llm_provider_env_api_key
+        from lit_review.collection.harvest import run_harvest, llm_provider_default_model, llm_provider_env_api_key
 
         config = CollectionSettings.for_operation(operation, options).model_dump(mode="json")
         config.update(
@@ -297,7 +307,10 @@ def execute_operation(
             harvest_mode="citations" if operation.endswith("citations") else "draft",
         )
         config["llm_model"] = config.get("llm_model") or llm_provider_default_model(config["llm_provider"])
-        config["llm_api_key"] = llm_provider_env_api_key(config["llm_provider"])
+        config["llm_api_key"] = (
+            os.getenv(config["api_key_env"]) if config.get("api_key_env")
+            else llm_provider_env_api_key(config["llm_provider"])
+        )
         config["email"] = config.get("email") or os.getenv("LITHARVEST_EMAIL")
         config["semantic_scholar_api_key"] = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
         config["unpaywall_email"] = config.get("unpaywall_email") or os.getenv("UNPAYWALL_EMAIL")
@@ -366,6 +379,10 @@ def execute_operation(
         allowed = {
             "run_dir",
             "goal",
+            "provider",
+            "auth_mode",
+            "vertex_project",
+            "vertex_location",
             "model",
             "base_url",
             "reasoning_effort",
@@ -380,12 +397,18 @@ def execute_operation(
         }
         if set(options) - allowed:
             raise ValueError(f"Unknown report options: {sorted(set(options) - allowed)}")
-        values = {k: v for k, v in options.items() if k not in {"goal", "api_key_env", "profile"}}
+        values = {k: v for k, v in options.items() if k not in {"goal", "api_key_env", "profile", "provider"}}
+        provider = options.get("provider", "openai")
+        key_env = options.get("api_key_env") or ("GEMINI_API_KEY" if provider == "gemini" else "OPENAI_API_KEY")
+        key = os.getenv(key_env)
+        if not key and provider == "gemini" and not options.get("api_key_env"):
+            key = os.getenv("GOOGLE_API_KEY")
         values.update(
             run_dir=Path(options["run_dir"]),
             goal_path=Path(options["goal"]),
             output_path=output_dir / "report.md",
-            api_key=os.getenv(options.get("api_key_env", "OPENAI_API_KEY")),
+            api_key=key,
+            api_provider=provider,
         )
         output_dir.mkdir(parents=True, exist_ok=True)
         with research_context({}, options.get("profile")):

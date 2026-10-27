@@ -33,15 +33,29 @@ class ProviderSettings(Settings):
     model: str = "gemini-2.5-flash"
     base_url: str | None = None
     api_key_env: str | None = None
+    auth_mode: Literal["auto", "api_key", "adc"] = "auto"
+    vertex_project: str | None = None
+    vertex_location: str | None = None
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
     temperature: float = Field(default=0.0, ge=0, le=2)
     timeout: float = Field(default=600, gt=0)
     max_tokens: int = Field(default=6000, ge=1)
 
+    @model_validator(mode="after")
+    def valid_authentication(self):
+        if self.provider == "openai" and (self.auth_mode == "adc" or self.vertex_project):
+            raise ValueError("Vertex AI ADC authentication requires the Gemini provider")
+        return self
+
     def transport(self) -> dict:
         key_env = self.api_key_env or ("GEMINI_API_KEY" if self.provider == "gemini" else "OPENAI_API_KEY")
         return {
-            "api_key": os.getenv(key_env),
+            "api_key": os.getenv(key_env) or (
+                os.getenv("GOOGLE_API_KEY") if self.provider == "gemini" and not self.api_key_env else None
+            ),
+            "auth_mode": self.auth_mode,
+            "vertex_project": self.vertex_project,
+            "vertex_location": self.vertex_location,
             "model": self.model,
             "base_url": self.base_url
             or (
@@ -73,6 +87,9 @@ class FeatureSettings(ProviderSettings):
     category_config: Path | None = None
     embedding_model: str = "gemini-embedding-001"
     embedding_api_key_env: str = "GEMINI_API_KEY"
+    embedding_auth_mode: Literal["auto", "api_key", "adc"] | None = None
+    embedding_vertex_project: str | None = None
+    embedding_vertex_location: str | None = None
     embedding_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     embedding_task_type: str = "CLUSTERING"
     embedding_output_dimensionality: int = Field(default=768, ge=1)
@@ -110,6 +127,10 @@ class CollectionSettings(Settings):
     citation_extractor: Literal["direct_pdf", "pymupdf_markdown"] = "direct_pdf"
     llm_provider: Literal["gemini", "openai"] = "gemini"
     llm_model: str | None = None
+    api_key_env: str | None = None
+    auth_mode: Literal["auto", "api_key", "adc"] = "auto"
+    vertex_project: str | None = None
+    vertex_location: str | None = None
     max_output_tokens: int = Field(default=0, ge=0)
     max_text_chars: int = Field(default=0, ge=0)
     sources: list[Literal["openalex", "semantic_scholar", "crossref", "europe_pmc"]] = Field(
@@ -151,6 +172,8 @@ class CollectionSettings(Settings):
 
     @model_validator(mode="after")
     def valid_years(self):
+        if self.llm_provider == "openai" and (self.auth_mode == "adc" or self.vertex_project):
+            raise ValueError("Vertex AI ADC authentication requires the Gemini provider")
         if self.year_from is not None and self.year_to is not None and self.year_from > self.year_to:
             raise ValueError("year_from cannot be later than year_to")
         return self
@@ -165,6 +188,10 @@ class CollectionSettings(Settings):
                 "citation_extractor",
                 "llm_provider",
                 "llm_model",
+                "api_key_env",
+                "auth_mode",
+                "vertex_project",
+                "vertex_location",
                 "max_output_tokens",
                 "max_text_chars",
                 "refresh_citation_extractions",

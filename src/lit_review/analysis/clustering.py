@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from lit_review.embeddings.core import add_google_auth_arguments, make_embedding_client
+
 from lit_review.core.io import write_jsonl
 
 import argparse
@@ -26,7 +28,6 @@ from lit_review.embeddings.core import (
     EmbeddingClient,
     EmbeddingTextCleanup,
     FeatureItem,
-    GeminiEmbeddingClient,
     embed_texts_with_cache,
     gemini_api_key,
     load_feature_items,
@@ -2305,6 +2306,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch-size", type=positive_int, default=50, help="Gemini embedding batch size.")
     parser.add_argument("--timeout", type=float, default=120.0, help="Gemini request timeout in seconds.")
+    add_google_auth_arguments(parser)
     return parser
 
 
@@ -2348,16 +2350,17 @@ def main(argv: list[str] | None = None) -> int:
         cache_path = args.cache or output_dir / f"{prefix}_gemini_embedding_cache.jsonl"
 
         api_key = gemini_api_key(args.gemini_api_key)
-        client: EmbeddingClient | None = None
-        if api_key:
-            client = GeminiEmbeddingClient(
-                api_key=api_key,
-                model=args.model,
-                base_url=args.base_url,
-                task_type=args.task_type,
-                output_dimensionality=args.output_dimensionality,
-                timeout=args.timeout,
-            )
+        client = make_embedding_client(
+            api_key=api_key,
+            auth_mode=args.auth_mode,
+            vertex_project=args.vertex_project,
+            vertex_location=args.vertex_location,
+            model=args.model,
+            base_url=args.base_url,
+            task_type=args.task_type,
+            output_dimensionality=args.output_dimensionality,
+            timeout=args.timeout,
+        )
 
         if args.category_config is not None:
             trace = run_embedding_merge_by_category(

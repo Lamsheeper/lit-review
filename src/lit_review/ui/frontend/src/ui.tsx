@@ -50,6 +50,8 @@ function Credentials() {
         <label className="mt-4 block text-xs font-semibold text-slate-600" key={key}>{label}
           <input type="password" className="input mt-1 bg-white opacity-100" value={values[key] || ""} placeholder={query.data?.[key]?.available ? `${query.data[key].source} credential available` : "Not configured"} onChange={(event) => setValues({ ...values, [key]: event.target.value })} />
         </label>)}
+      <p className="mt-4 text-xs leading-5 text-slate-600">For Google Cloud, run <code>gcloud auth application-default login</code> on the machine running this app. Choose Google Cloud (ADC) in the Gemini settings and enter your project and region, or set GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION before starting the app.</p>
+      <Error mutation={save} />
       <button className="button-primary mt-5 w-full" onClick={() => save.mutate()}>Use for this session</button>
     </div>}
   </div>;
@@ -177,7 +179,7 @@ function Define({ projectId, status, onNext }: { projectId: string; status: Work
   const client = useQueryClient();
   const [request, setRequest] = useState("");
   const [dirty, setDirty] = useState(false);
-  const [generator, setGenerator] = useState({ provider: "gemini", model: "gemini-2.5-flash", reasoning_effort: "low", base_url: "" });
+  const [generator, setGenerator] = useState({ provider: "gemini", model: "gemini-2.5-flash", reasoning_effort: "low", base_url: "", auth_mode: "auto", vertex_project: "", vertex_location: "" });
   const docs = useQuery({ queryKey: ["docs", projectId], queryFn: () => api<{ draft_markdown: string; goal_markdown: string }>(`/api/projects/${projectId}/documents`) });
   const taxonomy = useQuery({ queryKey: ["taxonomy", projectId], queryFn: () => api<Taxonomy | null>(`/api/projects/${projectId}/taxonomy`) });
   const relevance = useQuery({ queryKey: ["relevance", projectId], queryFn: () => api<RelevanceProfile | null>(`/api/projects/${projectId}/relevance-scoring`) });
@@ -214,7 +216,8 @@ function Define({ projectId, status, onNext }: { projectId: string; status: Work
       <textarea id="research-request" className="input min-h-28" placeholder="Describe the concepts, evidence, distinctions, and intended use in ordinary language." value={request} onChange={(event) => setRequest(event.target.value)} />
       <p className="mt-3 text-xs text-slate-500">Generate the definition, then review the search brief, feature families, and paper ranking rules below.</p>
       <details className="details"><summary>Generation model </summary><div className="form-grid mt-4">
-        <Field label="Provider"><select className="input" value={generator.provider} onChange={event => setGenerator({ ...generator, provider: event.target.value, model: event.target.value === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini" })}><option value="gemini">Gemini</option><option value="openai">OpenAI-compatible</option></select></Field>
+        <Field label="Provider"><select className="input" value={generator.provider} onChange={event => setGenerator({ ...generator, provider: event.target.value, auth_mode: "auto", vertex_project: "", vertex_location: "", model: event.target.value === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini" })}><option value="gemini">Gemini</option><option value="openai">OpenAI-compatible</option></select></Field>
+        {generator.provider === "gemini" && <GoogleAuthFields value={generator} onChange={next => setGenerator({ ...generator, ...next })} />}
         <Field label="Model"><input className="input" value={generator.model} onChange={event => setGenerator({ ...generator, model: event.target.value })} /></Field>
         <Field label="Reasoning effort"><select className="input" value={generator.reasoning_effort} onChange={event => setGenerator({ ...generator, reasoning_effort: event.target.value })}>{["none", "minimal", "low", "medium", "high"].map(value => <option key={value}>{value}</option>)}</select></Field>
         <Field label="Base URL"><input className="input" placeholder="Use provider default" value={generator.base_url} onChange={event => setGenerator({ ...generator, base_url: event.target.value })} /></Field>
@@ -331,7 +334,8 @@ function Extract({ projectId, status, onNext }: { projectId: string; status: Wor
   const set = (key: string, next: any) => { setDirty(true); setValue({ ...value, [key]: next }); };
   return <section className="stage"><StepHeader eyebrow="Step 4 of 8 · Extract" title="Extract raw features from the selected full PDFs." description="Read your selected PDFs and save each feature with its supporting evidence. You will review relevance in the next step." status={{ ...status, running: status.running || run.isPending }} ready={status.complete && !status.running && !dirty && !run.isPending} onNext={onNext} nextLabel="Filter" action={<><button className="button-secondary" disabled={preview.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => preview.mutate()}>{preview.isPending ? <LoaderCircle className="animate-spin" size={16} /> : <Eye size={16} />} View prompt</button><button className="button-primary" disabled={run.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => run.mutate()}>{run.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} Extract raw features</button></>} />
     <div className="grid gap-5 lg:grid-cols-[1fr_420px]"><div className="panel"><div className="border-l-2 border-slate-300 pl-4 text-sm text-slate-700"><strong>Input: selected full PDFs.</strong> Each extracted feature keeps a reference to its source paper.<div className="mt-2 text-xs font-semibold">{candidates.data?.items.filter(row => row.selected).length || 0} selected · {candidates.data?.items.filter(row => ["downloaded", "already_exists"].includes(row.download_status)).length || 0} downloaded</div></div><div className="form-grid mt-6">
-      <Field label="Provider"><select className="input" value={value.provider || "gemini"} onChange={(e) => set("provider", e.target.value)}><option value="gemini">Gemini</option><option value="openai">OpenAI-compatible</option></select></Field>
+      <Field label="Provider"><select className="input" value={value.provider || "gemini"} onChange={(e) => { setDirty(true); setValue({ ...value, provider: e.target.value, auth_mode: "auto", vertex_project: null, vertex_location: null }); }}><option value="gemini">Gemini</option><option value="openai">OpenAI-compatible</option></select></Field>
+      {(value.provider || "gemini") === "gemini" && <GoogleAuthFields value={value} onChange={next => { setDirty(true); setValue({ ...value, ...next }); }} />}
       <Field label="Model"><input className="input" value={value.model || ""} onChange={(e) => set("model", e.target.value)} /></Field>
       <Field label="Maximum features per PDF"><input className="input" type="number" value={value.max_features_per_pdf || 40} onChange={(e) => set("max_features_per_pdf", Number(e.target.value))} /></Field>
     </div><details className="details"><summary>Advanced model settings</summary><div className="form-grid">      <Field label="Reasoning effort"><select className="input" value={value.reasoning_effort || "low"} onChange={(e) => set("reasoning_effort", e.target.value)}>{["none", "minimal", "low", "medium", "high"].map(x => <option key={x}>{x}</option>)}</select></Field>
@@ -384,10 +388,12 @@ export function ProcessingStage({ projectId, stage, status, onNext }: { projectI
   return <section className="stage">
     <StepHeader eyebrow={stage === "score" ? "Optional scoring" : { filter: "Step 5 of 8 · Filter", annotate: "Step 6 of 8 · Annotate", merge: "Step 7 of 8 · Merge" }[stage]} title={{ filter: "Filter feature candidates", annotate: "Annotate retained features", merge: "Merge equivalent features", score: "Score the final inventory" }[stage]} description={descriptions[stage]} status={{ ...status, running: status.running || run.isPending }} ready={status.complete && !status.running && !dirty && !run.isPending} onNext={onNext} nextLabel={{ filter: "Annotate", annotate: "Merge", merge: "Results", score: "" }[stage]} action={<><button className="button-secondary" disabled={status.running || inspect.isPending || run.isPending} onClick={() => inspect.mutate()}>Preview settings</button><button className="button-primary" disabled={status.running || run.isPending || inspect.isPending} onClick={() => run.mutate()}>{status.running ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} Run {stage}</button></>} />
     <div className="grid gap-5 lg:grid-cols-[1fr_420px]"><div className="panel"><h3 className="section-title">Settings</h3><div className="form-grid">
-      <Field label="Provider"><select className="input" value={value.provider || "gemini"} onChange={e => { setDirty(true); setValue({ ...value, provider: e.target.value, base_url: null }); }}><option value="gemini">Gemini</option><option value="openai">OpenAI compatible</option></select></Field>
+      <Field label="Provider"><select className="input" value={value.provider || "gemini"} onChange={e => { setDirty(true); setValue({ ...value, provider: e.target.value, base_url: null, auth_mode: "auto", vertex_project: null, vertex_location: null }); }}><option value="gemini">Gemini</option><option value="openai">OpenAI compatible</option></select></Field>
+      {(value.provider || "gemini") === "gemini" && <GoogleAuthFields value={value} onChange={next => { setDirty(true); setValue({ ...value, ...next }); }} />}
       <Field label="Model"><input className="input" value={value.model || ""} onChange={e => { setDirty(true); setValue({ ...value, model: e.target.value }); }} /></Field>
       <Field label="Domain rules"><select className="input" value={value.profile || ""} onChange={e => { setDirty(true); setValue({ ...value, profile: e.target.value || null }); }}><option value="">Use project taxonomy</option><option value="media_attributes">Media attributes</option></select></Field>
       <Field label={stage === "merge" ? "Neighbor candidates per feature" : "Features per batch"}><input className="input" type="number" min="1" value={value[stage === "merge" ? "top_k" : "batch_features"] || (stage === "merge" ? 10 : 25)} onChange={e => { setDirty(true); setValue({ ...value, [stage === "merge" ? "top_k" : "batch_features"]: Number(e.target.value) }); }} /></Field>
+      {stage === "merge" && <GoogleAuthFields value={value} prefix="embedding_" onChange={next => { setDirty(true); setValue({ ...value, ...next }); }} />}
       {stage === "merge" && <Field label="Embedding model"><input className="input" value={value.embedding_model || "gemini-embedding-001"} onChange={e => { setDirty(true); setValue({ ...value, embedding_model: e.target.value }); }} /></Field>}
     </div><Error mutation={inspect} /><Error mutation={run} />
     {preview && <details className="details" open><summary>Planned inputs and outputs</summary><pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(preview, null, 2)}</pre></details>}
@@ -456,6 +462,27 @@ function JobPanel({ projectId, kind }: { projectId: string; kind: string }) {
       <button className="button-secondary mt-4" disabled={job?.status === "cancelling"} onClick={() => api(`/api/jobs/${job!.id}/cancel`, { method: "POST" })}><Square size={12} /> {job?.status === "cancelling" ? "Stopping…" : "Cancel run"}</button>
     </>}
   </aside>;
+}
+
+function GoogleAuthFields({ value, onChange, prefix = "" }: { value: Record<string, any>; onChange: (next: Record<string, any>) => void; prefix?: string }) {
+  const mode = value[prefix + "auth_mode"] || (prefix ? "" : "auto");
+  const cloud = mode === "adc" || mode === "auto";
+  return <>
+    <Field label={prefix ? "Embedding authentication" : "Gemini authentication"} description="Automatic uses API keys when available, or Google Cloud when configured. ADC uses your Google Cloud login.">
+      <select className="input" value={mode} onChange={e => onChange({ [prefix + "auth_mode"]: e.target.value || null })}>
+        {prefix && <option value="">Use generation settings</option>}
+        <option value="auto">Automatic</option><option value="api_key">API key</option><option value="adc">Google Cloud (ADC)</option>
+      </select>
+    </Field>
+    {cloud && <>
+      <Field label={prefix ? "Embedding Google Cloud project" : "Google Cloud project"} description="Defaults to GOOGLE_CLOUD_PROJECT. Entering a project selects Google Cloud in automatic mode.">
+        <input className="input" placeholder="my-project-id" value={value[prefix + "vertex_project"] || ""} onChange={e => onChange({ [prefix + "vertex_project"]: e.target.value })} />
+      </Field>
+      <Field label={prefix ? "Embedding region" : "Google Cloud region"} description="Defaults to GOOGLE_CLOUD_LOCATION or us-central1. Choose a region that supports your model.">
+        <input className="input" placeholder="us-central1" value={value[prefix + "vertex_location"] || ""} onChange={e => onChange({ [prefix + "vertex_location"]: e.target.value })} />
+      </Field>
+    </>}
+  </>;
 }
 
 function Field({ label, description, children }: { label: string; description?: string; children: any }) { return <label className="block"><span className="label">{label}</span><div className="mt-2">{children}</div>{description && <span className="mt-2 block text-xs leading-5 text-slate-500">{description}</span>}</label>; }

@@ -1,7 +1,8 @@
 """Analysis visualization."""
 
 from __future__ import annotations
-from lit_review.embeddings.core import EmbeddingClient, VertexEmbeddingClient
+
+from lit_review.embeddings.core import add_google_auth_arguments, make_embedding_client
 
 import argparse
 
@@ -14,7 +15,6 @@ import json
 
 import math
 
-import os
 
 import re
 
@@ -36,7 +36,6 @@ from lit_review.embeddings.core import (
     DEFAULT_TASK_TYPE,
     DEFAULT_OUTPUT_DIMENSIONALITY,
     DEFAULT_TEXT_FIELDS,
-    GeminiEmbeddingClient,
     gemini_api_key,
     parse_text_fields,
     load_feature_items,
@@ -915,16 +914,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gemini-api-key", help="Gemini API key. Defaults to GEMINI_API_KEY or GOOGLE_API_KEY."
     )
-    parser.add_argument(
-        "--vertex-project",
-        default=os.environ.get("GOOGLE_CLOUD_PROJECT"),
-        help="Use Vertex AI with this GCP project and ADC. Defaults to GOOGLE_CLOUD_PROJECT.",
-    )
-    parser.add_argument(
-        "--vertex-location",
-        default=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
-        help="Vertex AI region. Defaults to GOOGLE_CLOUD_LOCATION or us-central1.",
-    )
     parser.add_argument("--model", default=DEFAULT_GEMINI_MODEL, help="Gemini embedding model.")
     parser.add_argument("--base-url", default=DEFAULT_GEMINI_BASE_URL, help="Gemini API base URL.")
     parser.add_argument("--task-type", default=DEFAULT_TASK_TYPE, help="Gemini embedding task type.")
@@ -947,6 +936,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of highest-support features to label on the plot.",
     )
     parser.add_argument("--dpi", type=positive_int, default=220, help="PNG output DPI.")
+    add_google_auth_arguments(parser)
     return parser
 
 
@@ -970,27 +960,12 @@ def main(argv: list[str] | None = None) -> int:
         cache_path = args.cache or output_dir / f"{prefix}_gemini_embedding_cache.jsonl"
 
         api_key = gemini_api_key(args.gemini_api_key)
-        if args.vertex_project and api_key:
-            raise ValueError("Use either --vertex-project or a Gemini API key, not both.")
-        client: EmbeddingClient | None = None
-        if args.vertex_project:
-            client = VertexEmbeddingClient(
-                project=args.vertex_project,
-                location=args.vertex_location,
-                model=args.model,
-                task_type=args.task_type,
-                output_dimensionality=args.output_dimensionality,
-                timeout=args.timeout,
-            )
-        elif api_key:
-            client = GeminiEmbeddingClient(
-                api_key=api_key,
-                model=args.model,
-                base_url=args.base_url,
-                task_type=args.task_type,
-                output_dimensionality=args.output_dimensionality,
-                timeout=args.timeout,
-            )
+        client = make_embedding_client(
+            api_key=api_key, auth_mode=args.auth_mode,
+            vertex_project=args.vertex_project, vertex_location=args.vertex_location,
+            model=args.model, base_url=args.base_url, task_type=args.task_type,
+            output_dimensionality=args.output_dimensionality, timeout=args.timeout,
+        )
 
         embeddings, stats = embed_texts_with_cache(
             [item.embedding_text for item in items],

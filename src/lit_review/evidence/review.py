@@ -11,6 +11,9 @@ collected PDFs plus, when available, the LitHarvest manifest. The pipeline is:
 """
 
 from __future__ import annotations
+
+from lit_review.core.llm import make_llm_client
+from lit_review.core.google_auth import use_vertex
 from lit_review.core.context import PROFILE
 from lit_review.profiles.media_review import taxonomy_plan_goal, llm_plan_taxonomy_goal
 from lit_review.core.json_response import parse_json_object
@@ -863,7 +866,7 @@ def write_report(
     output_path: Path,
     api_key: str | None = None,
     model: str = DEFAULT_MODEL,
-    base_url: str = "https://api.openai.com/v1",
+    base_url: str | None = None,
     reasoning_effort: str | None = None,
     max_questions: int = 6,
     per_question: int = 6,
@@ -871,21 +874,30 @@ def write_report(
     evidence_chars: int = 1400,
     section_evidence: int = 24,
     temperature: float = 0.2,
+    api_provider: str = "openai",
+    auth_mode: str = "auto",
+    vertex_project: str | None = None,
+    vertex_location: str | None = None,
 ) -> dict[str, Any]:
     db_path = run_dir / "index.sqlite"
     if not db_path.exists():
         raise FileNotFoundError(f"Index database does not exist: {db_path}")
     goal_text = goal_path.read_text(encoding="utf-8", errors="replace")
-    client = (
-        ChatCompletionClient(
-            api_key=api_key,
-            model=model,
-            base_url=base_url,
-            reasoning_effort=reasoning_effort,
-        )
-        if api_key
-        else None
+    base_url = base_url or (
+        "https://generativelanguage.googleapis.com/v1beta" if api_provider == "gemini"
+        else "https://api.openai.com/v1"
     )
+    if api_provider != "gemini" and (auth_mode == "adc" or vertex_project):
+        raise ValueError("Vertex AI ADC authentication requires the Gemini provider.")
+    client = None
+    if api_key or (api_provider == "gemini" and use_vertex(
+        api_key, auth_mode=auth_mode, project=vertex_project
+    )):
+        client = make_llm_client(
+            api_key=api_key, model=model, base_url=base_url,
+            reasoning_effort=reasoning_effort, api_provider=api_provider,
+            auth_mode=auth_mode, vertex_project=vertex_project, vertex_location=vertex_location,
+        )
 
     if PROFILE.get() == "media_attributes" and is_taxonomy_goal(goal_text):
         if client:

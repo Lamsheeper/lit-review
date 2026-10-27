@@ -4,6 +4,7 @@ Preview every recipe with `lit-review pipeline run --config <recipe> --dry-run`.
 
 - `collection/pipeline.json`: a small scholarly search/download run and service summary; actual execution uses network APIs.
 - `features/pipeline.json`: general-taxonomy feature discovery using the synthetic ergonomics paper; actual execution needs generation and embedding credentials.
+- `features/pipeline.vertex.json`: the same feature workflow using Google Cloud ADC for generation and embeddings; set `GOOGLE_CLOUD_PROJECT` after `gcloud auth application-default login`.
 - `media_attributes/pipeline.json`: explicit media domain rules and the historical research goal.
 - `review/pipeline.json`: local conversion, indexing, and offline review writing; no model key required.
 - `analysis/pipeline.json`: local feature-set comparison; install `uv sync --extra analysis`, no credentials required.

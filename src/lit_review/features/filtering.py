@@ -31,7 +31,6 @@ from lit_review.core.io import utc_now, write_json
 from lit_review.core.chat import ChatCompletionClient
 
 
-from lit_review.core.chat import clean_api_key
 
 from lit_review.features.records import ensure_feature_identity, feature_key, load_goal_text
 from lit_review.core.text import normalize_feature_name
@@ -465,6 +464,9 @@ def run_curation(
     model: str,
     base_url: str,
     api_provider: str = "auto",
+    auth_mode: str = "auto",
+    vertex_project: str | None = None,
+    vertex_location: str | None = None,
     reasoning_effort: str | None,
     batch_features: int,
     goal_path: Path | None = None,
@@ -500,10 +502,11 @@ def run_curation(
         )
 
     if client is None:
-        if not api_key:
-            raise ValueError("An API key is required unless --dry-run is used.")
         client = make_llm_client(
-            api_key=clean_api_key(api_key),
+            auth_mode=auth_mode,
+            vertex_project=vertex_project,
+            vertex_location=vertex_location,
+            api_key=api_key,
             api_provider=api_provider,
             input_mode="chunks",
             model=model,

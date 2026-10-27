@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import time
@@ -109,6 +110,41 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(start.call_args.args[3]["OPENAI_API_KEY"], "session-secret")
         config_path = Path(commands[0][commands[0].index("--config") + 1])
         self.assertNotIn("session-secret", config_path.read_text())
+
+    def test_extraction_can_launch_with_adc_and_no_api_key(self):
+        response = self.client.put(
+            f"/api/projects/{self.id}/extraction/config",
+            json={"auth_mode": "adc", "vertex_project": "test-project", "vertex_location": "us-central1"},
+        )
+        self.assertEqual(response.status_code, 200)
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", return_value={"id": "fake"}
+        ) as start:
+            response = self.client.post(f"/api/projects/{self.id}/extraction/run")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(start.call_args.args[3], {})
+        commands = start.call_args.args[2]
+        path = Path(commands[0][commands[0].index("--config") + 1])
+        from lit_review.pipeline import compile_pipeline, load_pipeline
+
+        plan = compile_pipeline(load_pipeline(path))
+        extraction = next(stage for stage in plan if stage["id"] == "extract")
+        self.assertEqual(extraction["options"]["auth_mode"], "adc")
+        self.assertEqual(extraction["options"]["vertex_project"], "test-project")
+
+    def test_processing_can_launch_with_adc_and_no_api_key(self):
+        self.complete()
+        response = self.client.put(
+            f"/api/projects/{self.id}/stages/filter/config",
+            json={"auth_mode": "adc", "vertex_project": "test-project"},
+        )
+        self.assertEqual(response.status_code, 200)
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", return_value={"id": "fake"}
+        ) as start:
+            response = self.client.post(f"/api/projects/{self.id}/stages/filter/run")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(start.call_args.args[3], {})
 
     def test_selection_changes_invalidate_extraction(self):
         self.complete()

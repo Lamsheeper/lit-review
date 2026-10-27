@@ -47,6 +47,18 @@ describe("ProcessingStage", () => {
     await waitFor(() => expect(mockedApi).toHaveBeenCalledWith("/api/projects/p1/stages/filter/run", { method: "POST" }));
   });
 
+  it("saves Google Cloud authentication settings with the processing stage", async () => {
+    show("filter");
+    await screen.findByDisplayValue("test-model");
+    fireEvent.change(screen.getByLabelText(/Gemini authentication/), { target: { value: "adc" } });
+    fireEvent.change(screen.getByLabelText(/Google Cloud project/), { target: { value: "my-project" } });
+    fireEvent.change(screen.getByLabelText(/Google Cloud region/), { target: { value: "europe-west4" } });
+    fireEvent.click(screen.getByText("Run filter"));
+    await waitFor(() => expect(mockedApi).toHaveBeenCalledWith("/api/projects/p1/stages/filter/run", { method: "POST" }));
+    const saved = mockedApi.mock.calls.find(([path, options]) => path.endsWith("/config") && options?.method === "PUT");
+    expect(JSON.parse(saved![1]!.body as string)).toMatchObject({ auth_mode: "adc", vertex_project: "my-project", vertex_location: "europe-west4" });
+  });
+
   it("requires rerunning changed settings before offering the next step", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
     render(<QueryClientProvider client={client}><ProcessingStage projectId="p1" stage="filter" status={{ complete: true, running: false, missing: [], materials: {}, action_label: "Run" }} onNext={() => {}} /></QueryClientProvider>);

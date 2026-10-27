@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from lit_review.core.google_auth import use_vertex
+from lit_review.embeddings.core import add_google_auth_arguments
+
 import argparse
 import copy
 import json
@@ -233,6 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Regenerate metadata even when matching cache entries exist.",
     )
+    add_google_auth_arguments(parser)
     return parser
 
 
@@ -251,8 +255,10 @@ def main(argv: list[str] | None = None) -> int:
         cache_path = args.cache or output_dir / f"{prefix}_embedding_metadata_cache.jsonl"
         api_key = gemini_api_key(args.gemini_api_key)
         client = None
-        if api_key:
+        if api_key or use_vertex(api_key, auth_mode=args.auth_mode, project=args.vertex_project):
             client = make_llm_client(
+                auth_mode=args.auth_mode, vertex_project=args.vertex_project,
+                vertex_location=args.vertex_location,
                 api_key=api_key,
                 model=args.model,
                 base_url=args.base_url,

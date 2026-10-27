@@ -27,7 +27,7 @@ A pipeline JSON document has `version: 1`, `output_root`, optional `inputs`, opt
 
 Relative paths are interpreted relative to the configuration file. Shared inputs supply initial artifacts; subsequent stages use the latest applicable predecessor. Stage options override shared settings. Stage commands accept an options JSON file plus explicit feature input flags and repeated `--set KEY=VALUE` overrides. Relative paths in CLI overrides use the working directory. `--output-root` overrides a pipeline's configured run root.
 
-Unknown options and options that do not apply to an operation are errors. Credentials use `api_key_env` and `embedding_api_key_env`; literal API keys are not accepted in pipeline configuration.
+Unknown options and options that do not apply to an operation are errors. API key credentials use `api_key_env` and `embedding_api_key_env`; Google Cloud uses ADC. Literal credentials are not accepted in pipeline configuration.
 
 ## Collection
 
@@ -43,9 +43,51 @@ The new execution service defaults to full PDFs; abstract surrogate files requir
 - `convert`: the same inputs plus an optional extractor; creates Markdown and a paper index.
 - `index`: `run_dir`, with chunk size/overlap controls; writes a separate indexed stage containing the source artifacts.
 - `search`: `run_dir`, `query`, optional `limit`; writes retrieved evidence.
-- `write`: indexed `run_dir`, `goal`, and optional generation/retrieval controls; writes `report.md`. Without a generation key it uses the existing offline evidence-report path.
+- `write`: indexed `run_dir`, `goal`, and optional generation/retrieval controls; writes `report.md`. Without configured generation credentials it uses the existing offline evidence-report path.
 
 The review recipe can run without model credentials. Its small synthetic fixture demonstrates software behavior, not research findings.
+
+## Authentication
+
+Gemini generation (including PDF extraction, citation collection, review writing, and feature processing) and embeddings support API keys and Vertex AI ADC. OpenAI-compatible providers continue to use API keys. The default installation includes the Google authentication library; the gcloud executable is needed only to set up a local user login, not for each model request.
+
+For local Google Cloud use, run `gcloud auth application-default login`, and set `GOOGLE_CLOUD_PROJECT` and optionally `GOOGLE_CLOUD_LOCATION` (default `us-central1`) before starting the app or CLI. Use a project with billing, the Vertex AI API enabled, and an account with Vertex AI permissions. `gcloud auth login` alone does not configure ADC. Google documents [ADC setup](https://cloud.google.com/docs/authentication/provide-credentials-adc) and [Vertex AI authentication](https://cloud.google.com/vertex-ai/docs/authentication).
+
+Provider configuration accepts:
+
+```json
+{
+  "provider": "gemini",
+  "model": "gemini-2.5-flash",
+  "auth_mode": "adc",
+  "vertex_project": "your-project-id",
+  "vertex_location": "us-central1"
+}
+```
+
+Put these fields under `providers` in a pipeline or at the top level of a feature stage config. For a ready-to-run structure, copy [the Vertex AI recipe](../examples/features/pipeline.vertex.json) and set your project environment variable. Existing API key recipes also use Vertex AI when `GOOGLE_GENAI_USE_VERTEXAI=true` is set.
+
+Authentication selection is deterministic:
+
+- `auth_mode: "api_key"` forces API key authentication, even when Google Cloud environment variables are set.
+- `auth_mode: "adc"` forces Vertex AI and requires `vertex_project` or `GOOGLE_CLOUD_PROJECT`; API keys are ignored.
+- `auth_mode: "auto"` (default) selects Vertex AI when an explicit `vertex_project` is supplied, when `GOOGLE_GENAI_USE_VERTEXAI=true` is set, or when no Gemini key is available and `GOOGLE_CLOUD_PROJECT` is set. Otherwise it uses the API key.
+
+Explicit project and location fields override environment values. Generation and embedding model availability varies by region. `global` uses the global endpoint for models that support it; use a supported region such as `us-central1` for `gemini-embedding-001`. Never put access tokens or credential JSON into pipeline files. ADC also supports `GOOGLE_APPLICATION_CREDENTIALS`, workload identity, and attached service accounts without a gcloud installation.
+
+Merge stages inherit generation authentication and accept independent `embedding_auth_mode`, `embedding_vertex_project`, and `embedding_vertex_location` overrides. For example, an OpenAI generation provider can use Vertex embeddings by setting `embedding_auth_mode: "adc"` and `embedding_vertex_project`. `embedding_api_key_env` continues to select an embedding API key environment variable.
+
+Citation collection uses `llm_provider: "gemini"`, `llm_model`, and the same `auth_mode` / `vertex_project` / `vertex_location` fields in standalone configs. Pipeline citation stages inherit the shared provider settings. Standalone review writing accepts `provider: "gemini"` with these same fields; writing without any credentials still uses the offline report path.
+
+Analysis operations `calibrate`, `metadata`, `cluster`, `compare`, and `tsne` accept `auth_mode`, `vertex_project`, and `vertex_location` through JSON or `--set`:
+
+```bash
+uv run lit-review analysis tsne --output-root runs/tsne \
+  --set features=path/to/features.jsonl --set auth_mode=adc \
+  --set vertex_project=your-project-id --set vertex_location=us-central1
+```
+
+Cache-only analysis still works without credentials. For API key authentication, use `GEMINI_API_KEY` or `GOOGLE_API_KEY` for Gemini and `OPENAI_API_KEY` for OpenAI; explicit `api_key_env` selects a different environment variable. UI session keys are passed to background jobs in memory.
 
 ## Features
 

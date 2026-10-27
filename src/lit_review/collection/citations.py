@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from lit_review.core.google_auth import ADCAuth, use_vertex, vertex_model_url
+
 from lit_review.core.io import write_json
 
 
@@ -438,14 +440,18 @@ def call_gemini_citation_extraction(
         "generationConfig": generation_config,
     }
     model_name = str(config["llm_model"]).removeprefix("models/")
-    url = (
-        f"{GEMINI_GENERATE_URL.format(model=urllib.parse.quote(model_name, safe=''))}"
-        f"?{urllib.parse.urlencode({'key': config['llm_api_key']})}"
-    )
+    if use_vertex(config.get("llm_api_key"), auth_mode=config.get("auth_mode", "auto"),
+                  project=config.get("vertex_project")):
+        url = vertex_model_url(config.get("vertex_project"), config.get("vertex_location"), model_name)
+        url += ":generateContent"
+        headers = ADCAuth().headers(url)
+    else:
+        url = GEMINI_GENERATE_URL.format(model=urllib.parse.quote(model_name, safe=""))
+        headers = {"x-goog-api-key": config["llm_api_key"]}
     response = post_json(
         url,
         payload,
-        headers={},
+        headers=headers,
         timeout=float(config["timeout"]),
         retries=int(config["retries"]),
         sleep_seconds=float(config["backoff"]),

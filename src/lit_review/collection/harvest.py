@@ -8,6 +8,8 @@ APIs expose them, and records every candidate and download outcome.
 
 from __future__ import annotations
 
+from lit_review.core.google_auth import use_vertex
+
 import csv
 import dataclasses
 import hashlib
@@ -1995,7 +1997,11 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                     )
                     continue
 
-                if not config.get("llm_api_key"):
+                vertex = config.get("llm_provider") == "gemini" and use_vertex(
+                    config.get("llm_api_key"), auth_mode=config.get("auth_mode", "auto"),
+                    project=config.get("vertex_project"),
+                )
+                if not config.get("llm_api_key") and not vertex:
                     provider = config.get("llm_provider")
                     if provider == "gemini":
                         raise ValueError(

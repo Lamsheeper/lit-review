@@ -236,6 +236,9 @@ def run_annotation(
     model: str,
     base_url: str,
     api_provider: str = "auto",
+    auth_mode: str = "auto",
+    vertex_project: str | None = None,
+    vertex_location: str | None = None,
     reasoning_effort: str | None,
     batch_features: int,
     goal_path: Path | None = None,
@@ -276,9 +279,10 @@ def run_annotation(
         )
 
     if client is None:
-        if not api_key:
-            raise ValueError("An API key is required unless --dry-run is used.")
         client = make_llm_client(
+            auth_mode=auth_mode,
+            vertex_project=vertex_project,
+            vertex_location=vertex_location,
             api_key=api_key,
             model=model,
             base_url=base_url,

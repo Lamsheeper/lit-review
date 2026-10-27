@@ -7,6 +7,9 @@ and paper counts, with optional category and mention_count fields.
 """
 
 from __future__ import annotations
+
+from lit_review.core.llm import make_llm_client
+from lit_review.embeddings.core import add_google_auth_arguments
 from lit_review.core.context import PROFILE
 from lit_review.core.json_response import parse_json_content
 from lit_review.core.text import normalize_feature_name
@@ -18,8 +21,6 @@ import math
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -965,7 +966,7 @@ def build_semantic_matches(
     feature_set_1: FeatureSet,
     feature_set_2: FeatureSet,
     *,
-    api_key: str,
+    api_key: str | None,
     model: str,
     base_url: str,
     timeout: float,
@@ -973,6 +974,9 @@ def build_semantic_matches(
     candidate_limit: int,
     batch_size: int,
     confidence_threshold: float,
+    auth_mode: str = "auto",
+    vertex_project: str | None = None,
+    vertex_location: str | None = None,
 ) -> list[SemanticMatch]:
     groups = semantic_candidate_groups(
         feature_set_1,
@@ -988,6 +992,7 @@ def build_semantic_matches(
         prompt = build_semantic_match_prompt(batch)
         raw_response = call_gemini_json(
             prompt,
+            auth_mode=auth_mode, vertex_project=vertex_project, vertex_location=vertex_location,
             api_key=api_key,
             model=model,
             base_url=base_url,
@@ -1128,42 +1133,23 @@ def feature_prompt_record(record_id: str, record: FeatureRecord) -> dict[str, An
 def call_gemini_json(
     prompt: str,
     *,
-    api_key: str,
+    api_key: str | None,
     model: str,
     base_url: str,
     timeout: float,
+    auth_mode: str = "auto",
+    vertex_project: str | None = None,
+    vertex_location: str | None = None,
 ) -> str:
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.0,
-            "responseMimeType": "application/json",
-        },
-    }
-    url = f"{base_url.rstrip('/')}/models/{model.removeprefix('models/')}:generateContent"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-        },
-        method="POST",
+    client = make_llm_client(
+        api_key=api_key, model=model, base_url=base_url, timeout=timeout,
+        api_provider="gemini", reasoning_effort=None,
+        auth_mode=auth_mode, vertex_project=vertex_project, vertex_location=vertex_location,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Gemini API returned HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Gemini API request failed: {exc}") from exc
-
-    try:
-        parts = data["candidates"][0].get("content", {}).get("parts", [])
-        return "".join(str(part.get("text") or "") for part in parts).strip()
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Unexpected Gemini API response: {data}") from exc
+    return client.chat(
+        [{"role": "user", "content": prompt}], temperature=0.0,
+        response_format={"type": "json_object"},
+    )
 
 
 def parse_semantic_match_response(
@@ -1267,10 +1253,8 @@ def write_semantic_matches_json(
     return path
 
 
-def gemini_api_key(cli_value: str | None) -> str:
+def gemini_api_key(cli_value: str | None) -> str | None:
     api_key = cli_value or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("Gemini matching requires --gemini-api-key, GEMINI_API_KEY, or GOOGLE_API_KEY.")
     return api_key
 
 
@@ -1686,6 +1670,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prefix", help="Filename prefix for generated PNGs.")
     parser.add_argument("--dpi", type=positive_int, default=200, help="Output image DPI.")
+    add_google_auth_arguments(parser)
     return parser
 
 
@@ -1794,6 +1779,8 @@ def main(argv: list[str] | None = None) -> int:
             semantic_matches = build_semantic_matches(
                 feature_set_1,
                 feature_set_2,
+                auth_mode=args.auth_mode, vertex_project=args.vertex_project,
+                vertex_location=args.vertex_location,
                 api_key=gemini_api_key(args.gemini_api_key),
                 model=args.gemini_model,
                 base_url=args.gemini_base_url,

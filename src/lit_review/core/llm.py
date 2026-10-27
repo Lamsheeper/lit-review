@@ -14,7 +14,8 @@ import urllib.request
 from typing import Any
 
 
-from lit_review.core.chat import ChatCompletionClient
+from lit_review.core.chat import ChatCompletionClient, ChatResult
+from lit_review.core.google_auth import ADCAuth, use_vertex, vertex_model_url
 
 
 def clean_api_key(api_key: str) -> str:
@@ -162,14 +163,25 @@ def build_gemini_generate_content_payload(
 class GeminiGenerateContentClient:
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None,
         model: str,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta",
         reasoning_effort: str | None = None,
         timeout: float = 120.0,
+        vertex_project: str | None = None,
+        vertex_location: str | None = None,
+        auth_mode: str = "auto",
     ) -> None:
-        self.api_key = clean_api_key(api_key)
-        self.model = model
+        self.vertex = use_vertex(api_key, auth_mode=auth_mode, project=vertex_project)
+        self.auth = ADCAuth() if self.vertex else None
+        if not self.vertex and not api_key:
+            raise ValueError("A Gemini API key or Vertex AI ADC configuration is required.")
+        self.api_key = clean_api_key(api_key) if api_key and not self.vertex else None
+        self.model = model.removeprefix("models/")
+        self.url = (
+            vertex_model_url(vertex_project, vertex_location, model)
+            if self.vertex else f"{native_gemini_base_url(base_url)}/models/{self.model}"
+        ) + ":generateContent"
         self.base_url = native_gemini_base_url(base_url)
         self.reasoning_effort = reasoning_effort
         self.timeout = timeout
@@ -181,6 +193,15 @@ class GeminiGenerateContentClient:
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> str:
+        return self.chat_result(messages, temperature, max_tokens, response_format).content
+
+    def chat_result(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> ChatResult:
         payload = build_gemini_generate_content_payload(
             messages=messages,
             model=self.model,
@@ -190,11 +211,11 @@ class GeminiGenerateContentClient:
             response_format=response_format,
         )
         request = urllib.request.Request(
-            f"{self.base_url}/models/{self.model}:generateContent",
+            self.url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "x-goog-api-key": self.api_key,
+                **(self.auth.headers(self.url) if self.auth else {"x-goog-api-key": self.api_key}),
             },
             method="POST",
         )
@@ -215,20 +236,28 @@ class GeminiGenerateContentClient:
             if not text:
                 finish_reason = str(candidate.get("finishReason") or "unknown")
                 raise RuntimeError(f"Gemini returned an empty response (finish_reason={finish_reason}).")
-            return text
+            reason = candidate.get("finishReason")
+            return ChatResult(
+                content=text,
+                finish_reason={"MAX_TOKENS": "length", "STOP": "stop"}.get(reason, reason),
+                usage=data.get("usageMetadata"),
+            )
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Unexpected Gemini API response: {data}") from exc
 
 
 def make_llm_client(
     *,
-    api_key: str,
+    api_key: str | None,
     model: str,
     base_url: str,
     reasoning_effort: str | None,
     api_provider: str = "auto",
     input_mode: str = "text",
     timeout: float | None = None,
+    auth_mode: str = "auto",
+    vertex_project: str | None = None,
+    vertex_location: str | None = None,
 ) -> Any:
     client_timeout = 120.0 if timeout is None else max(1.0, float(timeout))
     if should_use_gemini_native_client(
@@ -237,12 +266,19 @@ def make_llm_client(
         input_mode=input_mode,
     ):
         return GeminiGenerateContentClient(
-            api_key=clean_api_key(api_key),
+            api_key=api_key,
             model=model,
             base_url=base_url,
             reasoning_effort=reasoning_effort,
             timeout=client_timeout,
+            auth_mode=auth_mode,
+            vertex_project=vertex_project,
+            vertex_location=vertex_location,
         )
+    if auth_mode == "adc" or vertex_project:
+        raise ValueError("Vertex AI ADC authentication requires the Gemini provider.")
+    if not api_key:
+        raise ValueError("An API key is required for the OpenAI provider.")
     return ChatCompletionClient(
         api_key=clean_api_key(api_key),
         model=model,
