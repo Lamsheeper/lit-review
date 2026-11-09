@@ -5,7 +5,9 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(detail.detail || response.statusText);
+    const message = typeof detail.detail === 'object' ? detail.detail.message : detail.detail;
+    if(detail.detail?.readiness && typeof window !== 'undefined')window.dispatchEvent(new CustomEvent('readiness-needed',{detail:detail.detail.readiness}));
+    throw new Error(message || response.statusText);
   }
   return response.json();
 }
@@ -28,6 +30,7 @@ export type Project = {
     extracted: boolean;
   };
   jobs?: Job[];
+  setup?: {request:string;status:string;message?:string} | null;
 };
 
 export type Job = {
@@ -70,3 +73,6 @@ export type RelevanceProfile = {
   metadata_weights: { source_relevance: number; citation_impact: number; recency: number; open_access: number; doi: number };
   exclusions: { term: string; penalty: number; reason: string }[];
 };
+
+
+export type Readiness={ready:boolean;message:string;requirements:{id:string;kind:string;label:string;message:string;field?:string}[]};

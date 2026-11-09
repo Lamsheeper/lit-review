@@ -1507,6 +1507,8 @@ def load_candidate_cache(path: Path) -> dict[str, Any] | None:
         payload = raw
     else:
         raise ValueError(f"Candidate cache must contain an object or list: {path}")
+    if payload.get("complete") is False:
+        return None
     if not isinstance(raw_candidates, list) or not raw_candidates:
         return None
 
@@ -1662,6 +1664,29 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             clients = build_clients(config, http)
+            completed_searches = 0
+
+            def publish_search(source="", query_text=""):
+                # Partial searches are previews, never reusable candidate caches.
+                preview = ensure_candidate_ids(
+                    rank_candidates(merge_candidates(candidates), extracted, relevance_profile)
+                )
+                write_json(
+                    logs_dir / "candidates.live.json",
+                    {
+                        "complete": False,
+                        "generated_at": utc_now(),
+                        "progress": {
+                            "source": source,
+                            "query": query_text,
+                            "completed": completed_searches,
+                            "total": len(queries) * len(clients),
+                        },
+                        "candidates": [dataclasses.asdict(candidate) for candidate in preview],
+                    },
+                )
+
+            publish_search()
             for query in queries:
                 for client in clients:
                     try:
@@ -1698,6 +1723,9 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                                 "reason": str(exc),
                             }
                         )
+                    finally:
+                        completed_searches += 1
+                        publish_search(client.name, query.text)
 
             candidates = merge_candidates(candidates)
             candidates = ensure_candidate_ids(rank_candidates(candidates, extracted, relevance_profile))
@@ -1998,7 +2026,8 @@ def run_citation_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                     continue
 
                 vertex = config.get("llm_provider") == "gemini" and use_vertex(
-                    config.get("llm_api_key"), auth_mode=config.get("auth_mode", "auto"),
+                    config.get("llm_api_key"),
+                    auth_mode=config.get("auth_mode", "auto"),
                     project=config.get("vertex_project"),
                 )
                 if not config.get("llm_api_key") and not vertex:

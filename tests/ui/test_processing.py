@@ -99,6 +99,7 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(before, sorted(self.path.rglob("*")))
         application.SESSION_CREDENTIALS["OPENAI_API_KEY"] = "session-secret"
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "embedding-test-key"
         self.client.put(
             f"/api/projects/{self.id}/stages/score/config", json={"provider": "openai", "model": "test"}
         )
@@ -117,9 +118,11 @@ class ProcessingUiTests(unittest.TestCase):
             json={"auth_mode": "adc", "vertex_project": "test-project", "vertex_location": "us-central1"},
         )
         self.assertEqual(response.status_code, 200)
-        with patch.dict(os.environ, {}, clear=True), patch.object(
-            application.jobs, "start", return_value={"id": "fake"}
-        ) as start:
+        with (
+            patch("google.auth.default", return_value=(object(), "test-project")),
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(application.jobs, "start", return_value={"id": "fake"}) as start,
+        ):
             response = self.client.post(f"/api/projects/{self.id}/extraction/run")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(start.call_args.args[3], {})
@@ -139,9 +142,11 @@ class ProcessingUiTests(unittest.TestCase):
             json={"auth_mode": "adc", "vertex_project": "test-project"},
         )
         self.assertEqual(response.status_code, 200)
-        with patch.dict(os.environ, {}, clear=True), patch.object(
-            application.jobs, "start", return_value={"id": "fake"}
-        ) as start:
+        with (
+            patch("google.auth.default", return_value=(object(), "test-project")),
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(application.jobs, "start", return_value={"id": "fake"}) as start,
+        ):
             response = self.client.post(f"/api/projects/{self.id}/stages/filter/run")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(start.call_args.args[3], {})

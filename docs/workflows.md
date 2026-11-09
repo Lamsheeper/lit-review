@@ -53,6 +53,19 @@ Gemini generation (including PDF extraction, citation collection, review writing
 
 For local Google Cloud use, run `gcloud auth application-default login`, and set `GOOGLE_CLOUD_PROJECT` and optionally `GOOGLE_CLOUD_LOCATION` (default `us-central1`) before starting the app or CLI. Use a project with billing, the Vertex AI API enabled, and an account with Vertex AI permissions. `gcloud auth login` alone does not configure ADC. Google documents [ADC setup](https://cloud.google.com/docs/authentication/provide-credentials-adc) and [Vertex AI authentication](https://cloud.google.com/vertex-ai/docs/authentication).
 
+The Studio can configure this without a terminal login:
+
+1. Open **Credentials → Google Cloud** (also linked from missing-credential checks).
+2. Enter your project ID and region. Leave **Use Google Cloud by default** checked to use Vertex AI for automatic Gemini generation and embeddings.
+3. Click **Sign in with Google**, then **Open Google sign-in**. Complete Google's authorization and paste its authorization code into the app. Click **Complete sign-in**.
+4. Click **Check credentials** to verify ADC can refresh an access token. This checks authentication without calling a paid model; project permissions, API enablement, billing, and model availability still apply.
+
+The app uses gcloud's documented [`--no-launch-browser` flow](https://cloud.google.com/sdk/gcloud/reference/auth/application-default/login), so the browser can be on a different machine from the app. Install the Google Cloud CLI on the app's machine first. Login can be cancelled and expires after ten minutes. gcloud saves ADC in its standard user credential location; signing in replaces any existing user ADC there. The app sends the code to gcloud in memory and does not write codes, access tokens, or gcloud output into project files or job logs.
+
+Only the nonsecret defaults (`enabled`, `project`, `location`) are saved in `google_cloud.json` under the app's project root (`projects/` by default, or `LIT_REVIEW_UI_PROJECTS_DIR`). They reload when the app starts and apply to readiness checks, project setup, generation, and background jobs. Turning off **Use Google Cloud by default** restores the environment settings the app started with; it does not revoke your Google credentials. Explicit stage authentication, project, and region fields still take precedence. CLI processes launched independently of the app still use their own environment/config files.
+
+If `GOOGLE_APPLICATION_CREDENTIALS` selects an external credential file, the panel verifies that file instead of starting a gcloud user login. Unset the variable and restart the app if you want to switch to user ADC. Existing service-account credentials can be verified even when gcloud is not installed.
+
 Provider configuration accepts:
 
 ```json
@@ -124,3 +137,9 @@ uv run lit-review analysis tsne --output-root runs/tsne \
 ```
 
 The example has only two rows; use at least three usable features for an actual t-SNE run. No credential is needed for the preview. Wikidata analysis consumes existing mapping artifacts; it does not perform new entity mapping.
+
+## Live studio results
+
+The collection screen shows a searchable, paginated paper list as each metadata search finishes. Extraction shows features as each PDF or batch is saved, with paper and mention counts. Download statuses and later feature inventories refresh automatically. Tables have their own vertical scroll area and sticky headers. Search and scroll position stay in place during updates. Intermediate features are provisional until the stage completes.
+
+Search previews are atomically published to `logs/candidates.live.json` and are never reused as completed candidate caches. Cancelling preserves the last committed preview. Live preview endpoints do not change the user's PDF selection, and new jobs do not present a previous job's preview as new output. The normal candidate cache is written only after search completes; completed collection output and manual selections retain their existing behavior.

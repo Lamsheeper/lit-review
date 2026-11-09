@@ -7,13 +7,14 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from lit_review.features.extraction import PDF_EXTRACTION_SYSTEM_PROMPT
 from lit_review.features.prompts import build_pdf_extraction_prompt
@@ -26,12 +27,15 @@ from lit_review.collection.relevance import validate_relevance_profile
 from lit_review.evidence.review import extract_json_object
 from lit_review.core.taxonomy import load_taxonomy, validate_taxonomy
 
+from .readiness import summarize, provider_requirements, document_requirements
 from .jobs import JobManager
 from .store import ProjectStore
+from .google_cloud import GoogleCloudSetup, CloudSettings
 
 
 FRONTEND_DIST = Path(__file__).resolve().parent / "frontend" / "dist"
 SESSION_CREDENTIALS: dict[str, str] = {}
+SETUP_LOCKS: dict[str, threading.Lock] = {}
 store: ProjectStore
 jobs: JobManager
 from contextlib import asynccontextmanager
@@ -43,15 +47,93 @@ async def lifespan(app):
     if "store" not in globals():
         store = ProjectStore()
         jobs = JobManager(store)
-    yield
+    cloud_setup().apply()
+    try:
+        yield
+    finally:
+        cloud_setup().close()
 
 
 app = FastAPI(title="Lit Review UI", version="0.2.0", lifespan=lifespan)
 
 
+def cloud_setup() -> GoogleCloudSetup:
+    if not hasattr(store, "google_cloud"):
+        store.google_cloud = GoogleCloudSetup(store.root)
+    return store.google_cloud
+
+
+def require_same_origin(request: Request):
+    from urllib.parse import urlsplit
+
+    origin = request.headers.get("origin")
+    if request.headers.get("sec-fetch-site") == "cross-site" or (
+        origin and urlsplit(origin).netloc != request.headers.get("host")
+    ):
+        raise HTTPException(403, "Open Google Cloud settings from this app to continue.")
+
+
+@app.get("/api/settings/google-cloud")
+def google_cloud_status():
+    return cloud_setup().status()
+
+
+@app.put("/api/settings/google-cloud")
+def save_google_cloud(payload: CloudSettings, request: Request):
+    require_same_origin(request)
+    try:
+        return cloud_setup().save(payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/settings/google-cloud/login")
+def start_google_login(request: Request):
+    require_same_origin(request)
+    try:
+        return cloud_setup().start_login()
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+class GoogleLoginCode(BaseModel):
+    code: SecretStr
+
+
+@app.post("/api/settings/google-cloud/login/{login_id}/code")
+def complete_google_login(login_id: str, payload: GoogleLoginCode, request: Request):
+    require_same_origin(request)
+    try:
+        return cloud_setup().submit_code(login_id, payload.code.get_secret_value())
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.delete("/api/settings/google-cloud/login/{login_id}")
+def cancel_google_login(login_id: str, request: Request):
+    require_same_origin(request)
+    try:
+        return cloud_setup().cancel(login_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/settings/google-cloud/check")
+def check_google_cloud(request: Request):
+    require_same_origin(request)
+    try:
+        return cloud_setup().check_credentials()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 class ProjectCreate(BaseModel):
     name: str
     description: str = ""
+
+
+class StartRequest(BaseModel):
+    request: str = Field(min_length=1, max_length=5000)
 
 
 class ProjectUpdate(BaseModel):
@@ -157,11 +239,16 @@ def write_config(path: Path, payload: dict[str, Any]) -> None:
 
 
 def credential_env() -> dict[str, str]:
-    return {
+    credentials = {
         key: value
         for key, value in SESSION_CREDENTIALS.items()
-        if key in {"GEMINI_API_KEY", "OPENAI_API_KEY", "SEMANTIC_SCHOLAR_API_KEY"}
+        if key in {
+            "GEMINI_API_KEY", "OPENAI_API_KEY", "SEMANTIC_SCHOLAR_API_KEY",
+            "BRAVE_SEARCH_API_KEY", "SERPAPI_API_KEY",
+        }
     }
+    credentials.update(cloud_setup().environment())
+    return credentials
 
 
 def launch_job(
@@ -177,7 +264,11 @@ def launch_job(
 
 def provider_key(provider: str) -> str | None:
     if provider == "gemini":
-        return SESSION_CREDENTIALS.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        return (
+            SESSION_CREDENTIALS.get("GEMINI_API_KEY")
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        )
     return SESSION_CREDENTIALS.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
 
@@ -191,15 +282,175 @@ def require_provider_configuration(config: dict) -> None:
         raise HTTPException(422, "Configure an API key or Google Cloud ADC for the selected provider")
     if vertex:
         try:
-            vertex_model_url(config.get("vertex_project"), config.get("vertex_location"), config.get("model", "gemini-2.5-flash"))
+            vertex_model_url(
+                config.get("vertex_project"),
+                config.get("vertex_location"),
+                config.get("model", "gemini-2.5-flash"),
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+
+
+def named_key(name):
+    return (
+        SESSION_CREDENTIALS.get(name)
+        or os.getenv(name)
+        or (os.getenv("GOOGLE_API_KEY") if name == "GEMINI_API_KEY" else None)
+    )
+
+
+def automatic_provider():
+    cloud_setup()
+    gemini = bool(named_key("GEMINI_API_KEY")) or use_vertex(None, auth_mode="auto")
+    return "gemini" if gemini or not named_key("OPENAI_API_KEY") else "openai"
+
+
+def check_readiness(project_id=None, action="flow", deep=False):
+    requirements = []
+    path = project_dir(project_id) if project_id else None
+    provider = automatic_provider()
+    generation = {
+        "provider": provider,
+        "model": "gemini-2.5-flash" if provider == "gemini" else "gpt-4o-mini",
+    }
+    extraction = get_extraction_config(project_id) if path else generation
+    if action in ("flow", "setup", "collect"):
+        configs = [generation] if not path or action == "setup" else [extraction]
+        if path and action in ("flow", "collect"):
+            for stage in ("filter", "annotate", "merge"):
+                configs.append({**extraction, **(read_json(path / f"configs/{stage}.json", {}) or {})})
+        for config in configs:
+            requirements.extend(
+                provider_requirements(config, named_key, "literature search and feature extraction")
+            )
+        merge = {**extraction, **((read_json(path / "configs/merge.json", {}) or {}) if path else {})}
+        requirements.extend(
+            provider_requirements(merge, named_key, "merging related concepts", embedding=True)
+        )
+    elif action in ("extract", "filter", "annotate", "merge", "score"):
+        config = (
+            extraction
+            if action == "extract"
+            else {**extraction, **(read_json(path / f"configs/{action}.json", {}) or {})}
+        )
+        requirements.extend(provider_requirements(config, named_key, action))
+        if action == "merge":
+            requirements.extend(
+                provider_requirements(config, named_key, "merging related concepts", embedding=True)
+            )
+    if path and action == "extract":
+        files, _ = document_requirements(
+            path, read_json, lambda row: stable_candidate_id(candidate_from_dict(row)), deep
+        )
+        requirements.extend(files)
+    if path and action in ("flow", "collect"):
+        for source in get_collection_config(project_id).get("web_search_sources", []):
+            key = {"brave": "BRAVE_SEARCH_API_KEY", "serpapi": "SERPAPI_API_KEY"}.get(source)
+            if key and not named_key(key):
+                requirements.append(
+                    {
+                        "id": key,
+                        "field": key,
+                        "kind": "credential",
+                        "label": source + " search API key",
+                        "message": f"Add {key} to use the selected {source} search source, or turn that source off.",
+                    }
+                )
+    if path and action == "collect":
+        try:
+            if not (path / "draft.md").read_text().strip():
+                raise ValueError()
+        except (OSError, ValueError):
+            requirements.append(
+                {
+                    "id": "search_brief",
+                    "kind": "file",
+                    "label": "Search brief",
+                    "message": "Prepare the research setup before searching for papers.",
+                }
+            )
+    if path and action == "download":
+        try:
+            selection = (read_json(path / "selection.json", {}) or {}).get("candidate_ids", [])
+            rows = load_candidates(candidate_path(path))
+            known = {r["candidate_id"] for r in rows}
+            if not selection or not set(selection).issubset(known):
+                raise ValueError()
+        except (OSError, ValueError, TypeError):
+            requirements.append(
+                {
+                    "id": "paper_selection",
+                    "kind": "file",
+                    "label": "Paper selection",
+                    "message": "Search for papers and save a current selection before downloading PDFs.",
+                }
+            )
+    if path and action in ("flow", "collect", "merge"):
+        options = read_json(path / "configs/merge.json", {}) or {}
+        category_file = options.get("category_config")
+        if category_file:
+            try:
+                if not isinstance(read_json(Path(category_file)), dict):
+                    raise ValueError()
+            except (OSError, ValueError, TypeError):
+                requirements.append(
+                    {
+                        "id": "category_config",
+                        "kind": "file",
+                        "label": "Merge category settings",
+                        "message": "Provide a readable JSON merge-category settings file before starting.",
+                    }
+                )
+    return summarize(requirements)
+
+
+def require_readiness(result):
+    if not result["ready"]:
+        raise HTTPException(409, detail={"message": result["message"], "readiness": result})
+
+
+@app.get("/api/readiness")
+def startup_readiness():
+    return check_readiness()
+
+
+@app.get("/api/projects/{project_id}/readiness")
+def project_readiness(project_id: str, action: str = "flow"):
+    if action not in (
+        "flow",
+        "setup",
+        "collect",
+        "download",
+        "extract",
+        "filter",
+        "annotate",
+        "merge",
+        "score",
+        "results",
+    ):
+        raise HTTPException(422, "Unknown readiness check")
+    return check_readiness(project_id, action)
 
 
 def default_base_url(provider: str) -> str:
     if provider == "gemini":
         return "https://generativelanguage.googleapis.com/v1beta"
     return "https://api.openai.com/v1"
+
+
+def download_statuses(path: Path) -> dict:
+    ledger = read_json(path / "run/stages/collect/logs/download_log.json", {}) or {}
+    statuses = {}
+    for record in ledger.get("records", []):
+        if isinstance(record, dict):
+            key = record.get("candidate_id") or stable_candidate_id(candidate_from_dict(record))
+            statuses[key] = record.get("status")
+    final = read_json(path / "run/stages/collect/logs/manifest.json", {}) or {}
+    for record in final.get("candidates", []):
+        if isinstance(record, dict):
+            key = stable_candidate_id(candidate_from_dict(record))
+            statuses.setdefault(key, (record.get("download") or {}).get("status"))
+    return statuses
 
 
 def load_candidates(path: Path) -> list[dict[str, Any]]:
@@ -263,6 +514,20 @@ def create_project(payload: ProjectCreate) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.post("/api/projects/start")
+def start_project(payload: StartRequest) -> dict[str, Any]:
+    request = payload.request.strip()
+    if not request:
+        raise HTTPException(422, "Describe a concept or research question to get started.")
+    require_readiness(check_readiness())
+    name = " ".join(request.split())
+    project = store.create_project(name[:80], request)
+    store.write_json(
+        store.project_dir(project["id"]) / "setup.json", {"request": request, "status": "pending"}
+    )
+    return get_project(project["id"])
+
+
 @app.get("/api/projects/{project_id}")
 def get_project(project_id: str) -> dict[str, Any]:
     try:
@@ -270,6 +535,13 @@ def get_project(project_id: str) -> dict[str, Any]:
     except KeyError as exc:
         raise HTTPException(404, "Project not found.") from exc
     project["jobs"] = store.list_jobs(project_id)
+    setup_path = store.project_dir(project_id) / "setup.json"
+    setup = read_json(setup_path)
+    lock = SETUP_LOCKS.get(project_id)
+    if setup and setup.get("status") == "running" and (not lock or not lock.locked()):
+        setup["status"] = "pending"
+        store.write_json(setup_path, setup)
+    project["setup"] = setup
     return project
 
 
@@ -329,6 +601,7 @@ def generate_documents(project_id: str, payload: GeneratePayload) -> dict[str, A
     )
     if not api_key and not vertex:
         raise HTTPException(422, f"No {payload.provider} API key or Vertex AI configuration is available.")
+    require_readiness(summarize(provider_requirements(payload.model_dump(), named_key, "project definition")))
     try:
         client = make_llm_client(
             api_key=api_key,
@@ -413,6 +686,68 @@ USER REQUEST:
     }
 
 
+@app.post("/api/projects/{project_id}/setup")
+def setup_project(project_id: str) -> dict[str, Any]:
+    path = project_dir(project_id)
+    saved = read_json(path / "setup.json")
+    if not saved:
+        raise HTTPException(422, "This project has no saved research request.")
+    lock = SETUP_LOCKS.setdefault(project_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "Your workspace is already being prepared.")
+    try:
+        saved = read_json(path / "setup.json")
+        if saved.get("status") == "ready":
+            return saved
+        require_readiness(check_readiness(project_id, "setup"))
+        gemini = bool(provider_key("gemini")) or use_vertex(None, auth_mode="auto")
+        provider = "gemini" if gemini else "openai"
+        if not gemini and not provider_key("openai"):
+            saved.update(
+                status="needs_credentials",
+                message="Your workspace is saved. Add a Gemini or OpenAI key under Credentials, or configure Google Cloud, to prepare your search automatically.",
+            )
+            store.write_json(path / "setup.json", saved)
+            return saved
+        saved.update(
+            status="running",
+            provider=provider,
+            message="Preparing your search brief and organizing the concepts to look for.",
+        )
+        store.write_json(path / "setup.json", saved)
+        try:
+            generate_documents(
+                project_id,
+                GeneratePayload(
+                    request=saved["request"],
+                    provider=provider,
+                    model="gemini-2.5-flash" if provider == "gemini" else "gpt-4o-mini",
+                ),
+            )
+        except HTTPException:
+            saved.update(
+                status="failed",
+                message="Your workspace and question are saved. We could not prepare the search this time; try again when your model connection is ready.",
+            )
+            store.write_json(path / "setup.json", saved)
+            raise
+        extraction_path = path / "configs/extraction.json"
+        if not extraction_path.exists():
+            write_config(
+                extraction_path,
+                {
+                    **get_extraction_config(project_id),
+                    "provider": provider,
+                    "model": "gemini-2.5-flash" if provider == "gemini" else "gpt-4o-mini",
+                },
+            )
+        saved.update(status="ready", message="Your search brief and feature families are ready.")
+        store.write_json(path / "setup.json", saved)
+        return saved
+    finally:
+        lock.release()
+
+
 @app.get("/api/projects/{project_id}/taxonomy")
 def get_taxonomy(project_id: str) -> dict[str, Any] | None:
     return read_json(project_dir(project_id) / "taxonomy.json")
@@ -447,21 +782,48 @@ def save_relevance_scoring(project_id: str, payload: dict[str, Any]) -> dict[str
 
 @app.get("/api/settings/credential-status")
 def credential_status() -> dict[str, Any]:
-    keys = ["GEMINI_API_KEY", "OPENAI_API_KEY", "SEMANTIC_SCHOLAR_API_KEY"]
-    return {
+    cloud_setup()
+    keys = [
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "SEMANTIC_SCHOLAR_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "SERPAPI_API_KEY",
+    ]
+    result = {
         key: {
-            "available": bool(SESSION_CREDENTIALS.get(key) or os.getenv(key) or (os.getenv("GOOGLE_API_KEY") if key == "GEMINI_API_KEY" else None)),
+            "available": bool(
+                SESSION_CREDENTIALS.get(key)
+                or os.getenv(key)
+                or (os.getenv("GOOGLE_API_KEY") if key == "GEMINI_API_KEY" else None)
+            ),
             "source": "session"
             if SESSION_CREDENTIALS.get(key)
-            else ("environment" if os.getenv(key) or (key == "GEMINI_API_KEY" and os.getenv("GOOGLE_API_KEY")) else None),
+            else (
+                "environment"
+                if os.getenv(key) or (key == "GEMINI_API_KEY" and os.getenv("GOOGLE_API_KEY"))
+                else None
+            ),
         }
         for key in keys
     }
 
+    result["GOOGLE_CLOUD_ADC"] = {
+        "available": use_vertex(None, auth_mode="auto"),
+        "source": "environment" if use_vertex(None, auth_mode="auto") else None,
+    }
+    return result
+
 
 @app.put("/api/settings/session-credentials")
 def set_session_credentials(payload: CredentialsPayload) -> dict[str, Any]:
-    allowed = {"GEMINI_API_KEY", "OPENAI_API_KEY", "SEMANTIC_SCHOLAR_API_KEY"}
+    allowed = {
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "SEMANTIC_SCHOLAR_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "SERPAPI_API_KEY",
+    }
     for key, value in payload.credentials.items():
         if key not in allowed:
             raise HTTPException(422, f"Unsupported credential: {key}")
@@ -536,6 +898,12 @@ def harvest_config(
             "bibtex": True,
         }
     )
+    setup = read_json(path / "setup.json", {}) or {}
+    if setup.get("provider"):
+        config.update(
+            llm_provider=setup["provider"],
+            llm_model="gemini-2.5-flash" if setup["provider"] == "gemini" else "gpt-4o-mini",
+        )
     relevance_path = path / "relevance_scoring.json"
     if relevance_path.exists():
         config["relevance_scoring"] = str(relevance_path)
@@ -543,6 +911,50 @@ def harvest_config(
         config["selected_candidate_ids"] = selected_ids
         config["refresh_candidates"] = False
     return config
+
+
+@app.get("/api/projects/{project_id}/collection/live")
+def live_papers(project_id: str, page: int = 1, page_size: int = 50, query: str = "") -> dict:
+    """Read committed previews without changing the user's download selection."""
+    from datetime import datetime
+
+    path = project_dir(project_id)
+    recent = next(
+        (
+            job
+            for job in store.list_jobs(project_id)
+            if job["kind"] in ("collection_search", "collection_download")
+        ),
+        {},
+    )
+    active = recent.get("status") in ("queued", "running", "cancelling")
+    searching = recent.get("kind") == "collection_search"
+    preview = path / "run/stages/search/logs/candidates.live.json"
+    started = recent.get("started_at") or recent.get("created_at")
+    fresh = bool(
+        preview.exists()
+        and (
+            not started
+            or preview.stat().st_mtime >= datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+        )
+    )
+    partial = searching and recent.get("status") != "completed"
+    candidate_file = preview if partial else candidate_path(path)
+    rows = load_candidates(candidate_file) if not partial or fresh else []
+    progress = (read_json(preview, {}) or {}).get("progress", {}) if partial and fresh else {}
+    statuses = download_statuses(path)
+    for row in rows:
+        row["download_status"] = statuses.get(row["candidate_id"]) or "pending"
+    result = paginate_rows(
+        rows, page=page, page_size=page_size, query=query, sort="relevance_score", order="desc"
+    )
+    result.update(
+        partial=bool(partial),
+        running=bool(active),
+        progress=progress,
+        downloaded=sum(row["download_status"] in ("downloaded", "already_exists") for row in rows),
+    )
+    return result
 
 
 @app.get("/api/projects/{project_id}/collection/candidates")
@@ -557,12 +969,7 @@ def list_candidates(
 ) -> dict[str, Any]:
     path = project_dir(project_id)
     rows = load_candidates(candidate_path(path))
-    manifest = read_json(path / "run/stages/collect/logs/manifest.json", {}) or {}
-    status_by_id = {}
-    for raw in manifest.get("candidates", []):
-        if isinstance(raw, dict):
-            candidate = candidate_from_dict(raw)
-            status_by_id[stable_candidate_id(candidate)] = (raw.get("download") or {}).get("status")
+    status_by_id = download_statuses(path)
     selection_path = path / "selection.json"
     selection = read_json(selection_path)
     candidate_ids = {row["candidate_id"] for row in rows}
@@ -889,12 +1296,9 @@ def project_workflow_status(project_id: str) -> dict:
     except (ValueError, TypeError):
         candidates = []
     selected = set((read_json(path / "selection.json", {}) or {}).get("candidate_ids", []))
-    manifest = read_json(path / "run/stages/collect/logs/manifest.json", {}) or {}
-    downloaded = {
-        stable_candidate_id(candidate_from_dict(row))
-        for row in manifest.get("candidates", [])
-        if (row.get("download") or {}).get("status") in {"downloaded", "already_exists"}
-    }
+    _, downloaded = document_requirements(
+        path, read_json, lambda row: stable_candidate_id(candidate_from_dict(row))
+    )
     active = store.active_job(project_id) or {}
     status = processing_status(project_id)
 
@@ -929,7 +1333,7 @@ def project_workflow_status(project_id: str) -> dict:
             missing=["paper search results"],
         ),
         "candidates": step(
-            bool(selected & downloaded),
+            bool(selected) and selected.issubset(downloaded),
             "collection_download",
             "Download selected PDFs",
             {
@@ -964,6 +1368,12 @@ def project_workflow_status(project_id: str) -> dict:
 def pipeline_job(project_id: str, kind: str, config: PipelineConfig, stages: list[str]) -> dict:
     from uuid import uuid4
 
+    action = {
+        "collection_search": "collect",
+        "collection_download": "download",
+        "direct_pdf_extraction": "extract",
+    }.get(kind, kind)
+    require_readiness(check_readiness(project_id, action, deep=action == "extract"))
     path = project_dir(project_id) / "configs" / (kind + "_" + uuid4().hex + ".json")
     write_config(path, config.model_dump(mode="json"))
     return launch_job(
@@ -987,6 +1397,7 @@ def pipeline_job(project_id: str, kind: str, config: PipelineConfig, stages: lis
 
 @app.post("/api/projects/{project_id}/collection/search")
 def start_search(project_id: str) -> dict:
+    require_readiness(check_readiness(project_id, "collect"))
     path = project_dir(project_id)
     if not (path / "draft.md").read_text().strip():
         raise HTTPException(422, "Save a collection draft first")
@@ -1008,6 +1419,7 @@ def start_search(project_id: str) -> dict:
 
 @app.post("/api/projects/{project_id}/collection/download")
 def start_download(project_id: str) -> dict:
+    require_readiness(check_readiness(project_id, "download"))
     path = project_dir(project_id)
     selected = (read_json(path / "selection.json", {}) or {}).get("candidate_ids", [])
     if not selected:
@@ -1029,6 +1441,7 @@ def start_download(project_id: str) -> dict:
 
 @app.post("/api/projects/{project_id}/extraction/run")
 def start_extraction(project_id: str) -> dict:
+    require_readiness(check_readiness(project_id, "extract"))
     if not project_workflow_status(project_id)["steps"]["candidates"]["complete"]:
         raise HTTPException(422, "Download at least one selected full PDF first")
     config = get_extraction_config(project_id)
@@ -1102,7 +1515,21 @@ def stage_results(
 ) -> dict:
     if artifact not in RESULT_FILES.get(stage, set()) or not artifact.endswith(".jsonl"):
         raise HTTPException(404, "Unknown stage artifact")
-    rows = read_jsonl(project_dir(project_id) / "run/stages" / stage / artifact)
+    from datetime import datetime
+
+    artifact_path = project_dir(project_id) / "run/stages" / stage / artifact
+    active = store.active_job(project_id) or {}
+    kind = "direct_pdf_extraction" if stage == "extract" else stage
+    started = active.get("started_at") or active.get("created_at")
+    if (
+        active.get("kind") == kind
+        and started
+        and artifact_path.exists()
+        and artifact_path.stat().st_mtime < datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+    ):
+        rows = []
+    else:
+        rows = read_jsonl(artifact_path)
     return paginate_rows(
         rows,
         page=page,

@@ -128,13 +128,18 @@ class UiApiTests(unittest.TestCase):
                 app_module.SESSION_CREDENTIALS.clear()
                 if auth_mode == "api_key":
                     app_module.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "test-key"
-                with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(
-                    app_module, "make_llm_client", return_value=FakeClient()
-                ) as factory:
+                with (
+                    mock.patch.dict("os.environ", {}, clear=True),
+                    mock.patch("google.auth.default", return_value=(object(), "test-project")),
+                    mock.patch.object(app_module, "make_llm_client", return_value=FakeClient()) as factory,
+                ):
                     response = self.client.post(
                         f"/api/projects/{project['id']}/documents/generate",
-                        json={"request": "Find requested topic features", "auth_mode": auth_mode,
-                              **({"vertex_project": "test-project"} if auth_mode == "adc" else {})},
+                        json={
+                            "request": "Find requested topic features",
+                            "auth_mode": auth_mode,
+                            **({"vertex_project": "test-project"} if auth_mode == "adc" else {}),
+                        },
                     )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(factory.call_args.kwargs["auth_mode"], auth_mode)
@@ -183,7 +188,14 @@ class UiApiTests(unittest.TestCase):
         self.assertEqual(response.json()["GEMINI_API_KEY"]["source"], "session")
         self.assertEqual(
             set(response.json()),
-            {"GEMINI_API_KEY", "OPENAI_API_KEY", "SEMANTIC_SCHOLAR_API_KEY"},
+            {
+                "GEMINI_API_KEY",
+                "OPENAI_API_KEY",
+                "SEMANTIC_SCHOLAR_API_KEY",
+                "GOOGLE_CLOUD_ADC",
+                "BRAVE_SEARCH_API_KEY",
+                "SERPAPI_API_KEY",
+            },
         )
 
     def test_session_credentials_reject_unused_provider_keys(self):
@@ -422,7 +434,7 @@ class UiApiTests(unittest.TestCase):
         )
 
         workflow = self.client.get(f"/api/projects/{project_id}/workflow").json()["steps"]
-        self.assertTrue(workflow["candidates"]["complete"])
+        self.assertFalse(workflow["candidates"]["complete"])
         self.assertFalse(workflow["extract"]["complete"])
         self.assertFalse(workflow["results"]["complete"])
 
@@ -451,6 +463,76 @@ class UiApiTests(unittest.TestCase):
             json={"year_from": 2025, "year_to": 2020},
         )
         self.assertEqual(response.status_code, 422)
+
+    def test_prompt_first_project_preserves_question_and_needs_no_project_name(self):
+        app_module.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "test-key"
+        response = self.client.post(
+            "/api/projects/start", json={"request": "  How do people express emotion?  "}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        project = response.json()
+        self.assertEqual(project["name"], "How do people express emotion?")
+        self.assertEqual(project["setup"]["request"], "How do people express emotion?")
+        self.assertEqual(project["setup"]["status"], "pending")
+        self.assertEqual(self.client.post("/api/projects/start", json={"request": "  "}).status_code, 422)
+
+    def test_automatic_setup_preserves_request_until_credentials_are_available(self):
+        project = self.client.post("/api/projects", json={"name": "Emotion concepts"}).json()
+        app_module.store.write_json(
+            app_module.store.project_dir(project["id"]) / "setup.json",
+            {"request": "Emotion concepts", "status": "pending"},
+        )
+        # Missing credentials block before generation, while preserving a saved workspace.
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch.object(app_module, "generate_documents") as generate,
+        ):
+            result = self.client.post("/api/projects/" + project["id"] + "/setup")
+        self.assertEqual(result.status_code, 409, result.text)
+        self.assertFalse(result.json()["detail"]["readiness"]["ready"])
+        generate.assert_not_called()
+        self.assertEqual(
+            self.client.get("/api/projects/" + project["id"]).json()["setup"]["request"], "Emotion concepts"
+        )
+
+    def test_setup_uses_available_provider_and_does_not_repeat_completed_generation(self):
+        app_module.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "test-key"
+        project = self.client.post("/api/projects/start", json={"request": "Emotion concepts"}).json()
+        app_module.SESSION_CREDENTIALS["OPENAI_API_KEY"] = "test-key"
+        app_module.store.write_json(
+            app_module.store.project_dir(project["id"]) / "configs/extraction.json",
+            {"provider": "openai", "model": "gpt-4o-mini"},
+        )
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch.object(app_module, "generate_documents", return_value={}) as generate,
+        ):
+            response = self.client.post("/api/projects/" + project["id"] + "/setup")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "ready")
+            self.assertEqual(generate.call_args.args[1].request, "Emotion concepts")
+            self.assertEqual(generate.call_args.args[1].provider, "gemini")
+            self.client.post("/api/projects/" + project["id"] + "/setup")
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(app_module.get_extraction_config(project["id"])["provider"], "openai")
+
+    def test_interrupted_setup_is_resumable_and_concurrent_setup_is_rejected(self):
+        app_module.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "test-key"
+        import threading
+
+        project = self.client.post("/api/projects/start", json={"request": "Emotion concepts"}).json()
+        path = app_module.store.project_dir(project["id"]) / "setup.json"
+        app_module.store.write_json(path, {"request": "Emotion concepts", "status": "running"})
+        self.assertEqual(
+            self.client.get("/api/projects/" + project["id"]).json()["setup"]["status"], "pending"
+        )
+        lock = threading.Lock()
+        lock.acquire()
+        app_module.SETUP_LOCKS[project["id"]] = lock
+        try:
+            self.assertEqual(self.client.post("/api/projects/" + project["id"] + "/setup").status_code, 409)
+        finally:
+            lock.release()
 
 
 if __name__ == "__main__":

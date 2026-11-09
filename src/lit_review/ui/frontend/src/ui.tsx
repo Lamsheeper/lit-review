@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as Tabs from "@radix-ui/react-tabs";
@@ -6,9 +6,13 @@ import CodeMirror from "@uiw/react-codemirror";
 import { markdown } from "@codemirror/lang-markdown";
 import ReactMarkdown from "react-markdown";
 import { createColumnHelper, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, Download, Eye, FileSearch, LoaderCircle, Plus, Save, Square, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, Download, Eye, FileSearch, LoaderCircle, Plus, Save, Square, X } from "lucide-react";
 import clsx from "clsx";
 import { api, ExtractionPromptPreview, Family, Job, json, Project, RelevanceProfile, Taxonomy, Workflow, WorkflowStep } from "./api";
+
+import { GoogleCloudSettings } from "./google-cloud";
+
+import {ReadyContext,ReadinessNotice,useReadiness,ReadinessButton} from "./readiness";
 
 export function AppShell() {
   return (
@@ -29,11 +33,17 @@ export function AppShell() {
 
 function Credentials() {
   const [open, setOpen] = useState(false);
+  const [credentialTab, setCredentialTab] = useState("keys");
+  useEffect(() => {
+    const showCloud = () => { setOpen(true); setCredentialTab("cloud"); };
+    window.addEventListener("open-google-cloud", showCloud);
+    return () => window.removeEventListener("open-google-cloud", showCloud);
+  }, []);
   const [values, setValues] = useState<Record<string, string>>({});
   const query = useQuery({ queryKey: ["credentials"], queryFn: () => api<Record<string, { available: boolean; source: string | null }>>("/api/settings/credential-status") });
   const save = useMutation({
     mutationFn: () => api("/api/settings/session-credentials", json("PUT", { credentials: values })),
-    onSuccess: () => { query.refetch(); setValues({}); setOpen(false); },
+    onSuccess: () => { query.refetch(); setValues({}); setOpen(false); window.dispatchEvent(new Event("credentials-updated")); },
   });
   const ready = Object.values(query.data || {}).filter((item) => item.available).length;
   const credentials = [
@@ -43,16 +53,22 @@ function Credentials() {
   ];
   return <div className="relative">
     <button className="button-secondary whitespace-nowrap" onClick={() => setOpen(!open)}>Credentials <span className="badge">{ready} ready</span></button>
-    {open && <div className="absolute right-0 z-50 mt-2 w-96 isolate rounded-sm border border-slate-300 bg-white p-5 opacity-100 shadow-lg">
-      <h3 className="font-semibold">Session credentials</h3>
+    {open && <div className="absolute right-0 z-50 mt-2 max-h-[85vh] w-96 overflow-y-auto isolate rounded-sm border border-slate-300 bg-white p-5 opacity-100 shadow-lg">
+      <h3 className="font-semibold">Credentials</h3>
+      <div className="mt-3 flex gap-2" role="tablist" aria-label="Credential type">
+        <button className="button-secondary" role="tab" aria-selected={credentialTab === "keys"} onClick={() => setCredentialTab("keys")}>API keys</button>
+        <button className="button-secondary" role="tab" aria-selected={credentialTab === "cloud"} onClick={() => setCredentialTab("cloud")}>Google Cloud</button>
+      </div>
+      {credentialTab === "cloud" ? <GoogleCloudSettings /> : <>
+
       <p className="mt-1 text-xs text-slate-500">Overrides stay in memory and are never written to project files.</p>
       {credentials.map(({ key, label }) =>
         <label className="mt-4 block text-xs font-semibold text-slate-600" key={key}>{label}
           <input type="password" className="input mt-1 bg-white opacity-100" value={values[key] || ""} placeholder={query.data?.[key]?.available ? `${query.data[key].source} credential available` : "Not configured"} onChange={(event) => setValues({ ...values, [key]: event.target.value })} />
         </label>)}
-      <p className="mt-4 text-xs leading-5 text-slate-600">For Google Cloud, run <code>gcloud auth application-default login</code> on the machine running this app. Choose Google Cloud (ADC) in the Gemini settings and enter your project and region, or set GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION before starting the app.</p>
+
       <Error mutation={save} />
-      <button className="button-primary mt-5 w-full" onClick={() => save.mutate()}>Use for this session</button>
+      <button className="button-primary mt-5 w-full" onClick={() => save.mutate()}>Use for this session</button></>}
     </div>}
   </div>;
 }
@@ -60,44 +76,14 @@ function Credentials() {
 export function ProjectsPage() {
   const navigate = useNavigate();
   const client = useQueryClient();
-  const [name, setName] = useState("");
-  const projects = useQuery({ queryKey: ["projects"], queryFn: () => api<Project[]>("/api/projects") });
+  const [request, setRequest] = useState("");
+  const readiness=useReadiness();
+  const projects = useQuery({queryKey:["projects"],queryFn:()=>api<Project[]>("/api/projects")});
   const create = useMutation({
-    mutationFn: () => api<Project>("/api/projects", json("POST", { name })),
-    onSuccess: (project) => { client.invalidateQueries({ queryKey: ["projects"] }); navigate(`/projects/${project.id}`); },
+    mutationFn:()=>api<Project>("/api/projects/start",json("POST",{request:request.trim()})),
+    onSuccess:project=>{client.invalidateQueries({queryKey:["projects"]});navigate(`/projects/${project.id}`)},
   });
-  const deleteProject = useMutation({
-    mutationFn: (project: Project) => api<{ deleted: boolean }>(`/api/projects/${project.id}`, { method: "DELETE" }),
-    onSuccess: () => client.invalidateQueries({ queryKey: ["projects"] }),
-  });
-  return <main className="mx-auto max-w-7xl px-6 py-14">
-    <div className="grid gap-12 lg:grid-cols-[1fr_420px]">
-      <section>
-
-        <h1 className="text-3xl font-semibold tracking-tight text-slate-950">Projects</h1>
-        <p className="mt-4 max-w-2xl text-slate-600">Start a review or continue an existing project. Each project keeps its papers, decisions, and results together.</p>
-        <div className="mt-9 divide-y divide-slate-200">
-          {(projects.data || []).map((project) => <article className="panel" key={project.id}>
-            <Link className="block group" to={`/projects/${project.id}`}>
-              <div className="flex items-start justify-between gap-4"><h2 className="text-lg font-semibold group-hover:text-blue-700">{project.name}</h2><span className="badge">{project.progress.downloaded} PDFs</span></div>
-              <p className="mt-2 line-clamp-2 text-sm text-slate-500">{project.description || "No description yet."}</p>
-              <Progress project={project} />
-            </Link>
-            <div className="mt-5 flex justify-end border-t border-slate-100 pt-4">
-              <button className="button-secondary border-red-100 text-red-700 hover:border-red-200 hover:bg-red-50" disabled={deleteProject.isPending} onClick={() => { if (window.confirm(`Delete "${project.name}" and its local files?`)) deleteProject.mutate(project); }}><Trash2 size={14} /> Delete</button>
-            </div>
-          </article>)}
-        </div>
-        <Error mutation={deleteProject} />
-      </section>
-      <aside className="panel h-fit">
-        <p className="label">Start a project</p>
-        <h2 className="mt-4 text-2xl font-semibold">New project</h2>
-        <input className="input mt-5" aria-label="Project name" placeholder="e.g. Human factors in aviation incidents" value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => event.key === "Enter" && name.trim() && create.mutate()} />
-        <button className="button-primary mt-4" disabled={!name.trim() || create.isPending} onClick={() => create.mutate()}><Plus size={17} /> Create project</button>
-      </aside>
-    </div>
-  </main>;
+  return <main className="prompt-home"><section className="research-start"><div className="research-symbol"><FileSearch size={27}/></div><h1>What would you like to discover?</h1><p>Describe a concept or research question. We’ll create your workspace and prepare a search for relevant literature.</p><form className="research-composer" onSubmit={event=>{event.preventDefault();if(request.trim()&&!create.isPending&&readiness.data?.ready)create.mutate()}}><textarea aria-label="Research question" placeholder="e.g. How do people express emotion in written communication?" rows={2} value={request} onChange={event=>setRequest(event.target.value)} onKeyDown={event=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();if(request.trim()&&!create.isPending&&readiness.data?.ready)event.currentTarget.form?.requestSubmit()}}}/><button aria-label="Start research" disabled={!request.trim()||create.isPending||!readiness.data?.ready}>{create.isPending?<LoaderCircle className="animate-spin" size={20}/>:<ArrowUp size={20}/>}</button></form><ReadinessNotice report={readiness.data} error={readiness.error} checking={readiness.isPending} check={()=>readiness.refetch()}/><Error mutation={create}/>{create.isPending&&<p role="status" className="mt-5 text-sm text-slate-500">Creating your workspace…</p>}</section>{!!projects.data?.length&&<details className="recent-research"><summary>Continue a previous project</summary><div>{projects.data.map(project=><Link key={project.id} to={`/projects/${project.id}`}>{project.name}<ArrowRight size={14}/></Link>)}</div></details>}</main>;
 }
 
 const workflowSteps = ["define", "collect", "candidates", "extract", "filter", "annotate", "merge", "results"] as const;
@@ -124,9 +110,11 @@ export function ProjectPage() {
   const { projectId = "" } = useParams();
   const client = useQueryClient();
   const [activeStep, setActiveStep] = useState<WorkflowStepName | null>(null);
+  const readiness=useReadiness(projectId,({define:'setup',collect:'collect',candidates:'download',extract:'extract',results:'results'} as Record<string,string>)[activeStep||'define']||activeStep||'setup');
   const project = useQuery({ queryKey: ["project", projectId], queryFn: () => api<Project>(`/api/projects/${projectId}`), refetchInterval: 3000 });
   const workflow = useQuery({ queryKey: ["workflow", projectId], queryFn: () => api<Workflow>(`/api/projects/${projectId}/workflow`), refetchInterval: 1500 });
   useEffect(() => { setActiveStep(null); }, [projectId]);
+  useEffect(()=>{void client.invalidateQueries({queryKey:['readiness',projectId]})},[workflow.data?.steps.candidates.materials.selected_count,workflow.data?.steps.candidates.materials.selected_downloaded_count]);
   useEffect(() => {
     if (workflow.data) setActiveStep(current => current || nextWorkflowStep(workflow.data!));
   }, [workflow.data, projectId]);
@@ -147,17 +135,20 @@ export function ProjectPage() {
   return <main className="mx-auto max-w-[1500px] px-6 py-8">
     <Link to="/" className="inline-flex items-center gap-2 text-sm text-slate-500 hover:text-slate-950"><ArrowLeft size={15} /> All projects</Link>
     <div className="mt-5 flex flex-wrap items-end justify-between gap-4"><div><p className="eyebrow">Project</p><div className="mt-1 flex items-center gap-3"><h1 className="text-3xl font-semibold tracking-tight">{project.data.name}</h1><button className="button-quiet" onClick={() => { const name = window.prompt("Rename project", project.data?.name); if (name?.trim()) rename.mutate(name.trim()); }}>Rename</button></div></div><Progress project={project.data} workflow={workflow.data} /></div>
+    <ReadinessNotice report={readiness.data} error={readiness.error} checking={readiness.isPending} check={()=>readiness.refetch()} onFiles={()=>setActiveStep('candidates')}/>
+    <ReadyContext.Provider value={readiness.data?.ready===true}>
     <Tabs.Root value={activeStep} onValueChange={value => setActiveStep(value as WorkflowStepName)} className="mt-8">
-      <Tabs.List className="tabs" aria-label="Review workflow">
+      {!(project.data.setup && !workflow.data.steps.define.complete) && <Tabs.List className="tabs" aria-label="Review workflow">
         {workflowSteps.map((value, index) => <Tabs.Trigger className="tab" disabled={!stepUnlocked(index)} value={value} key={value} aria-current={activeStep === value ? "step" : undefined} title={!stepUnlocked(index) ? `Complete ${stepLabels[workflowSteps[index - 1]]} first` : undefined}><span aria-hidden="true">{workflow.data.steps[value].complete ? <CheckCircle2 size={12} /> : index + 1}</span>{stepLabels[value]}</Tabs.Trigger>)}
-      </Tabs.List>
-      <Tabs.Content value="define"><Define projectId={projectId} status={workflow.data.steps.define} onNext={goNext} /></Tabs.Content>
+      </Tabs.List>}
+      <Tabs.Content value="define"><Define projectId={projectId} status={workflow.data.steps.define} onNext={goNext} setup={project.data.setup} /></Tabs.Content>
       <Tabs.Content value="collect"><Collect projectId={projectId} status={workflow.data.steps.collect} onNext={goNext} /></Tabs.Content>
       <Tabs.Content value="candidates"><Candidates projectId={projectId} status={workflow.data.steps.candidates} onNext={goNext} /></Tabs.Content>
       <Tabs.Content value="extract"><Extract projectId={projectId} status={workflow.data.steps.extract} onNext={goNext} /></Tabs.Content>
       {(["filter", "annotate", "merge"] as const).map(stage => <Tabs.Content value={stage} key={stage}><ProcessingStage projectId={projectId} stage={stage} status={workflow.data!.steps[stage]} onNext={goNext} /></Tabs.Content>)}
       <Tabs.Content value="results"><Results projectId={projectId} status={workflow.data.steps.results} scoreStatus={workflow.data.steps.score} /></Tabs.Content>
     </Tabs.Root>
+    </ReadyContext.Provider>
   </main>;
 }
 
@@ -171,13 +162,19 @@ export function StepHeader({ eyebrow, title, description, status, action, onNext
     {!status.running && status.stale && <p role="status" className="border-l-2 border-amber-600 pl-3 text-sm text-amber-900">Inputs or settings changed. These results need to be recomputed before continuing.</p>}
     {!status.running && !status.stale && !ready && status.missing.length > 0 && <p className="text-sm text-slate-500">Needed before the next step: {status.missing.map(item => item === "successful upstream stage and current artifacts" ? "a successful run with the current inputs" : item).join(", ")}.</p>}
     {status.complete && !ready && !status.running && !status.stale && <p className="text-sm text-amber-800">Save your changes and run this step again before continuing.</p>}
-    <div className="stage-actions" data-ready={ready}>{action}{ready && onNext && <button className="button-next" onClick={onNext}>{nextLabel ? `Next: ${nextLabel}` : "Next step"} <ArrowRight size={16} /></button>}</div>
+    {!status.running && <div className="stage-actions" data-ready={ready}>{action}{ready && onNext && <button className="button-next" onClick={onNext}>{nextLabel ? `Next: ${nextLabel}` : "Next step"} <ArrowRight size={16} /></button>}</div>}
   </header>;
 }
 
-function Define({ projectId, status, onNext }: { projectId: string; status: WorkflowStep; onNext: () => void }) {
+function Define({ projectId, status, onNext, setup }: { projectId: string; status: WorkflowStep; onNext: () => void; setup?:Project["setup"] }) {
   const client = useQueryClient();
-  const [request, setRequest] = useState("");
+  const [request, setRequest] = useState(setup?.request || "");
+  const setupAttempted = useRef(false);
+  const inputsReady=useContext(ReadyContext);
+  const credentialStatus = useQuery({queryKey:["credentials"],queryFn:()=>api<Record<string,{available:boolean}>>("/api/settings/credential-status")});
+  const automaticSetup = useMutation({mutationFn:()=>api<{status:string;message?:string}>(`/api/projects/${projectId}/setup`,json("POST",{})),onSuccess:()=>{for(const key of ["project","workflow","docs","taxonomy","relevance"])client.invalidateQueries({queryKey:[key,projectId]})}});
+  const connected = !!credentialStatus.data?.GEMINI_API_KEY?.available || !!credentialStatus.data?.OPENAI_API_KEY?.available || !!credentialStatus.data?.GOOGLE_CLOUD_ADC?.available;
+  useEffect(()=>{if(setup && !status.complete && ["pending","needs_credentials"].includes(setup.status) && connected && inputsReady && !setupAttempted.current){setupAttempted.current=true;automaticSetup.mutate()}},[setup?.status,connected,inputsReady]);
   const [dirty, setDirty] = useState(false);
   const [generator, setGenerator] = useState({ provider: "gemini", model: "gemini-2.5-flash", reasoning_effort: "low", base_url: "", auth_mode: "auto", vertex_project: "", vertex_location: "" });
   const docs = useQuery({ queryKey: ["docs", projectId], queryFn: () => api<{ draft_markdown: string; goal_markdown: string }>(`/api/projects/${projectId}/documents`) });
@@ -209,8 +206,13 @@ function Define({ projectId, status, onNext }: { projectId: string; status: Work
     setDirty(true);
     setTax({ ...tax, families });
   };
+  const preparing = automaticSetup.isPending || setup?.status === 'running';
+  const setupState = automaticSetup.data?.status || setup?.status;
+  if (setup && !status.complete) return <section className="stage"><div className="setup-card" role="status">{preparing?<LoaderCircle size={24} className="animate-spin"/>:<FileSearch size={24}/>}<h2>{preparing?'Preparing your research workspace':setupState==='needs_credentials'||!connected?'Your workspace is ready':'Let’s prepare your literature search'}</h2><p>{preparing?'We’re turning your question into a search brief and organizing the feature families automatically.':automaticSetup.error?'Your question is saved. Check your model connection and try again.':!connected?'Add a Gemini or OpenAI key under Credentials, or configure Google Cloud, to prepare your search automatically.':setup?.message||'We’ll organize the search around your question.'}</p><blockquote>{setup.request}</blockquote>{!preparing&&connected&&inputsReady&&<button className="button-primary" onClick={()=>automaticSetup.mutate()}>{automaticSetup.isError?'Try setup again':'Prepare search'}</button>}</div><Error mutation={automaticSetup}/></section>;
   return <section className="stage">
-    <StepHeader eyebrow="Step 1 of 8 · Define" title="Define what you want to find." description="Describe your question. Generate a search brief and feature families, then review them before collecting papers." status={{ ...status, running: status.running || generate.isPending }} ready={status.complete && !dirty && !generate.isPending} onNext={onNext} nextLabel="Collect" action={<><button className="button-secondary" disabled={!dirty || save.isPending} onClick={() => save.mutate()}><Save size={16} /> Save changes</button><button className="button-primary" disabled={!request.trim() || generate.isPending} onClick={() => generate.mutate()}>{generate.isPending ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} Generate project definition</button></>} />
+    {setup&&<div className="setup-ready"><CheckCircle2 size={18}/><div><strong>Your research workspace is ready.</strong><p>Your search brief and feature families are prepared. Continue to find papers.</p></div><button className="button-primary" onClick={onNext}>Find papers<ArrowRight size={15}/></button></div>}
+    <details open={!setup}><summary className="label">{setup?'Adjust the research setup':'Research setup'}</summary>
+    <StepHeader eyebrow="Step 1 of 8 · Define" title="Define what you want to find." description="Describe your question. Generate a search brief and feature families, then review them before collecting papers." status={{ ...status, running: status.running || generate.isPending }} ready={status.complete && !dirty && !generate.isPending} onNext={onNext} nextLabel="Collect" action={<><button className="button-secondary" disabled={!dirty || save.isPending} onClick={() => save.mutate()}><Save size={16} /> Save changes</button><ReadinessButton className="button-primary" disabled={!request.trim() || generate.isPending} onClick={() => generate.mutate()}>{generate.isPending ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} Generate project definition</ReadinessButton></>} />
     <div className="panel">
       <label className="label" htmlFor="research-request">What are you researching?</label>
       <textarea id="research-request" className="input min-h-28" placeholder="Describe the concepts, evidence, distinctions, and intended use in ordinary language." value={request} onChange={(event) => setRequest(event.target.value)} />
@@ -233,6 +235,7 @@ function Define({ projectId, status, onNext }: { projectId: string; status: Work
         <input className="input mt-3" value={family.aliases.join(", ")} placeholder="Aliases, comma separated" onChange={(event) => updateFamily(index, { aliases: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) })} />
       </div>)}</div><Error mutation={save} /></div>
     <div className="panel overflow-hidden p-0"><div className="border-b border-slate-200 px-5 py-4"><p className="label">Collection settings</p><h3 className="mt-1 text-lg font-semibold">Paper ranking rules</h3><p className="mt-2 text-sm text-slate-500">These rules rank papers against your question. Each paper shows which criteria contributed to its score.</p></div><CodeMirror value={relevanceJson} height="520px" onChange={value => { setDirty(true); setRelevanceJson(value); }} /></div>
+    </details>
   </section>;
 }
 
@@ -253,8 +256,10 @@ function Collect({ projectId, status, onNext }: { projectId: string; status: Wor
   const run = useMutation({ mutationFn: async () => { await save.mutateAsync(); return api<Job>(`/api/projects/${projectId}/collection/search`, { method: "POST" }); }, onSuccess: () => client.invalidateQueries({ queryKey: ["workflow", projectId] }) });
   const set = (key: string, next: any) => { setDirty(true); setValue({ ...value, [key]: next }); };
   const cached = Boolean(status.materials.uses_cached_candidates);
-  return <section className="stage"><StepHeader eyebrow="Step 2 of 8 · Collect" title={cached ? "Apply the latest ranking to your saved candidates." : "Find and rank candidate papers."} description={cached ? "Re-rank your saved papers using the current rules. Enable Refresh metadata candidates in advanced settings to search the services again." : "Search the selected services and rank papers against your question. You will choose which PDFs to download next."} status={status} ready={status.complete && !dirty && !status.running} onNext={onNext} nextLabel="Select PDFs" action={<><button className="button-secondary" disabled={!dirty || save.isPending || status.running} onClick={() => save.mutate()}><Save size={15} /> Save settings</button><button className="button-primary" disabled={run.isPending || status.running} onClick={() => run.mutate()}>{run.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} {status.action_label}</button></>} />
-    <div className="grid gap-5 lg:grid-cols-[1fr_420px]"><div className="panel"><h3 className="section-title">Search scope</h3><div className="form-grid">
+  return <section className="stage"><StepHeader eyebrow="Step 2 of 8 · Collect" title={cached ? "Apply the latest ranking to your saved candidates." : "Find and rank candidate papers."} description={cached ? "Re-rank your saved papers using the current rules. Enable Refresh metadata candidates in advanced settings to search the services again." : "Search the selected services and rank papers against your question. You will choose which PDFs to download next."} status={status} ready={status.complete && !dirty && !status.running} onNext={onNext} nextLabel="Select PDFs" action={<><button className="button-secondary" disabled={!dirty || save.isPending || status.running} onClick={() => save.mutate()}><Save size={15} /> Save settings</button><ReadinessButton className="button-primary" disabled={run.isPending || status.running} onClick={() => run.mutate()}>{run.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} {status.action_label}</ReadinessButton></>} />
+    <JobPanel projectId={projectId} kind="collection_search" />
+    <LivePapers projectId={projectId} />
+    <details className="details"><summary>Search settings</summary><div className="mt-4"><div className="panel"><h3 className="section-title">Search scope</h3><div className="form-grid">
       <fieldset><legend className="label">Sources</legend><div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3">{[["openalex", "OpenAlex"], ["semantic_scholar", "Semantic Scholar"], ["crossref", "Crossref"], ["europe_pmc", "Europe PMC"]].map(([source, label]) => <label className="flex items-center gap-2 text-sm" key={source}><input type="checkbox" checked={(value.sources || []).includes(source)} onChange={event => set("sources", event.target.checked ? [...(value.sources || []), source] : value.sources.filter((item: string) => item !== source))} />{label}</label>)}</div></fieldset>
       <Field label="Contact email (optional)" description="Helps scholarly services identify your requests and find open-access PDFs. Saved with the project."><input className="input" type="email" placeholder="researcher@example.edu" value={value.email || ""} onChange={(e) => set("email", e.target.value)} /></Field>
       <Field label="Earliest year"><input className="input" type="number" value={value.year_from || ""} onChange={(e) => set("year_from", e.target.value ? Number(e.target.value) : null)} /></Field>
@@ -271,7 +276,7 @@ function Collect({ projectId, status, onNext }: { projectId: string; status: Wor
       <Field label="Extra queries (one per line)"><textarea className="input min-h-24" value={(value.extra_queries || []).map((item: any) => item.text).join("\n")} onChange={(e) => set("extra_queries", e.target.value.split("\n").map(text => text.trim()).filter(Boolean).map(text => ({ bucket: "ui_extra", text, terms: [] })))} /></Field>
       <label className="flex items-center gap-2 text-sm font-semibold text-slate-700"><input type="checkbox" checked={Boolean(value.refresh_candidates)} onChange={(e) => set("refresh_candidates", e.target.checked)} /> Refresh metadata candidates</label>
       <label className="flex items-center gap-2 text-sm font-semibold text-slate-700"><input type="checkbox" checked={Boolean(value.retry_failed_downloads)} onChange={(e) => set("retry_failed_downloads", e.target.checked)} /> Retry failed downloads</label>
-    </div></details><Error mutation={run} /></div><JobPanel projectId={projectId} kind="collection_search" /></div>
+    </div></details><Error mutation={run} /></div></div></details>
   </section>;
 }
 
@@ -292,7 +297,7 @@ function Candidates({ projectId, status, onNext }: { projectId: string; status: 
   const [selectionDirty, setSelectionDirty] = useState(false);
   const pageSize = 100;
   const savedSelection = useQuery({ queryKey: ["candidateSelection", projectId], queryFn: () => api<{ candidate_ids: string[] }>(`/api/projects/${projectId}/collection/selection`) });
-  const candidates = useQuery({ queryKey: ["candidates", projectId, query, page], queryFn: () => api<{ items: Candidate[]; total: number }>(`/api/projects/${projectId}/collection/candidates?page=${page}&page_size=${pageSize}&query=${encodeURIComponent(query)}`) });
+  const candidates = useQuery({ queryKey: ["candidates", projectId, query, page], queryFn: () => api<{ items: Candidate[]; total: number }>(`/api/projects/${projectId}/collection/candidates?page=${page}&page_size=${pageSize}&query=${encodeURIComponent(query)}`), refetchInterval: 1500 });
   useEffect(() => { if (savedSelection.data) setSelected(new Set(savedSelection.data.candidate_ids)); }, [savedSelection.data]);
   useEffect(() => { if (candidates.data) setSelected(current => new Set([...current, ...candidates.data.items.filter(row => row.selected).map(row => row.candidate_id)])); }, [candidates.data]);
   const save = useMutation({ mutationFn: () => api(`/api/projects/${projectId}/collection/selection`, json("PUT", { candidate_ids: [...selected] })), onSuccess: () => { setSelectionDirty(false); client.invalidateQueries({ queryKey: ["workflow", projectId] }); } });
@@ -307,7 +312,7 @@ function Candidates({ projectId, status, onNext }: { projectId: string; status: 
     helper.accessor("download_status", { header: "Status", cell: info => <span className="badge">{info.getValue() || "not downloaded"}</span> }),
   ], [rows, selected]);
   const table = useReactTable({ data: rows, columns, getCoreRowModel: getCoreRowModel() });
-  return <section className="stage"><StepHeader eyebrow="Step 3 of 8 · Select PDFs" title="Choose which papers to use." description="Select papers from the ranked list and download their full PDFs. At least one selected PDF is needed for extraction." status={status} ready={status.complete && !selectionDirty && !status.running} onNext={onNext} nextLabel="Extract" action={<><button className="button-secondary" onClick={() => candidates.refetch()}>Refresh table</button><button className="button-secondary" disabled={!selectionDirty || save.isPending || status.running} onClick={() => save.mutate()}><Save size={15} /> Save {selected.size}</button><button className="button-primary" disabled={selected.size === 0 || download.isPending || status.running} onClick={() => download.mutate()}>{download.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <Download size={16} />} Download selected PDFs</button></>} />
+  return <section className="stage"><StepHeader eyebrow="Step 3 of 8 · Select PDFs" title="Choose which papers to use." description="Select papers from the ranked list and download their full PDFs. At least one selected PDF is needed for extraction." status={status} ready={status.complete && !selectionDirty && !status.running} onNext={onNext} nextLabel="Extract" action={<><button className="button-secondary" onClick={() => candidates.refetch()}>Refresh table</button><button className="button-secondary" disabled={!selectionDirty || save.isPending || status.running} onClick={() => save.mutate()}><Save size={15} /> Save {selected.size}</button><ReadinessButton className="button-primary" disabled={selected.size === 0 || download.isPending || status.running} onClick={() => download.mutate()}>{download.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <Download size={16} />} Download selected PDFs</ReadinessButton></>} />
     <div className="grid gap-3 sm:grid-cols-3">
       <MaterialCount label="Candidates found" value={Number(status.materials.candidate_count || 0)} />
       <MaterialCount label="Papers selected" value={Number(status.materials.selected_count || 0)} />
@@ -332,8 +337,10 @@ function Extract({ projectId, status, onNext }: { projectId: string; status: Wor
     onSuccess: (data) => setPromptPreview(data),
   });
   const set = (key: string, next: any) => { setDirty(true); setValue({ ...value, [key]: next }); };
-  return <section className="stage"><StepHeader eyebrow="Step 4 of 8 · Extract" title="Extract raw features from the selected full PDFs." description="Read your selected PDFs and save each feature with its supporting evidence. You will review relevance in the next step." status={{ ...status, running: status.running || run.isPending }} ready={status.complete && !status.running && !dirty && !run.isPending} onNext={onNext} nextLabel="Filter" action={<><button className="button-secondary" disabled={preview.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => preview.mutate()}>{preview.isPending ? <LoaderCircle className="animate-spin" size={16} /> : <Eye size={16} />} View prompt</button><button className="button-primary" disabled={run.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => run.mutate()}>{run.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} Extract raw features</button></>} />
-    <div className="grid gap-5 lg:grid-cols-[1fr_420px]"><div className="panel"><div className="border-l-2 border-slate-300 pl-4 text-sm text-slate-700"><strong>Input: selected full PDFs.</strong> Each extracted feature keeps a reference to its source paper.<div className="mt-2 text-xs font-semibold">{candidates.data?.items.filter(row => row.selected).length || 0} selected · {candidates.data?.items.filter(row => ["downloaded", "already_exists"].includes(row.download_status)).length || 0} downloaded</div></div><div className="form-grid mt-6">
+  return <section className="stage"><StepHeader eyebrow="Step 4 of 8 · Extract" title="Extract raw features from the selected full PDFs." description="Read your selected PDFs and save each feature with its supporting evidence. You will review relevance in the next step." status={{ ...status, running: status.running || run.isPending }} ready={status.complete && !status.running && !dirty && !run.isPending} onNext={onNext} nextLabel="Filter" action={<><button className="button-secondary" disabled={preview.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => preview.mutate()}>{preview.isPending ? <LoaderCircle className="animate-spin" size={16} /> : <Eye size={16} />} View prompt</button><ReadinessButton className="button-primary" disabled={run.isPending || status.running || Number(status.materials.selected_downloaded_count || 0) === 0} onClick={() => run.mutate()}>{run.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} Extract raw features</ReadinessButton></>} />
+    <JobPanel projectId={projectId} kind="direct_pdf_extraction" />
+    <LiveFeatures projectId={projectId} running={status.running} />
+    <details className="details"><summary>Extraction settings</summary><div className="mt-4"><div className="panel"><div className="border-l-2 border-slate-300 pl-4 text-sm text-slate-700"><strong>Input: selected full PDFs.</strong> Each extracted feature keeps a reference to its source paper.<div className="mt-2 text-xs font-semibold">{candidates.data?.items.filter(row => row.selected).length || 0} selected · {candidates.data?.items.filter(row => ["downloaded", "already_exists"].includes(row.download_status)).length || 0} downloaded</div></div><div className="form-grid mt-6">
       <Field label="Provider"><select className="input" value={value.provider || "gemini"} onChange={(e) => { setDirty(true); setValue({ ...value, provider: e.target.value, auth_mode: "auto", vertex_project: null, vertex_location: null }); }}><option value="gemini">Gemini</option><option value="openai">OpenAI-compatible</option></select></Field>
       {(value.provider || "gemini") === "gemini" && <GoogleAuthFields value={value} onChange={next => { setDirty(true); setValue({ ...value, ...next }); }} />}
       <Field label="Model"><input className="input" value={value.model || ""} onChange={(e) => set("model", e.target.value)} /></Field>
@@ -341,7 +348,7 @@ function Extract({ projectId, status, onNext }: { projectId: string; status: Wor
     </div><details className="details"><summary>Advanced model settings</summary><div className="form-grid">      <Field label="Reasoning effort"><select className="input" value={value.reasoning_effort || "low"} onChange={(e) => set("reasoning_effort", e.target.value)}>{["none", "minimal", "low", "medium", "high"].map(x => <option key={x}>{x}</option>)}</select></Field>
       <Field label="Temperature"><input className="input" type="number" step=".1" value={value.temperature ?? .1} onChange={(e) => set("temperature", Number(e.target.value))} /></Field>
       <Field label="Timeout seconds"><input className="input" type="number" value={value.timeout || 600} onChange={(e) => set("timeout", Number(e.target.value))} /></Field>
-</div><Field label="Base URL"><input className="input mt-3" placeholder="Use provider default" value={value.base_url || ""} onChange={(e) => set("base_url", e.target.value)} /></Field></details><Error mutation={preview} /><Error mutation={run} /></div><JobPanel projectId={projectId} kind="direct_pdf_extraction" /></div>
+</div><Field label="Base URL"><input className="input mt-3" placeholder="Use provider default" value={value.base_url || ""} onChange={(e) => set("base_url", e.target.value)} /></Field></details><Error mutation={preview} /><Error mutation={run} /></div></div></details>
     {promptPreview && <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/30" onClick={() => setPromptPreview(null)}><aside className="h-full w-full max-w-4xl overflow-auto bg-white p-8 shadow-lg" onClick={event => event.stopPropagation()}>
       <button className="icon-button float-right" onClick={() => setPromptPreview(null)}><X size={18} /></button>
       <p className="eyebrow">Direct PDF extraction</p>
@@ -378,7 +385,7 @@ export function ProcessingStage({ projectId, stage, status, onNext }: { projectI
   const save = () => api(`/api/projects/${projectId}/stages/${stage}/config`, json("PUT", value));
   const inspect = useMutation({ mutationFn: async () => { await save(); return api(`/api/projects/${projectId}/stages/${stage}/preview`, { method: "POST" }); }, onSuccess: data => { setPreview(data); setDirty(false); client.invalidateQueries({ queryKey: ["workflow", projectId] }); } });
   const run = useMutation({ mutationFn: async () => { await save(); return api(`/api/projects/${projectId}/stages/${stage}/run`, { method: "POST" }); }, onSuccess: () => { setDirty(false); setPreview(null); client.invalidateQueries({ queryKey: ["workflow", projectId] }); } });
-  const rows = useQuery({ queryKey: ["stageRows", projectId, stage, artifact], queryFn: () => api<{ items: Record<string, any>[]; total: number }>(`/api/projects/${projectId}/stages/${stage}/results/${artifact}`), refetchInterval: status.running ? 1500 : false });
+  const rows = useQuery({ queryKey: ["stageRows", projectId, stage, artifact], queryFn: () => api<{ items: Record<string, any>[]; total: number }>(`/api/projects/${projectId}/stages/${stage}/results/${artifact}`), refetchInterval: 1500 });
   const descriptions = {
     filter: "Keep or reject candidates against your goal. Inspect the retained inventory and rejection reasons before continuing.",
     annotate: "Write definitions, aliases, and examples. Inspect exclusions and features that need review.",
@@ -386,7 +393,7 @@ export function ProcessingStage({ projectId, stage, status, onNext }: { projectI
     score: "Optionally score the merged inventory for literature support, annotation reliability, and distinctiveness.",
   };
   return <section className="stage">
-    <StepHeader eyebrow={stage === "score" ? "Optional scoring" : { filter: "Step 5 of 8 · Filter", annotate: "Step 6 of 8 · Annotate", merge: "Step 7 of 8 · Merge" }[stage]} title={{ filter: "Filter feature candidates", annotate: "Annotate retained features", merge: "Merge equivalent features", score: "Score the final inventory" }[stage]} description={descriptions[stage]} status={{ ...status, running: status.running || run.isPending }} ready={status.complete && !status.running && !dirty && !run.isPending} onNext={onNext} nextLabel={{ filter: "Annotate", annotate: "Merge", merge: "Results", score: "" }[stage]} action={<><button className="button-secondary" disabled={status.running || inspect.isPending || run.isPending} onClick={() => inspect.mutate()}>Preview settings</button><button className="button-primary" disabled={status.running || run.isPending || inspect.isPending} onClick={() => run.mutate()}>{status.running ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} Run {stage}</button></>} />
+    <StepHeader eyebrow={stage === "score" ? "Optional scoring" : { filter: "Step 5 of 8 · Filter", annotate: "Step 6 of 8 · Annotate", merge: "Step 7 of 8 · Merge" }[stage]} title={{ filter: "Filter feature candidates", annotate: "Annotate retained features", merge: "Merge equivalent features", score: "Score the final inventory" }[stage]} description={descriptions[stage]} status={{ ...status, running: status.running || run.isPending }} ready={status.complete && !status.running && !dirty && !run.isPending} onNext={onNext} nextLabel={{ filter: "Annotate", annotate: "Merge", merge: "Results", score: "" }[stage]} action={<><button className="button-secondary" disabled={status.running || inspect.isPending || run.isPending} onClick={() => inspect.mutate()}>Preview settings</button><ReadinessButton className="button-primary" disabled={status.running || run.isPending || inspect.isPending} onClick={() => run.mutate()}>{status.running ? <LoaderCircle className="animate-spin" size={16} /> : <FileSearch size={16} />} Run {stage}</ReadinessButton></>} />
     <div className="grid gap-5 lg:grid-cols-[1fr_420px]"><div className="panel"><h3 className="section-title">Settings</h3><div className="form-grid">
       <Field label="Provider"><select className="input" value={value.provider || "gemini"} onChange={e => { setDirty(true); setValue({ ...value, provider: e.target.value, base_url: null, auth_mode: "auto", vertex_project: null, vertex_location: null }); }}><option value="gemini">Gemini</option><option value="openai">OpenAI compatible</option></select></Field>
       {(value.provider || "gemini") === "gemini" && <GoogleAuthFields value={value} onChange={next => { setDirty(true); setValue({ ...value, ...next }); }} />}
@@ -408,7 +415,7 @@ function Results({ projectId, status, scoreStatus }: { projectId: string; status
   const [query, setQuery] = useState(""); const [category, setCategory] = useState(""); const [detail, setDetail] = useState<Feature | null>(null);
   const [inventory, setInventory] = useState("merge");
   const inventories: Record<string, string> = { extract: "features.jsonl", filter: "filtered_features.jsonl", annotate: "annotated_features.jsonl", merge: "llm_merged_features.jsonl", score: "scored_features.jsonl" };
-  const features = useQuery({ queryKey: ["features", projectId, inventory, query, category], queryFn: () => api<{ items: Feature[]; total: number }>(`/api/projects/${projectId}/stages/${inventory}/results/${inventories[inventory]}?page_size=500&query=${encodeURIComponent(query)}&category=${encodeURIComponent(category)}`) });
+  const features = useQuery({ queryKey: ["features", projectId, inventory, query, category], queryFn: () => api<{ items: Feature[]; total: number }>(`/api/projects/${projectId}/stages/${inventory}/results/${inventories[inventory]}?page_size=500&query=${encodeURIComponent(query)}&category=${encodeURIComponent(category)}`), refetchInterval: 1500 });
   const errors = useQuery({ queryKey: ["errors", projectId], queryFn: () => api<{ items: Record<string, any>[]; total: number }>(`/api/projects/${projectId}/results/errors?page_size=50`) });
   const mentions = useQuery({ queryKey: ["detailMentions", projectId, detail?.feature_name, detail?.category], enabled: Boolean(detail), queryFn: () => api<{ items: Record<string, any>[] }>(`/api/projects/${projectId}/results/mentions?page_size=100&query=${encodeURIComponent(detail?.feature_name || "")}&category=${encodeURIComponent(detail?.category || "")}`) });
   const rows = features.data?.items || []; const categories = [...new Set(rows.map(row => row.category))];
@@ -433,7 +440,7 @@ function Results({ projectId, status, scoreStatus }: { projectId: string; status
 function Detail({ label, values }: { label: string; values: string[] }) { return <div className="mt-8"><h3 className="label">{label}</h3><div className="mt-2 space-y-2">{(values || []).map((value, i) => <p className="rounded-sm bg-slate-50 p-3 text-sm text-slate-700" key={i}>{value}</p>)}</div></div>; }
 function MaterialCount({ label, value, detail }: { label: string; value: number; detail?: string; accent?: boolean }) { return <div className="border-l border-slate-200 pl-4"><p className="text-sm text-slate-500">{label}</p><p className="mt-1 text-2xl font-semibold tabular-nums text-slate-950">{value}</p>{detail && <p className="mt-1 text-xs text-slate-500">{detail}</p>}</div>; }
 
-function DataTable({ table }: { table: any }) { return <div className="overflow-auto"><table className="data-table"><thead>{table.getHeaderGroups().map((group: any) => <tr key={group.id}>{group.headers.map((header: any) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead><tbody>{table.getRowModel().rows.map((row: any) => <tr key={row.id}>{row.getVisibleCells().map((cell: any) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}</tr>)}</tbody></table></div>; }
+function DataTable({ table }: { table: any }) { return <div className="live-table" role="region" aria-label="Items" tabIndex={0}><table className="data-table"><thead>{table.getHeaderGroups().map((group: any) => <tr key={group.id}>{group.headers.map((header: any) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead><tbody>{table.getRowModel().rows.map((row: any) => <tr key={row.id}>{row.getVisibleCells().map((cell: any) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}</tr>)}</tbody></table></div>; }
 
 function JobPanel({ projectId, kind }: { projectId: string; kind: string }) {
   const project = useQuery({ queryKey: ["projectJobs", projectId], queryFn: () => api<Project>(`/api/projects/${projectId}`), refetchInterval: 1500 });
@@ -449,18 +456,13 @@ function JobPanel({ projectId, kind }: { projectId: string; kind: string }) {
   }, [job?.id, job?.status]);
   const labels: Record<string, string> = { queued: "Waiting to start", running: "Running", cancelling: "Stopping", completed: "Completed", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted" };
   const active = Boolean(job && ["queued", "running", "cancelling"].includes(job.status));
-  return <aside className="run-status" aria-label="Run status">
-    <h3 className="text-sm font-medium text-slate-600">Run status</h3>
-    <p className="mt-2 flex items-center gap-2 font-medium text-slate-950" role="status">{active && <LoaderCircle size={15} className="animate-spin" />}{job ? labels[job.status] || job.status : "Not started"}</p>
-    {!job && <p className="mt-3 text-sm leading-6 text-slate-500">Check the settings, then run this step. Progress and any errors will appear here.</p>}
-    {job?.status === "completed" && <p className="mt-3 text-sm text-slate-600">Results are ready to inspect.</p>}
-    {job && ["cancelled", "interrupted", "failed"].includes(job.status) && <p className="mt-3 text-sm leading-6 text-slate-600">Progress is saved. Run this step again to resume.</p>}
-    {job?.error && <p role="alert" className="mt-3 border-l-2 border-red-600 pl-3 text-sm text-red-800">{job.error}</p>}
-    {active && <>
-      <p className="mt-3 text-sm text-slate-600">{job?.status === "cancelling" ? "Stopping the current job. Please wait before starting another run." : "This project is processing. You can inspect the live log or cancel the run."}</p>
-      <details className="details"><summary>Live log</summary><pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap text-xs leading-5 text-slate-600">{log || "Waiting for output…"}</pre></details>
-      <button className="button-secondary mt-4" disabled={job?.status === "cancelling"} onClick={() => api(`/api/jobs/${job!.id}/cancel`, { method: "POST" })}><Square size={12} /> {job?.status === "cancelling" ? "Stopping…" : "Cancel run"}</button>
-    </>}
+  const message = job ? (job.status === "running" ? ({collection_search:"Finding and ranking papers",collection_download:"Downloading full PDFs",direct_pdf_extraction:"Reading PDFs and finding features",filter:"Checking feature relevance",annotate:"Adding feature descriptions",merge:"Combining equivalent features",score:"Measuring feature relevance"} as Record<string,string>)[kind] || "Processing saved results" : labels[job.status] || job.status) : "Ready to begin";
+  return <aside className="run-status compact-status" aria-label="Run status">
+    <p className="flex items-center gap-2 text-sm font-medium text-slate-950" role="status">{active && <LoaderCircle size={15} className="animate-spin" />}{message}</p>
+    {job && <details className="job-details"><summary>Details</summary><pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap text-xs leading-5 text-slate-600">{log || "No additional output."}</pre></details>}
+    {active && <button className="button-secondary" disabled={job?.status === "cancelling"} onClick={() => api(`/api/jobs/${job!.id}/cancel`, { method: "POST" })}><Square size={12} />{job?.status === "cancelling" ? "Stopping…" : "Stop"}</button>}
+    {job && ["cancelled","interrupted","failed"].includes(job.status) && <p className="w-full text-xs text-slate-600">Saved progress is available below. Run this step again to finish.</p>}
+    {job?.error && <p role="alert" className="w-full border-l-2 border-red-600 pl-3 text-sm text-red-800">{job.error}</p>}
   </aside>;
 }
 
@@ -488,3 +490,30 @@ function GoogleAuthFields({ value, onChange, prefix = "" }: { value: Record<stri
 function Field({ label, description, children }: { label: string; description?: string; children: any }) { return <label className="block"><span className="label">{label}</span><div className="mt-2">{children}</div>{description && <span className="mt-2 block text-xs leading-5 text-slate-500">{description}</span>}</label>; }
 function Error({ mutation }: { mutation: any }) { return mutation.error ? <p className="mt-4 rounded-sm bg-red-50 p-3 text-sm text-red-700">{mutation.error.message}</p> : null; }
 function Loading() { return <div className="grid min-h-[50vh] place-items-center"><LoaderCircle className="animate-spin text-blue-600" /></div>; }
+
+
+type PaperPreview = {items:Candidate[];total:number;partial:boolean;running:boolean;downloaded:number;progress?:{completed:number;total:number}};
+export function LivePapers({projectId}:{projectId:string}) {
+  const [query,setQuery]=useState(""); const [page,setPage]=useState(1);
+  const result=useQuery({queryKey:["livePapers",projectId,query,page],placeholderData:previous=>previous,queryFn:()=>api<PaperPreview>(`/api/projects/${projectId}/collection/live?page=${page}&page_size=50&query=${encodeURIComponent(query)}`),refetchInterval:1500});
+  const data=result.data; const rows=data?.items||[];
+  const columns=useMemo(()=>[
+    {accessorKey:"title",header:"Paper"}, {accessorKey:"year",header:"Year"},
+    {accessorKey:"citation_count",header:"Citations"},
+    {accessorKey:"relevance_score",header:"Relevance",cell:({getValue}:any)=>Number(getValue()||0).toFixed(3)},
+    {accessorKey:"download_status",header:"PDF",cell:({getValue}:any)=>getValue()==="pending"?"Waiting":String(getValue()).replaceAll("_"," ")},
+  ],[]);
+  const table=useReactTable({data:rows,columns,getCoreRowModel:getCoreRowModel(),getRowId:row=>row.candidate_id});
+  if(!query&&!data?.running&&!data?.total&&!result.error)return null;
+  return <div className="panel overflow-hidden p-0" aria-label="Live paper results"><div className="p-4 border-b border-slate-200"><h3 className="font-semibold">Papers found so far <span className="text-slate-500">{data?.total||0}</span></h3><p className="mt-1 text-xs text-slate-500" role="status">{data?.running?`Updates automatically as searches finish. ${data.progress?.completed||0} of ${data.progress?.total||0} searches complete.`:data?.partial?"Saved partial search. Run collection again to finish.":"Search complete. Continue to choose PDFs."}</p><input className="input mt-3" aria-label="Search papers found so far" placeholder="Search papers" value={query} onChange={e=>{setQuery(e.target.value);setPage(1)}}/></div>{result.error&&<p className="p-4 text-red-800" role="alert">{result.error.message}</p>}<DataTable table={table}/><PreviewPages page={page} total={data?.total||0} setPage={setPage}/></div>;
+}
+
+export function LiveFeatures({projectId,running}:{projectId:string;running:boolean}) {
+  const [query,setQuery]=useState(""); const [page,setPage]=useState(1);
+  const result=useQuery({queryKey:["liveFeatures",projectId,query,page],placeholderData:previous=>previous,queryFn:()=>api<{items:Feature[];total:number}>(`/api/projects/${projectId}/stages/extract/results/features.jsonl?page=${page}&page_size=50&query=${encodeURIComponent(query)}`),refetchInterval:1500});
+  const columns=useMemo(()=>[{accessorKey:"feature_name",header:"Feature"},{accessorKey:"category",header:"Family"},{accessorKey:"paper_count",header:"Papers"},{accessorKey:"mention_count",header:"Mentions"}],[]);
+  const table=useReactTable({data:result.data?.items||[],columns,getCoreRowModel:getCoreRowModel()});
+  if(!query&&!running&&!result.data?.total&&!result.error)return null;
+  return <div className="panel overflow-hidden p-0" aria-label="Live extracted features"><div className="p-4 border-b border-slate-200"><h3 className="font-semibold">Features found so far <span className="text-slate-500">{result.data?.total||0}</span></h3><p className="mt-1 text-xs text-slate-500" role="status">{running?"Updates automatically as each PDF or batch finishes. These features are provisional.":"Saved features from the latest extraction."}</p><input className="input mt-3" aria-label="Search features found so far" placeholder="Search features" value={query} onChange={e=>{setQuery(e.target.value);setPage(1)}}/></div>{result.error&&<p className="p-4 text-red-800" role="alert">{result.error.message}</p>}<DataTable table={table}/><PreviewPages page={page} total={result.data?.total||0} setPage={setPage}/></div>;
+}
+function PreviewPages({page,total,setPage}:{page:number;total:number;setPage:(page:number)=>void}) {return <div className="flex items-center justify-between border-t border-slate-200 p-4 text-xs text-slate-500"><span>{total} items · page {page}</span><div className="flex gap-2"><button className="button-secondary" disabled={page===1} onClick={()=>setPage(page-1)}>Previous</button><button className="button-secondary" disabled={page*50>=total} onClick={()=>setPage(page+1)}>Next</button></div></div>}
