@@ -161,7 +161,13 @@ class UiApiTests(unittest.TestCase):
 
     def test_document_generation_returns_actionable_adc_authentication_error(self):
         project = self.client.post("/api/projects", json={"name": "Cloud"}).json()
-        with mock.patch.object(app_module, "make_llm_client") as factory:
+        # Model a saved ADC login whose later token refresh fails, independent
+        # of whether this machine has real Google Cloud credentials installed.
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch("google.auth.default", return_value=(object(), "project")),
+            mock.patch.object(app_module, "make_llm_client") as factory,
+        ):
             factory.return_value.chat.side_effect = RuntimeError(
                 "Vertex AI authentication failed. Run `gcloud auth application-default login`."
             )
@@ -171,6 +177,23 @@ class UiApiTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 502)
         self.assertIn("gcloud auth application-default login", response.json()["detail"])
+
+    def test_document_generation_blocks_missing_adc_before_model_request(self):
+        from google.auth.exceptions import DefaultCredentialsError
+
+        project = self.client.post("/api/projects", json={"name": "Missing cloud login"}).json()
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch("google.auth.default", side_effect=DefaultCredentialsError("No saved login")),
+            mock.patch.object(app_module, "make_llm_client") as factory,
+        ):
+            response = self.client.post(
+                f"/api/projects/{project['id']}/documents/generate",
+                json={"request": "Find workplace factors", "auth_mode": "adc", "vertex_project": "project"},
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Google Cloud login", response.text)
+        factory.assert_not_called()
 
     def test_frontend_cannot_serve_files_outside_its_bundle(self):
         if not app_module.FRONTEND_DIST.exists():
