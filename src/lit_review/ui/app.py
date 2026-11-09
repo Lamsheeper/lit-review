@@ -327,6 +327,10 @@ def check_readiness(project_id=None, action="flow", deep=False):
         requirements.extend(
             provider_requirements(merge, named_key, "merging related concepts", embedding=True)
         )
+    elif action == "refine":
+        for stage in ("filter", "annotate"):
+            config = {**extraction, **(read_json(path / f"configs/{stage}.json", {}) or {})}
+            requirements.extend(provider_requirements(config, named_key, "refining extracted concepts"))
     elif action in ("extract", "filter", "annotate", "merge", "score"):
         config = (
             extraction
@@ -424,6 +428,7 @@ def project_readiness(project_id: str, action: str = "flow"):
         "extract",
         "filter",
         "annotate",
+        "refine",
         "merge",
         "score",
         "results",
@@ -898,12 +903,6 @@ def harvest_config(
             "bibtex": True,
         }
     )
-    setup = read_json(path / "setup.json", {}) or {}
-    if setup.get("provider"):
-        config.update(
-            llm_provider=setup["provider"],
-            llm_model="gemini-2.5-flash" if setup["provider"] == "gemini" else "gpt-4o-mini",
-        )
     relevance_path = path / "relevance_scoring.json"
     if relevance_path.exists():
         config["relevance_scoring"] = str(relevance_path)
@@ -1301,6 +1300,11 @@ def project_workflow_status(project_id: str) -> dict:
     )
     active = store.active_job(project_id) or {}
     status = processing_status(project_id)
+    refinement = next((job for job in store.list_jobs(project_id) if job["kind"] == "refine"), {})
+    refining = active.get("kind") == "refine"
+    phase = "annotate" if status.get("filter", {}).get("complete") else "filter"
+    if status.get("annotate", {}).get("complete") and not refining:
+        phase = "complete"
 
     def step(complete, kind, label, materials=None, missing=None, stale=False):
         running = active.get("kind") == kind
@@ -1356,9 +1360,28 @@ def project_workflow_status(project_id: str) -> dict:
             info.get("complete"),
             kind,
             "Run " + stage,
-            {"feature_count": count, "selected_downloaded_count": len(selected & downloaded)},
+            {
+                "feature_count": count,
+                "selected_downloaded_count": len(selected & downloaded),
+                "has_saved_inventory": artifact.is_file(),
+            },
             stale=info.get("stale", False),
         )
+        if stage in ("filter", "annotate"):
+            steps[stage]["materials"].update(
+                refinement_phase=phase,
+                refinement_status=refinement.get("status"),
+                refinement_error=refinement.get("error", ""),
+            )
+            if refining:
+                # The guided action is one job; neither half unlocks the next step early.
+                steps[stage]["running"] = True
+                steps[stage]["complete"] = False
+    steps["filter"]["action_label"] = (
+        "Retry refinement"
+        if refinement.get("status") in {"failed", "cancelled", "interrupted"}
+        else "Refine features"
+    )
     steps["results"] = step(
         steps["merge"]["complete"], "results", "Download merged features", steps["merge"]["materials"]
     )
@@ -1488,6 +1511,28 @@ def preview_stage(project_id: str, stage: str) -> dict:
         return run_pipeline(feature_pipeline_config(project_id), dry_run=True, stages=[stage])
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/refine/run")
+def run_refinement(project_id: str) -> dict:
+    """Filter and annotate in one explicit, cancellable, resumable guided action."""
+    project_dir(project_id)
+    if store.active_job(project_id):
+        raise HTTPException(409, "Project already has an active job")
+    workflow = project_workflow_status(project_id)
+    if not workflow["steps"]["extract"]["complete"]:
+        raise HTTPException(409, "Complete extract with current inputs first")
+    require_readiness(check_readiness(project_id, "refine"))
+    for stage in ("filter", "annotate"):
+        require_provider_configuration(get_stage_config(project_id, stage))
+    config = feature_pipeline_config(project_id)
+    # Future merge/scoring settings are independent of this guided action.
+    config.stages = [spec for spec in config.stages if spec.id in {"prepare", "extract", "filter", "annotate"}]
+    try:
+        compile_pipeline(config)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return pipeline_job(project_id, "refine", config, ["filter", "annotate"])
 
 
 @app.post("/api/projects/{project_id}/stages/{stage}/run")

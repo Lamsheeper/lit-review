@@ -152,6 +152,19 @@ class UiApiTests(unittest.TestCase):
         path = app_module.store.project_dir(project["id"]) / "relevance_scoring.json"
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["criteria"][0]["id"], "topic_match")
 
+    def test_metadata_collection_ignores_generation_provider_settings(self):
+        from lit_review.core.settings import CollectionSettings
+
+        project = self.client.post("/api/projects", json={"name": "Prepared search"}).json()
+        path = app_module.store.project_dir(project["id"])
+        (path / "draft.md").write_text("Find persuasion techniques")
+        app_module.store.write_json(path / "setup.json", {"status": "ready", "provider": "gemini"})
+        options = app_module.harvest_config(project["id"], metadata_only=True)
+        options = {key: value for key, value in options.items() if key not in {"output", "logs", "harvest_mode"}}
+        settings = CollectionSettings.for_operation("collect.search", options)
+        self.assertTrue(settings.metadata_only)
+        self.assertNotIn("llm_provider", options)
+
     def test_built_frontend_is_served(self):
         if not app_module.FRONTEND_DIST.exists():
             self.skipTest("Frontend bundle has not been built.")

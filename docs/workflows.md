@@ -1,5 +1,13 @@
 # Workflows and configuration
 
+## Guided local workflow
+
+Start with a question, confirm the prepared search and extraction plan, choose papers, extract concepts, refine, merge, and inspect results. The UI shows one focused card with a primary action rather than a row of stage tabs. Open the compact step menu to revisit available work. Search settings, full plans, model controls, and detailed records expand only when needed.
+
+**Refine** explicitly starts a cancellable job that filters concepts and then adds definitions, aliases, and examples automatically. Both stages are checked before it starts. Retrying reuses valid filtering and annotation progress; no model calls start merely because a project was opened. Descriptions remain separately recorded as the `annotate` pipeline stage, available through CLI commands and the optional description settings.
+
+Saved inventories can still be inspected and exported when their pipeline inputs or code are stale. The UI identifies that snapshot; starting new work still requires current successful prerequisites. Source evidence, manual selection, and existing artifacts are retained.
+
 ## Pipeline recipes
 
 A pipeline JSON document has `version: 1`, `output_root`, optional `inputs`, optional `providers`, optional `profile`, and ordered `stages`. Each stage has a unique snake-case `id`, an `operation`, and optional `options`.

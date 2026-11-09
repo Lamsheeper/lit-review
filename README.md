@@ -35,7 +35,7 @@ Choose **Google Cloud (ADC)** in the Gemini authentication settings, or leave **
 
 Before starting, provide a Gemini API key or configure Google Cloud ADC for the full workflow. If you choose OpenAI for text generation, Gemini credentials or ADC are still required for the merge step’s embeddings. The app checks these requirements up front, and checks selected full PDFs before extraction.
 
-Enter a concept or research question to create your workspace. The app prepares a search brief and feature families automatically using your available model connection; required credentials are checked before starting. Then follow **Collect → Select/download → Extract → Filter → Annotate → Merge**. Inspect decisions and supporting evidence as you go; export the merged inventory to CSV or JSONL. Scoring is optional.
+Enter a concept or research question to create your workspace. The app prepares a search brief and feature families automatically using your available model connection; required credentials are checked before starting. Follow one focused card at a time: **Your search → Papers → Extract → Refine → Merge → Results**. Paper search and PDF selection share one step. Refinement filters concepts and adds definitions, aliases, and examples automatically in one resumable job; there is no separate annotation tab. Each card presents the essential information and one main action. Full plans, configuration, decision records, and extra exports are available in optional sections. Live lists keep updating during long runs. Export the inventory to CSV or JSONL; scoring is optional.
 
 ![Lit Review Studio opens with a single research-question prompt.](docs/assets/studio.png)
 

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -13,7 +14,7 @@ from pypdf import PdfWriter
 import lit_review.ui.app as application
 from lit_review.collection.harvest import candidate_from_dict, stable_candidate_id
 from lit_review.core.io import write_json
-from lit_review.pipeline import run_pipeline
+from lit_review.pipeline import load_pipeline, run_pipeline
 from lit_review.services import execute_operation
 from lit_review.ui.jobs import JobManager
 from lit_review.ui.store import ProjectStore
@@ -90,6 +91,21 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertTrue(status["extract"]["complete"])
         self.assertFalse(status["filter"]["complete"])
         self.assertTrue(status["merge"]["stale"])
+        self.assertTrue(status["merge"]["materials"]["has_saved_inventory"])
+        self.assertTrue(status["results"]["materials"]["has_saved_inventory"])
+        # Saved results remain inspectable; new work still requires current predecessors.
+        self.assertEqual(
+            self.client.get(
+                f"/api/projects/{self.id}/stages/merge/results/llm_merged_features.jsonl"
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get(
+                f"/api/projects/{self.id}/stages/merge/exports/llm_merged_features.csv"
+            ).status_code,
+            200,
+        )
         self.assertEqual(self.client.post(f"/api/projects/{self.id}/stages/merge/run").status_code, 409)
 
     def test_preview_and_package_job_commands_keep_credentials_out_of_files(self):
@@ -199,3 +215,173 @@ class ProcessingUiTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(application.store.get_job(job["id"])["status"], "cancelled")
         self.assertFalse(marker.exists())
+
+    def run_job_inline(self, project_id, kind, commands, env_overrides):
+        """Exercise real checkpointing with local provider fixtures, without subprocess auth."""
+        job = application.store.create_job(project_id, kind, self.path / "jobs/refine-test.log")
+        application.store.update_job(job["id"], status="running")
+        command = commands[0]
+        config = load_pipeline(Path(command[command.index("--config") + 1]))
+        stages = command[command.index("--stages") + 1].split(",")
+        try:
+            run_pipeline(config, stages=stages, executor=self.executor)
+            application.store.update_job(job["id"], status="completed")
+        except Exception as exc:
+            application.store.update_job(job["id"], status="failed", error=str(exc))
+        return application.store.get_job(job["id"])
+
+    def complete_extraction(self):
+        run_pipeline(
+            application.feature_pipeline_config(self.id),
+            stages=["prepare", "extract"],
+            executor=self.executor,
+        )
+
+    def test_guided_refinement_runs_filter_then_annotation_in_one_job(self):
+        self.complete_extraction()
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ) as start:
+            response = self.client.post(f"/api/projects/{self.id}/refine/run")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["kind"], "refine")
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertEqual(start.call_args.args[2][0][-1], "filter,annotate")
+        steps = self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]
+        self.assertTrue(steps["filter"]["complete"])
+        self.assertTrue(steps["annotate"]["complete"])
+        self.assertEqual(steps["filter"]["materials"]["refinement_phase"], "complete")
+        self.assertFalse(steps["merge"]["complete"])
+
+    def test_guided_refinement_preflights_annotation_credentials_before_filter(self):
+        self.complete_extraction()
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        self.client.put(
+            f"/api/projects/{self.id}/stages/annotate/config",
+            json={"provider": "openai", "model": "test", "auth_mode": "api_key"},
+        )
+        with patch.dict(os.environ, {}, clear=True), patch.object(application.jobs, "start") as start:
+            readiness = self.client.get(f"/api/projects/{self.id}/readiness?action=refine")
+            response = self.client.post(f"/api/projects/{self.id}/refine/run")
+        self.assertFalse(readiness.json()["ready"])
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("OpenAI", response.text)
+        start.assert_not_called()
+        self.assertFalse((self.path / "run/stages/filter/filtered_features.jsonl").exists())
+        self.assertEqual(list((self.path / "configs").glob("refine_*.json")), [])
+
+    def test_guided_refinement_resumes_annotation_without_rerunning_valid_filter(self):
+        run_pipeline(
+            application.feature_pipeline_config(self.id),
+            stages=["prepare", "extract", "filter"],
+            executor=self.executor,
+        )
+        before = json.loads((self.path / "run/manifest.json").read_text())["stages"]["filter"]
+        self.model.prompts.clear()
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/refine/run")
+        self.assertEqual(response.json()["status"], "completed")
+        after = json.loads((self.path / "run/manifest.json").read_text())["stages"]["filter"]
+        self.assertEqual(before["execution_id"], after["execution_id"])
+        self.assertTrue(any(prompt.startswith("Write polished") for prompt in self.model.prompts))
+        self.assertFalse(any(prompt.startswith("Filter extracted") for prompt in self.model.prompts))
+
+    def test_guided_refinement_annotation_failure_keeps_filter_for_retry(self):
+        self.complete_extraction()
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        actual_executor = self.executor
+
+        def fail_annotation(operation, options, **kwargs):
+            if operation == "features.annotate":
+                raise RuntimeError("Provider unavailable during automatic annotation")
+            return actual_executor(operation, options, **kwargs)
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ), patch.object(self, "executor", side_effect=fail_annotation):
+            response = self.client.post(f"/api/projects/{self.id}/refine/run")
+        self.assertEqual(response.json()["status"], "failed")
+        steps = self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]
+        self.assertTrue(steps["filter"]["complete"])
+        self.assertFalse(steps["filter"]["stale"])
+        self.assertFalse(steps["annotate"]["complete"])
+        self.assertEqual(steps["filter"]["materials"]["refinement_phase"], "annotate")
+        self.assertIn("Provider unavailable", steps["filter"]["materials"]["refinement_error"])
+        self.assertEqual(steps["filter"]["action_label"], "Retry refinement")
+        before = json.loads((self.path / "run/manifest.json").read_text())["stages"]["filter"]
+        self.model.prompts.clear()
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/refine/run")
+        self.assertEqual(response.json()["status"], "completed")
+        after = json.loads((self.path / "run/manifest.json").read_text())["stages"]["filter"]
+        self.assertEqual(before["execution_id"], after["execution_id"])
+        self.assertFalse(any(prompt.startswith("Filter extracted") for prompt in self.model.prompts))
+
+    def test_guided_refinement_progress_and_overlap_are_one_action(self):
+        self.complete_extraction()
+        job = application.store.create_job(self.id, "refine", self.path / "jobs/progress.log")
+        for phase in ("filter", "annotate"):
+            statuses = {"filter": {"complete": phase == "annotate"}, "annotate": {"complete": False}}
+            with patch.object(application, "processing_status", return_value=statuses):
+                steps = self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]
+            self.assertTrue(steps["filter"]["running"])
+            self.assertTrue(steps["annotate"]["running"])
+            self.assertFalse(steps["filter"]["complete"])
+            self.assertEqual(steps["filter"]["materials"]["refinement_phase"], phase)
+        response = self.client.post(f"/api/projects/{self.id}/refine/run")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(len(application.store.list_jobs(self.id)), 1)
+        self.assertEqual(application.jobs.cancel(job["id"])["status"], "cancelling")
+        application.store.update_job(job["id"], status="cancelled")
+        steps = self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]
+        self.assertFalse(steps["filter"]["running"])
+        self.assertEqual(steps["filter"]["materials"]["refinement_status"], "cancelled")
+
+    def test_guided_refinement_rejects_stale_upstream_extraction(self):
+        with patch.object(application.jobs, "start") as start:
+            response = self.client.post(f"/api/projects/{self.id}/refine/run")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Complete extract", response.text)
+        start.assert_not_called()
+
+    def test_guided_refinement_restart_reuses_filter_after_interrupted_annotation(self):
+        self.complete_extraction()
+        actual_executor = self.executor
+
+        def interrupted_annotation(operation, options, **kwargs):
+            if operation == "features.annotate":
+                raise KeyboardInterrupt()
+            return actual_executor(operation, options, **kwargs)
+
+        job = application.store.create_job(self.id, "refine", self.path / "jobs/interrupted.log")
+        application.store.update_job(job["id"], status="running")
+        with self.assertRaises(KeyboardInterrupt):
+            run_pipeline(
+                application.feature_pipeline_config(self.id),
+                stages=["filter", "annotate"],
+                executor=interrupted_annotation,
+            )
+        before = json.loads((self.path / "run/manifest.json").read_text())["stages"]["filter"]
+        application.store = ProjectStore(Path(self.temp.name))
+        application.jobs = JobManager(application.store)
+        self.assertEqual(application.store.get_job(job["id"])["status"], "interrupted")
+        steps = self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]
+        self.assertTrue(steps["filter"]["complete"])
+        self.assertFalse(steps["annotate"]["complete"])
+        self.assertEqual(steps["filter"]["materials"]["refinement_status"], "interrupted")
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        self.model.prompts.clear()
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/refine/run")
+        self.assertEqual(response.json()["status"], "completed")
+        after = json.loads((self.path / "run/manifest.json").read_text())["stages"]["filter"]
+        self.assertEqual(before["execution_id"], after["execution_id"])
+        self.assertFalse(any(prompt.startswith("Filter extracted") for prompt in self.model.prompts))
