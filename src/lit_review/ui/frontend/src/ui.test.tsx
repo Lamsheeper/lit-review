@@ -535,7 +535,8 @@ it("shows selected PDF progress through completion in the Papers card without st
   await act(async()=>{await Promise.all([client.refetchQueries({queryKey:["downloadProgress","p1"]}),client.refetchQueries({queryKey:["workflow","p1"]})])});
   expect(screen.getByText("3 PDFs ready · ready to extract")).toBeVisible();
   expect(screen.getByRole("progressbar",{name:"PDF download progress"})).toHaveAttribute("value","3");
-  expect(screen.getByRole("button",{name:"Extract features"})).toBeEnabled();
+  // The separately polled workflow may finish refreshing after PDF progress.
+  await waitFor(()=>expect(screen.getByRole("button",{name:"Extract features"})).toBeEnabled(),{timeout:5000});
   expect(fetchMock.mock.calls.some(([path])=>String(path).endsWith("/discovery/run"))).toBe(false);
   fireEvent.click(screen.getByRole("button",{name:"Extract features"}));
   await waitFor(()=>expect(fetchMock).toHaveBeenCalledWith("/api/projects/p1/discovery/run",expect.objectContaining({method:"POST"})));
