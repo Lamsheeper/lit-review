@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
+from contextlib import contextmanager
 import uuid
 from pathlib import Path
 from typing import Any
@@ -186,11 +188,34 @@ class ProjectStore:
             return default
         return json.loads(path.read_text(encoding="utf-8"))
 
+    @contextmanager
+    def selection_transaction(self):
+        """Serialize selection initialization and explicit saves across app requests."""
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def write_json(self, path: Path, payload: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        temp.replace(path)
+        contents = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        temporary = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        )
+        temp_path = Path(temporary.name)
+        try:
+            with temporary:
+                temporary.write(contents)
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def create_job(self, project_id: str, kind: str, log_path: Path) -> dict[str, Any]:
         job_id = uuid.uuid4().hex

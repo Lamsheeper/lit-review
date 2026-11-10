@@ -979,25 +979,26 @@ def list_candidates(
     download_status: str = "",
 ) -> dict[str, Any]:
     path = project_dir(project_id)
-    rows = load_candidates(candidate_path(path))
-    status_by_id = download_statuses(path)
-    selection_path = path / "selection.json"
-    selection = read_json(selection_path)
-    candidate_ids = {row["candidate_id"] for row in rows}
-    if selection and selection.get("candidate_ids"):
-        valid_ids = [value for value in selection["candidate_ids"] if value in candidate_ids]
-        if valid_ids != selection["candidate_ids"]:
-            selection = {"candidate_ids": valid_ids} if valid_ids else None
-            if selection is None:
-                selection_path.unlink(missing_ok=True)
-            else:
-                store.write_json(selection_path, selection)
-    if selection is None and rows:
-        maximum = int(get_collection_config(project_id).get("max_downloads") or 50)
-        preselected = [row["candidate_id"] for row in rows[:maximum]]
-        selection = {"candidate_ids": preselected}
-        store.write_json(selection_path, selection)
-    selected = set((selection or {"candidate_ids": []})["candidate_ids"])
+    with store.selection_transaction():
+        rows = load_candidates(candidate_path(path))
+        status_by_id = download_statuses(path)
+        selection_path = path / "selection.json"
+        selection = read_json(selection_path)
+        candidate_ids = {row["candidate_id"] for row in rows}
+        if selection and selection.get("candidate_ids"):
+            valid_ids = [value for value in selection["candidate_ids"] if value in candidate_ids]
+            if valid_ids != selection["candidate_ids"]:
+                selection = {"candidate_ids": valid_ids} if valid_ids else None
+                if selection is None:
+                    selection_path.unlink(missing_ok=True)
+                else:
+                    store.write_json(selection_path, selection)
+        if selection is None and rows:
+            maximum = int(get_collection_config(project_id).get("max_downloads") or 50)
+            preselected = [row["candidate_id"] for row in rows[:maximum]]
+            selection = {"candidate_ids": preselected}
+            store.write_json(selection_path, selection)
+        selected = set((selection or {"candidate_ids": []})["candidate_ids"])
     for row in rows:
         row["download_status"] = status_by_id.get(row["candidate_id"], "")
         row["selected"] = row["candidate_id"] in selected
@@ -1015,12 +1016,13 @@ def list_candidates(
 @app.put("/api/projects/{project_id}/collection/selection")
 def save_selection(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     path = project_dir(project_id)
-    valid_ids = {row["candidate_id"] for row in load_candidates(candidate_path(path))}
-    ids = list(dict.fromkeys(str(value) for value in payload.get("candidate_ids", [])))
-    unknown = [value for value in ids if value not in valid_ids]
-    if unknown:
-        raise HTTPException(422, f"Unknown candidate IDs: {', '.join(unknown[:5])}")
-    store.write_json(path / "selection.json", {"candidate_ids": ids})
+    with store.selection_transaction():
+        valid_ids = {row["candidate_id"] for row in load_candidates(candidate_path(path))}
+        ids = list(dict.fromkeys(str(value) for value in payload.get("candidate_ids", [])))
+        unknown = [value for value in ids if value not in valid_ids]
+        if unknown:
+            raise HTTPException(422, f"Unknown candidate IDs: {', '.join(unknown[:5])}")
+        store.write_json(path / "selection.json", {"candidate_ids": ids})
     return {"candidate_ids": ids, "count": len(ids)}
 
 
