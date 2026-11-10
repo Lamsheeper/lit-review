@@ -88,7 +88,7 @@ describe("ProcessingStage", () => {
   it("shows stale results and keeps scoring separate from progression", async () => {
     show("score", { ...idle, stale: true });
     expect(screen.getByText("Optional scoring")).toBeVisible();
-    expect(screen.getByText(/These results need to be recomputed/)).toBeVisible();
+    expect(screen.getByText(/Inputs or settings changed/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Continue" })).not.toBeInTheDocument();
     expect(await screen.findByRole("region", { name: "Concepts" })).toHaveTextContent("Neutral posture");
   });

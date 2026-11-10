@@ -385,3 +385,267 @@ class ProcessingUiTests(unittest.TestCase):
         after = json.loads((self.path / "run/manifest.json").read_text())["stages"]["filter"]
         self.assertEqual(before["execution_id"], after["execution_id"])
         self.assertFalse(any(prompt.startswith("Filter extracted") for prompt in self.model.prompts))
+
+    def test_discovery_builds_the_final_inventory_in_one_job_and_reuses_it(self):
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ) as start:
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["kind"], "discovery")
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertEqual(start.call_args.args[2][0][-1], "prepare,extract,filter,annotate,merge")
+        before = json.loads((self.path / "run/manifest.json").read_text())["stages"]
+        steps = self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]
+        self.assertTrue(steps["results"]["complete"])
+        self.assertEqual(steps["extract"]["materials"]["discovery_phase"], "complete")
+        self.assertEqual(steps["merge"]["materials"]["discovery_completed"], 5)
+        live = self.client.get(f"/api/projects/{self.id}/discovery/live").json()
+        self.assertEqual((live["source_stage"], live["total"], live["partial"]), ("merge", 1, False))
+        self.model.prompts.clear()
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.json()["status"], "completed")
+        after = json.loads((self.path / "run/manifest.json").read_text())["stages"]
+        for stage in application.DISCOVERY_STAGES:
+            self.assertEqual(before[stage]["execution_id"], after[stage]["execution_id"])
+        self.assertEqual(self.model.prompts, [])
+
+    def test_discovery_preflights_future_annotation_before_extracting(self):
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        self.client.put(
+            f"/api/projects/{self.id}/stages/annotate/config",
+            json={"provider": "openai", "model": "test", "auth_mode": "api_key"},
+        )
+        with patch.dict(os.environ, {}, clear=True), patch.object(application.jobs, "start") as start:
+            readiness = self.client.get(f"/api/projects/{self.id}/readiness?action=discovery")
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertFalse(readiness.json()["ready"])
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("OpenAI", response.text)
+        start.assert_not_called()
+        self.assertFalse((self.path / "run/stages/extract/features.jsonl").exists())
+        self.assertEqual(list((self.path / "configs").glob("discovery_*.json")), [])
+
+    def test_discovery_preflights_future_merge_embeddings_before_extracting(self):
+        application.SESSION_CREDENTIALS["OPENAI_API_KEY"] = "local-fixture-key"
+        self.client.put(
+            f"/api/projects/{self.id}/extraction/config",
+            json={"provider": "openai", "model": "test", "auth_mode": "api_key"},
+        )
+        self.client.put(
+            f"/api/projects/{self.id}/stages/merge/config",
+            json={"provider": "openai", "model": "test", "auth_mode": "api_key", "embedding_auth_mode": "api_key"},
+        )
+        with patch.dict(os.environ, {}, clear=True), patch.object(application.jobs, "start") as start:
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("Gemini", response.text)
+        start.assert_not_called()
+        self.assertFalse((self.path / "run/stages/extract/features.jsonl").exists())
+
+    def test_discovery_validates_future_settings_and_files_before_launch(self):
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        for invalid_options, expected_status in (
+            ({"top_k": 0}, 422),
+            ({"category_config": str(self.path / "missing.json")}, 409),
+        ):
+            write_json(self.path / "configs/merge.json", invalid_options)
+            with patch.dict(os.environ, {}, clear=True), patch.object(application.jobs, "start") as start:
+                response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+            self.assertEqual(response.status_code, expected_status, response.text)
+            start.assert_not_called()
+        write_json(self.path / "configs/merge.json", {})
+        self.pdf.write_bytes(b"%PDF-1.4\nnot a readable PDF")
+        with patch.dict(os.environ, {}, clear=True), patch.object(application.jobs, "start") as start:
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("PDF", response.text)
+        start.assert_not_called()
+
+    def test_discovery_failure_retries_only_the_unfinished_merge(self):
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        execute = self.executor
+
+        def fail_merge(operation, options, **kwargs):
+            if operation == "features.merge":
+                raise RuntimeError("Merge provider temporarily unavailable")
+            return execute(operation, options, **kwargs)
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ), patch.object(self, "executor", side_effect=fail_merge):
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.json()["status"], "failed")
+        before = json.loads((self.path / "run/manifest.json").read_text())["stages"]
+        steps = self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]
+        self.assertTrue(steps["extract"]["complete"])
+        self.assertTrue(steps["annotate"]["complete"])
+        self.assertFalse(steps["merge"]["complete"])
+        self.assertEqual(steps["extract"]["materials"]["discovery_phase"], "merge")
+        self.assertIn("temporarily unavailable", steps["extract"]["materials"]["discovery_error"])
+        live = self.client.get(f"/api/projects/{self.id}/discovery/live").json()
+        self.assertEqual((live["source_stage"], live["completed"], live["total"]), ("annotate", 4, 2))
+        self.model.prompts.clear()
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.json()["status"], "completed")
+        after = json.loads((self.path / "run/manifest.json").read_text())["stages"]
+        for stage in application.DISCOVERY_STAGES[:-1]:
+            self.assertEqual(before[stage]["execution_id"], after[stage]["execution_id"])
+        self.assertFalse(any(prompt.startswith(("Extract taxonomy", "Filter extracted", "Write polished")) for prompt in self.model.prompts))
+
+    def test_discovery_restart_preserves_completed_stages(self):
+        execute = self.executor
+
+        def interrupt_merge(operation, options, **kwargs):
+            if operation == "features.merge":
+                raise KeyboardInterrupt()
+            return execute(operation, options, **kwargs)
+
+        job = application.store.create_job(self.id, "discovery", self.path / "jobs/restart.log")
+        application.store.update_job(job["id"], status="running")
+        with self.assertRaises(KeyboardInterrupt):
+            run_pipeline(
+                application.feature_pipeline_config(self.id),
+                stages=list(application.DISCOVERY_STAGES),
+                executor=interrupt_merge,
+            )
+        before = json.loads((self.path / "run/manifest.json").read_text())["stages"]
+        application.store = ProjectStore(Path(self.temp.name))
+        application.jobs = JobManager(application.store)
+        self.assertEqual(application.store.get_job(job["id"])["status"], "interrupted")
+        live = self.client.get(f"/api/projects/{self.id}/discovery/live").json()
+        self.assertEqual((live["phase"], live["completed"], live["running"]), ("merge", 4, False))
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        self.model.prompts.clear()
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.json()["status"], "completed")
+        after = json.loads((self.path / "run/manifest.json").read_text())["stages"]
+        for stage in application.DISCOVERY_STAGES[:-1]:
+            self.assertEqual(before[stage]["execution_id"], after[stage]["execution_id"])
+        self.assertFalse(any(prompt.startswith(("Extract taxonomy", "Filter extracted", "Write polished")) for prompt in self.model.prompts))
+
+    def test_discovery_cancellation_stops_later_stages_and_keeps_partial_results(self):
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        execute = self.executor
+
+        def cancel_during_extract(project_id, kind, commands, env_overrides):
+            job = application.store.create_job(project_id, kind, self.path / "jobs/cancel-discovery.log")
+            application.store.update_job(job["id"], status="running")
+            config = load_pipeline(Path(commands[0][commands[0].index("--config") + 1]))
+
+            def cancel(operation, options, **kwargs):
+                result = execute(operation, options, **kwargs)
+                if operation == "features.extract":
+                    application.jobs.cancel(job["id"])
+                    raise KeyboardInterrupt()
+                return result
+
+            try:
+                run_pipeline(config, stages=list(application.DISCOVERY_STAGES), executor=cancel)
+            except KeyboardInterrupt:
+                application.store.update_job(job["id"], status="cancelled", error="Job cancelled")
+            return application.store.get_job(job["id"])
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=cancel_during_extract
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.json()["status"], "cancelled")
+        self.assertFalse(any(prompt.startswith(("Filter extracted", "Write polished")) for prompt in self.model.prompts))
+        live = self.client.get(f"/api/projects/{self.id}/discovery/live").json()
+        self.assertEqual((live["source_stage"], live["total"], live["running"]), ("extract", 2, False))
+        self.assertTrue(live["partial"])
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertTrue(self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]["results"]["complete"])
+
+    def test_discovery_progress_moves_past_reused_stages_and_blocks_overlap(self):
+        self.complete_extraction()
+        job = application.store.create_job(self.id, "discovery", self.path / "jobs/discovery.log")
+        steps = self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]
+        for stage in application.DISCOVERY_STAGES[1:]:
+            self.assertTrue(steps[stage]["running"])
+            self.assertFalse(steps[stage]["complete"])
+            self.assertEqual(steps[stage]["materials"]["discovery_phase"], "filter")
+            self.assertEqual(steps[stage]["materials"]["discovery_completed"], 2)
+        response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(len(application.store.list_jobs(self.id)), 1)
+        application.store.update_job(job["id"], status="cancelled")
+
+    def test_discovery_live_keeps_reused_current_rows_and_ignores_stale_inventory(self):
+        self.complete_extraction()
+        artifact = self.path / "run/stages/extract/features.jsonl"
+        os.utime(artifact, (1, 1))
+        stale = self.path / "run/stages/merge/llm_merged_features.jsonl"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text(json.dumps({"feature_name": "Stale inventory"}) + "\n")
+        application.store.create_job(self.id, "discovery", self.path / "jobs/current.log")
+        live = self.client.get(f"/api/projects/{self.id}/discovery/live?page_size=1&query=Neutral").json()
+        self.assertEqual((live["source_stage"], live["total"], len(live["items"])), ("extract", 2, 1))
+        self.assertTrue(live["running"])
+        rows = self.client.get(f"/api/projects/{self.id}/stages/extract/results/features.jsonl").json()
+        self.assertEqual(rows["total"], 2)
+        self.client.put(f"/api/projects/{self.id}/extraction/config", json={"max_features_per_pdf": 3})
+        self.assertEqual(self.client.get(f"/api/projects/{self.id}/discovery/live").json()["total"], 0)
+
+    def test_discovery_live_preserves_a_completed_zero_instead_of_falling_back(self):
+        self.complete_extraction()
+        chat = self.model.chat
+
+        def reject_all(messages, **kwargs):
+            response = chat(messages, **kwargs)
+            if messages[-1]["content"].startswith("Filter extracted"):
+                payload = json.loads(response)
+                for decision in payload["decisions"]:
+                    decision["action"] = "reject"
+                return json.dumps(payload)
+            return response
+
+        with patch.object(self.model, "chat", side_effect=reject_all):
+            run_pipeline(application.feature_pipeline_config(self.id), stages=["filter"], executor=self.executor)
+        live = self.client.get(f"/api/projects/{self.id}/discovery/live").json()
+        self.assertEqual(live["source_stage"], "filter")
+        self.assertEqual(live["total"], 0)
+        self.assertEqual(live["items"], [])
+
+    def test_discovery_does_not_depend_on_optional_scoring_settings(self):
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        write_json(self.path / "configs/score.json", {"batch_features": 0})
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            application.jobs, "start", side_effect=self.run_job_inline
+        ):
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertTrue(self.client.get(f"/api/projects/{self.id}/workflow").json()["steps"]["results"]["complete"])
+
+    def test_discovery_preflights_supplied_merge_category_structure(self):
+        application.SESSION_CREDENTIALS["GEMINI_API_KEY"] = "local-fixture-key"
+        category_path = self.path / "category-settings.json"
+        write_json(category_path, {"ergonomics": {"text_cleanup": {"unknown_cleanup_option": True}}})
+        configured = self.client.put(
+            f"/api/projects/{self.id}/stages/merge/config",
+            json={"category_config": str(category_path)},
+        )
+        self.assertEqual(configured.status_code, 200, configured.text)
+        with patch.dict(os.environ, {}, clear=True), patch.object(application.jobs, "start") as start:
+            response = self.client.post(f"/api/projects/{self.id}/discovery/run")
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("Invalid merge category settings", response.text)
+        start.assert_not_called()
+        self.assertFalse((self.path / "run/stages/extract/features.jsonl").exists())
+        self.assertEqual(list((self.path / "configs").glob("discovery_*.json")), [])

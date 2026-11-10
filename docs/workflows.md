@@ -2,11 +2,13 @@
 
 ## Guided local workflow
 
-Start with a question, confirm the prepared search and extraction plan, choose papers, extract concepts, refine, merge, and inspect results. The UI shows one focused card with a primary action rather than a row of stage tabs. Open the compact step menu to revisit available work. Search settings, full plans, model controls, and detailed records expand only when needed.
+The UI has three steps: **Your search**, **Papers**, and **Features**. Confirming a prepared search starts collection directly. The Papers view shows found papers and PDF selection together; download the selected PDFs there, then choose **Extract features**. There is no separate “Read the PDFs” confirmation page.
 
-**Refine** explicitly starts a cancellable job that filters concepts and then adds definitions, aliases, and examples automatically. Both stages are checked before it starts. Retrying reuses valid filtering and annotation progress; no model calls start merely because a project was opened. Descriptions remain separately recorded as the `annotate` pipeline stage, available through CLI commands and the optional description settings.
+That explicit action checks all selected PDFs, extraction/filter/annotation settings, and merge-generation/embedding credentials before starting a single cancellable job: prepare → extract → filter → annotate → merge. No model work starts merely by opening a project. Valid stages and matching partial checkpoints are reused on retry or restart. Descriptions and merge decisions remain separately recorded for audit even though they need no separate UI confirmation.
 
-Saved inventories can still be inspected and exported when their pipeline inputs or code are stale. The UI identifies that snapshot; starting new work still requires current successful prerequisites. Source evidence, manual selection, and existing artifacts are retained.
+Live feature previews show current results as work advances. Completed empty results remain empty, and stale outputs from a different run are not mixed into progress. Saved inventories can still be inspected and exported; starting new work requires current successful prerequisites and checked inputs. Full plans, model settings, stage snapshots, and optional scoring are available on demand.
+
+The compact desktop layout gives most of the view to independently scrollable lists; the primary action stays beside the heading. Mobile controls retain comfortable tap areas.
 
 ## Pipeline recipes
 

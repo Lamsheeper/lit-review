@@ -327,6 +327,17 @@ def check_readiness(project_id=None, action="flow", deep=False):
         requirements.extend(
             provider_requirements(merge, named_key, "merging related concepts", embedding=True)
         )
+    elif action == "discovery":
+        configs = [extraction]
+        configs.extend(
+            {**extraction, **(read_json(path / f"configs/{stage}.json", {}) or {})}
+            for stage in ("filter", "annotate", "merge")
+        )
+        for config in configs:
+            requirements.extend(provider_requirements(config, named_key, "extracting and organizing concepts"))
+        requirements.extend(
+            provider_requirements(configs[-1], named_key, "comparing equivalent concepts", embedding=True)
+        )
     elif action == "refine":
         for stage in ("filter", "annotate"):
             config = {**extraction, **(read_json(path / f"configs/{stage}.json", {}) or {})}
@@ -342,7 +353,7 @@ def check_readiness(project_id=None, action="flow", deep=False):
             requirements.extend(
                 provider_requirements(config, named_key, "merging related concepts", embedding=True)
             )
-    if path and action == "extract":
+    if path and action in ("extract", "discovery"):
         files, _ = document_requirements(
             path, read_json, lambda row: stable_candidate_id(candidate_from_dict(row)), deep
         )
@@ -389,7 +400,7 @@ def check_readiness(project_id=None, action="flow", deep=False):
                     "message": "Search for papers and save a current selection before downloading PDFs.",
                 }
             )
-    if path and action in ("flow", "collect", "merge"):
+    if path and action in ("flow", "collect", "merge", "discovery"):
         options = read_json(path / "configs/merge.json", {}) or {}
         category_file = options.get("category_config")
         if category_file:
@@ -429,6 +440,7 @@ def project_readiness(project_id: str, action: str = "flow"):
         "filter",
         "annotate",
         "refine",
+        "discovery",
         "merge",
         "score",
         "results",
@@ -1192,10 +1204,11 @@ async def job_events(job_id: str, request: Request) -> StreamingResponse:
 
 
 from lit_review.core.settings import PipelineConfig, StageSpec
-from lit_review.pipeline import compile_pipeline, run_pipeline, stage_current
+from lit_review.pipeline import compile_pipeline, fingerprint, run_pipeline, stage_current
 from lit_review.services import ARTIFACTS, FEATURE_FIELDS, feature_options
 
 PROCESSING = ("extract", "filter", "annotate", "merge", "score")
+DISCOVERY_STAGES = ("prepare", "extract", "filter", "annotate", "merge")
 RESULT_FILES = {
     "extract": {
         "features.jsonl",
@@ -1266,7 +1279,13 @@ def processing_status(project_id: str) -> dict:
     except (ValueError, OSError, AttributeError):
         return {}
     try:
-        plan = compile_pipeline(feature_pipeline_config(project_id))
+        config = feature_pipeline_config(project_id)
+        try:
+            plan = compile_pipeline(config)
+        except (ValueError, OSError):
+            # Optional scoring cannot make the feature inventory appear incomplete.
+            config.stages = [stage for stage in config.stages if stage.id != "score"]
+            plan = compile_pipeline(config)
     except (ValueError, OSError):
         plan = []
     current = True
@@ -1300,7 +1319,14 @@ def project_workflow_status(project_id: str) -> dict:
     )
     active = store.active_job(project_id) or {}
     status = processing_status(project_id)
-    refinement = next((job for job in store.list_jobs(project_id) if job["kind"] == "refine"), {})
+    project_jobs = store.list_jobs(project_id)
+    refinement = next((job for job in project_jobs if job["kind"] == "refine"), {})
+    discovery = next((job for job in project_jobs if job["kind"] == "discovery"), {})
+    discovering = active.get("kind") == "discovery"
+    discovery_phase = next(
+        (stage for stage in DISCOVERY_STAGES if not status.get(stage, {}).get("complete")), "complete"
+    )
+    discovery_completed = sum(bool(status.get(stage, {}).get("complete")) for stage in DISCOVERY_STAGES)
     refining = active.get("kind") == "refine"
     phase = "annotate" if status.get("filter", {}).get("complete") else "filter"
     if status.get("annotate", {}).get("complete") and not refining:
@@ -1377,6 +1403,18 @@ def project_workflow_status(project_id: str) -> dict:
                 # The guided action is one job; neither half unlocks the next step early.
                 steps[stage]["running"] = True
                 steps[stage]["complete"] = False
+        if stage in DISCOVERY_STAGES:
+            steps[stage]["materials"].update(
+                discovery_phase=discovery_phase,
+                discovery_status=discovery.get("status"),
+                discovery_error=discovery.get("error", ""),
+                discovery_completed=discovery_completed,
+                discovery_total=len(DISCOVERY_STAGES),
+            )
+            if discovering:
+                # Preserve one guided action until the final inventory has finished.
+                steps[stage]["running"] = True
+                steps[stage]["complete"] = False
     steps["filter"]["action_label"] = (
         "Retry refinement"
         if refinement.get("status") in {"failed", "cancelled", "interrupted"}
@@ -1396,7 +1434,7 @@ def pipeline_job(project_id: str, kind: str, config: PipelineConfig, stages: lis
         "collection_download": "download",
         "direct_pdf_extraction": "extract",
     }.get(kind, kind)
-    require_readiness(check_readiness(project_id, action, deep=action == "extract"))
+    require_readiness(check_readiness(project_id, action, deep=action in ("extract", "discovery")))
     path = project_dir(project_id) / "configs" / (kind + "_" + uuid4().hex + ".json")
     write_config(path, config.model_dump(mode="json"))
     return launch_job(
@@ -1513,6 +1551,102 @@ def preview_stage(project_id: str, stage: str) -> dict:
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.get("/api/projects/{project_id}/discovery/live")
+def live_discovery(project_id: str, page: int = 1, page_size: int = 50, query: str = "") -> dict:
+    """Show current or resumable results without mixing in an obsolete inventory."""
+    from datetime import datetime
+
+    path = project_dir(project_id)
+    current = processing_status(project_id)
+    phase = next(
+        (stage for stage in DISCOVERY_STAGES if not current.get(stage, {}).get("complete")), "complete"
+    )
+    completed = sum(bool(current.get(stage, {}).get("complete")) for stage in DISCOVERY_STAGES)
+    processing_kinds = {"discovery", "direct_pdf_extraction", "refine", "filter", "annotate", "merge"}
+    recent = next((job for job in store.list_jobs(project_id) if job["kind"] in processing_kinds), {})
+    running = recent.get("status") in {"queued", "running", "cancelling"}
+    started = recent.get("started_at") or recent.get("created_at")
+    try:
+        config = feature_pipeline_config(project_id)
+        config.stages = [stage for stage in config.stages if stage.id in DISCOVERY_STAGES]
+        plan = {stage["id"]: stage for stage in compile_pipeline(config)}
+        records = (read_json(path / "run/manifest.json", {}) or {}).get("stages", {})
+    except (ValueError, OSError, AttributeError):
+        plan, records = {}, {}
+    source = None
+    rows = []
+    for stage in reversed(DISCOVERY_STAGES[1:]):
+        artifact = path / "run/stages" / stage / ARTIFACTS["features." + stage][0]
+        if not artifact.is_file():
+            continue
+        valid = current.get(stage, {}).get("complete", False)
+        record = records.get(stage, {})
+        # A failed/cancelled stage can still have useful, committed checkpoint rows.
+        # Their settings, upstream inputs and run must match before they are exposed.
+        resumable = bool(
+            not valid
+            and started
+            and stage in plan
+            and record.get("status") in {"running", "failed", "cancelled"}
+            and record.get("started_at", "") >= started
+            and artifact.stat().st_mtime >= datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+            and record.get("fingerprint") == fingerprint(plan[stage]["operation"], plan[stage]["options"])
+            and all(current.get(prior, {}).get("complete") for prior in DISCOVERY_STAGES[:DISCOVERY_STAGES.index(stage)])
+        )
+        if not valid and not resumable:
+            continue
+        try:
+            values = read_jsonl(artifact)
+        except (ValueError, OSError):
+            continue
+        if valid or values:
+            source, rows = stage, values
+            break
+    result = paginate_rows(rows, page=page, page_size=page_size, query=query, sort="paper_count", order="desc")
+    result.update(
+        phase=phase,
+        running=running,
+        partial=phase != "complete" or running,
+        completed=completed,
+        stages_total=len(DISCOVERY_STAGES),
+        source_stage=source,
+        status=recent.get("status"),
+        error=recent.get("error", ""),
+    )
+    return result
+
+
+@app.post("/api/projects/{project_id}/discovery/run")
+def run_discovery(project_id: str) -> dict:
+    """Build the final feature inventory from selected PDFs with one explicit action."""
+    project_dir(project_id)
+    if store.active_job(project_id):
+        raise HTTPException(409, "Project already has an active job")
+    require_readiness(check_readiness(project_id, "discovery", deep=True))
+    if not project_workflow_status(project_id)["steps"]["candidates"]["complete"]:
+        raise HTTPException(422, "Download at least one selected full PDF first")
+    require_provider_configuration(get_extraction_config(project_id))
+    for stage in ("filter", "annotate", "merge"):
+        require_provider_configuration(get_stage_config(project_id, stage))
+    merge_options = get_stage_config(project_id, "merge")
+    if merge_options.get("category_config"):
+        from lit_review.features.merging import llm_merge_specs_for_rows
+
+        try:
+            # Parse every supplied category specification before any model work begins.
+            llm_merge_specs_for_rows([], Path(merge_options["category_config"]))
+        except (ValueError, TypeError, AttributeError, OSError) as exc:
+            raise HTTPException(422, f"Invalid merge category settings: {exc}") from exc
+    config = feature_pipeline_config(project_id)
+    # Optional scoring is separate; invalid scoring settings must not block extraction.
+    config.stages = [spec for spec in config.stages if spec.id in DISCOVERY_STAGES]
+    try:
+        compile_pipeline(config)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return pipeline_job(project_id, "discovery", config, list(DISCOVERY_STAGES))
+
+
 @app.post("/api/projects/{project_id}/refine/run")
 def run_refinement(project_id: str) -> dict:
     """Filter and annotate in one explicit, cancellable, resumable guided action."""
@@ -1566,12 +1700,16 @@ def stage_results(
     active = store.active_job(project_id) or {}
     kind = "direct_pdf_extraction" if stage == "extract" else stage
     started = active.get("started_at") or active.get("created_at")
-    if (
-        active.get("kind") == kind
-        and started
+    composite = active.get("kind") == "discovery" or (
+        active.get("kind") == "refine" and stage in ("filter", "annotate")
+    )
+    older_than_job = (
+        started
         and artifact_path.exists()
         and artifact_path.stat().st_mtime < datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
-    ):
+    )
+    reused = composite and processing_status(project_id).get(stage, {}).get("complete")
+    if (active.get("kind") == kind or composite) and older_than_job and not reused:
         rows = []
     else:
         rows = read_jsonl(artifact_path)

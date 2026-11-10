@@ -1,11 +1,11 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Progress, StepHeader, nextWorkflowStep, ProjectsPage, ProjectPage, Results } from "./ui";
+import { Progress, StepHeader, nextWorkflowStep, ProjectsPage, ProjectPage, Results, FeatureDiscovery } from "./ui";
 import type { Project, Workflow } from "./api";
 
 vi.mock("@uiw/react-codemirror", () => ({default: ({value}: {value:string}) => <div data-testid="definition-editor">{value}</div>}));
 
-afterEach(() => {cleanup();vi.unstubAllGlobals()});
+afterEach(() => {cleanup();vi.unstubAllGlobals();vi.restoreAllMocks()});
 const project: Project = { id: "p1", name: "Review", description: "", updated_at: "", progress: { defined: true, taxonomy: true, searched: true, downloaded: 2, extracted: false } };
 const status = { complete: false, running: false, missing: ["ranked paper candidates"], materials: {}, action_label: "Find and rank papers" };
 function workflow(completed: string[] = []): Workflow {
@@ -17,38 +17,38 @@ describe("Workflow orientation", () => {
     const { rerender } = render(<Progress project={project} />);
     expect(screen.getByText("PDFs ready for extraction")).toBeInTheDocument();
     rerender(<Progress project={project} workflow={workflow(["define", "collect", "candidates"])} />);
-    expect(screen.getByText("2 of 6 steps complete")).toBeInTheDocument();
+    expect(screen.getByText("2 of 3 steps complete")).toBeInTheDocument();
   });
 
   it("resumes at the first unfinished step, including stale upstream work", () => {
     const saved = workflow(["define", "collect", "candidates", "extract"]);
-    expect(nextWorkflowStep(saved)).toBe("refine");
+    expect(nextWorkflowStep(saved)).toBe("features");
     saved.steps.extract = { ...status, stale: true };
-    expect(nextWorkflowStep(saved)).toBe("extract");
+    expect(nextWorkflowStep(saved)).toBe("features");
     saved.steps.collect.running = true;
     expect(nextWorkflowStep(saved)).toBe("papers");
   });
 
   it("returns completed projects to results without requiring scoring", () => {
-    expect(nextWorkflowStep(workflow(["define", "collect", "candidates", "extract", "filter", "annotate", "merge", "results"]))).toBe("results");
+    expect(nextWorkflowStep(workflow(["define", "collect", "candidates", "extract", "filter", "annotate", "merge", "results"]))).toBe("features");
   });
 });
 
 describe("StepHeader", () => {
   it("names the next step only when the current results are ready", () => {
     const onNext = vi.fn();
-    const base = { eyebrow: "PAPERS", title: "Choose papers", description: "Collect papers", action: <button>Download selected PDFs</button>, onNext, nextLabel: "Read these papers" };
+    const base = { eyebrow: "PAPERS", title: "Choose papers", description: "Collect papers", action: <button>Download selected PDFs</button>, onNext, nextLabel: "Extract features" };
     const { rerender } = render(<StepHeader {...base} status={status} />);
-    expect(screen.queryByRole("button", { name: "Read these papers" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Extract features" })).not.toBeInTheDocument();
     expect(screen.getByText("Not run")).toBeInTheDocument();
-    expect(screen.getByText(/Needed before the next step/)).toHaveTextContent("ranked paper candidates");
+    expect(screen.getByText(/Needed:/)).toHaveTextContent("ranked paper candidates");
 
     rerender(<StepHeader {...base} status={{ ...status, complete: true, running: true, missing: [] }} />);
-    expect(screen.queryByRole("button", { name: "Read these papers" })).not.toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent("This step is running");
+    expect(screen.queryByRole("button", { name: "Extract features" })).not.toBeInTheDocument();
+    expect(screen.getByText("Running")).toBeVisible();
 
     rerender(<StepHeader {...base} status={{ ...status, complete: true, missing: [] }} />);
-    fireEvent.click(screen.getByRole("button", { name: "Read these papers" }));
+    fireEvent.click(screen.getByRole("button", { name: "Extract features" }));
     expect(onNext).toHaveBeenCalledOnce();
   });
 
@@ -166,6 +166,7 @@ function workspaceFetch(getWorkflow: () => Workflow, override?: (path: string, i
       else if (path.endsWith("/documents")) data = { draft_markdown: "Search brief", goal_markdown: "Extraction goal" };
       else if (path.endsWith("/taxonomy")) data = { version: 1, title: "Persuasion", families: [] };
       else if (path.endsWith("/relevance-scoring")) data = null;
+      else if (path.includes("/discovery/live")) data = { items: [sampleFeature], total: 1, phase: "extract", running: false, partial: true, completed: 0, stages_total: 5, source_stage: "extract" };
       else if (path.endsWith("/config")) data = { provider: "gemini", model: "test-model" };
       else if (path.includes("/results/")) data = { items: [sampleFeature], total: 1 };
       else data = { items: [], total: 0 };
@@ -174,37 +175,21 @@ function workspaceFetch(getWorkflow: () => Workflow, override?: (path: string, i
   });
 }
 
-it("presents six research steps without a separate annotation tab", async () => {
+it("presents three research steps without separate processing tabs", async () => {
   const saved = workflow(["define", "collect", "candidates", "extract", "filter", "annotate", "merge", "results"]);
   vi.stubGlobal("fetch", workspaceFetch(() => saved));
   renderWorkspace(<ProjectPage />, "/projects/p1");
   await screen.findByRole("heading", { name: "Your concept inventory" });
   expect(screen.queryByRole("navigation", { name: "Research steps" })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: /Results 6 \/ 6/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Features 3 \/ 3/ }));
   const navigation = screen.getByRole("navigation", { name: "Research steps" });
   expect(within(navigation).getAllByRole("button").map(button => button.textContent?.trim())).toEqual([
-    "Your search", "Papers", "Extract", "Refine", "Merge", "Results",
+    "Your search", "Papers", "Features",
   ]);
   expect(within(navigation).queryByRole("button", { name: /annotat/i })).not.toBeInTheDocument();
   expect(screen.queryByRole("tab", { name: /annotat/i })).not.toBeInTheDocument();
 });
 
-it("requires completed descriptions as well as relevance filtering before Merge", async () => {
-  let current = workflow(["define", "collect", "candidates", "extract", "filter"]);
-  const fetchMock = workspaceFetch(() => current);
-  vi.stubGlobal("fetch", fetchMock);
-  const { client } = renderWorkspace(<ProjectPage />, "/projects/p1");
-  await screen.findByRole("heading", { name: "Refine the concepts" });
-  expect(nextWorkflowStep(current)).toBe("refine");
-  expect(screen.queryByRole("button", { name: "Review equivalent concepts" })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: /Refine 4 \/ 6/ }));
-  expect(within(screen.getByRole("navigation", { name: "Research steps" })).getByRole("button", { name: /Merge/ })).toBeDisabled();
-  current = workflow(["define", "collect", "candidates", "extract", "filter", "annotate"]);
-  await act(async () => { await client.refetchQueries({ queryKey: ["workflow", "p1"] }); });
-  expect(await screen.findByRole("button", { name: "Review equivalent concepts" })).toBeEnabled();
-  expect(within(screen.getByRole("navigation", { name: "Research steps" })).getByRole("button", { name: /Merge/ })).toBeEnabled();
-  expect(fetchMock.mock.calls.some(([path, options]) => String(path).endsWith("/refine/run") && options?.method === "POST")).toBe(false);
-});
 
 it("opens and exports a saved inventory even when upstream work is stale", async () => {
   const saved = workflow(["define", "collect", "candidates", "extract", "filter", "annotate", "merge"]);
@@ -213,13 +198,13 @@ it("opens and exports a saved inventory even when upstream work is stale", async
   saved.steps.results.materials = { has_saved_inventory: true };
   vi.stubGlobal("fetch", workspaceFetch(() => saved));
   renderWorkspace(<ProjectPage />, "/projects/p1");
-  expect(nextWorkflowStep(saved)).toBe("results");
+  expect(nextWorkflowStep(saved)).toBe("features");
   await screen.findByRole("heading", { name: "Your concept inventory" });
   expect(await screen.findByRole("button", { name: "Loaded language" })).toBeInTheDocument();
   expect(screen.getByText(/This saved inventory may need updating/)).toBeVisible();
   expect(within(screen.getByRole("heading", { name: "Your concept inventory" }).closest("header")!).getByRole("link", { name: "Download CSV" })).toHaveAttribute("href", "/api/projects/p1/stages/merge/exports/llm_merged_features.csv");
-  fireEvent.click(screen.getByRole("button", { name: /Results 6 \/ 6/ }));
-  expect(within(screen.getByRole("navigation", { name: "Research steps" })).getByRole("button", { name: /Results$/ })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: /Features 3 \/ 3/ }));
+  expect(within(screen.getByRole("navigation", { name: "Research steps" })).getByRole("button", { name: /Features$/ })).toBeEnabled();
 });
 
 it("keeps the results search responsive while a filtered request is pending", async () => {
@@ -276,4 +261,242 @@ it("preserves a manually unchecked paper through polling and pagination", async 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/projects/p1/collection/selection", expect.objectContaining({ method: "PUT", body: JSON.stringify({ candidate_ids: ["b"] }) })));
   await waitFor(() => expect(serverSelection).toEqual(["b"]));
   expect(screen.getByRole("checkbox", { name: "Select Paper A" })).not.toBeChecked();
+});
+
+
+function candidate(id = "a", title = "Available paper", downloaded = false) {
+  return { candidate_id: id, title, authors: ["Researcher"], year: 2025, doi: "", source_apis: ["crossref"], relevance_score: 1, citation_count: 0, selected: true, download_status: downloaded ? "downloaded" : "pending", matched_keywords: [], relevance_score_breakdown: {} };
+}
+function pdfsReady() {
+  const saved = workflow(["define", "collect", "candidates"]);
+  saved.steps.candidates.materials = { selected_count: 1, selected_downloaded_count: 1 };
+  saved.steps.extract.materials = { selected_downloaded_count: 1 };
+  return saved;
+}
+function runningDiscovery(phase = "extract") {
+  const current = pdfsReady();
+  for (const stage of ["extract", "filter", "annotate", "merge"] as const) current.steps[stage].running = true;
+  current.steps.merge.materials = { discovery_phase: phase, discovery_status: "running", discovery_completed: phase === "merge" ? 4 : 2, discovery_total: 5 };
+  return current;
+}
+function jobEvents() {
+  const events = { addEventListener: vi.fn(), close: vi.fn() };
+  const eventSource = vi.fn(function (_url: string) { return events; });
+  vi.stubGlobal("EventSource", eventSource);
+  return { eventSource, events };
+}
+function discoveryRows(phase = "extract", running = true) {
+  return { items: [{ ...sampleFeature, feature_name: "Live technique", annotation: undefined as { short_definition: string } | undefined }], total: 1, phase, running, partial: true, completed: phase === "merge" ? 4 : 2, stages_total: 5, source_stage: phase === "merge" ? "annotate" : "extract" };
+}
+
+it("switches from a running paper search to PDF selection in the same workspace", async () => {
+  let current = workflow(["define"]);
+  current.steps.collect.running = true;
+  const fetchMock = workspaceFetch(() => current, path => {
+    if (path.includes("/collection/live?")) return { items: [candidate()], total: 1, running: true, partial: true, progress: { completed: 1, total: 2 } };
+    if (path.includes("/collection/candidates?")) return { items: [candidate()], total: 1 };
+    if (path.endsWith("/collection/selection")) return { candidate_ids: ["a"] };
+    return undefined;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { client } = renderWorkspace(<ProjectPage />, "/projects/p1");
+  await screen.findByText("Available paper");
+  const workspace = screen.getByLabelText("Papers");
+  expect(screen.queryByRole("checkbox", { name: "Select Available paper" })).not.toBeInTheDocument();
+  current = workflow(["define", "collect"]);
+  await act(async () => { await client.refetchQueries({ queryKey: ["workflow", "p1"] }); });
+  expect(await screen.findByRole("checkbox", { name: "Select Available paper" })).toBeVisible();
+  expect(screen.getByLabelText("Papers")).toBe(workspace);
+  expect(screen.getByLabelText("Search found papers")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Download selected PDFs" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: /Select PDFs|Read these papers|Read PDFs/ })).not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+});
+
+it("downloads selected PDFs, then starts the complete feature workflow only on Extract features", async () => {
+  let current = workflow(["define", "collect"]);
+  let downloaded = false;
+  const fetchMock = workspaceFetch(() => current, (path, init) => {
+    if (path.includes("/collection/candidates?")) return { items: [candidate("a", "Available paper", downloaded)], total: 1 };
+    if (path.endsWith("/collection/selection")) return { candidate_ids: ["a"] };
+    if (path.endsWith("/collection/download") && init?.method === "POST") { downloaded = true; current = pdfsReady(); return { id: "download-1", kind: "collection_download", status: "completed" }; }
+    if (path.endsWith("/discovery/run") && init?.method === "POST") { current = runningDiscovery(); return { id: "discovery-1", kind: "discovery", status: "queued" }; }
+    return undefined;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  renderWorkspace(<ProjectPage />, "/projects/p1");
+  await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select Available paper" })).toBeChecked());
+  expect(fetchMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Download selected PDFs" }));
+  const extract = await screen.findByRole("button", { name: "Extract features" });
+  await waitFor(() => expect(extract).toBeEnabled());
+  expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/discovery/run"))).toBe(false);
+  expect(fetchMock.mock.calls.some(([path]) => String(path).includes("/readiness?action=discovery"))).toBe(true);
+  fireEvent.click(extract);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/projects/p1/discovery/run", expect.objectContaining({ method: "POST" })));
+  expect(await screen.findByRole("heading", { name: "Features from your papers" })).toBeVisible();
+  expect(fetchMock.mock.calls.some(([path]) => /\/(extraction|stages\/(filter|annotate|merge))\/run$/.test(String(path)))).toBe(false);
+  expect(screen.queryByRole("button", { name: /Read these papers|Refine these concepts|Review equivalent concepts/ })).not.toBeInTheDocument();
+});
+
+it("checks whole-workflow inputs before enabling Extract features after PDF download", async () => {
+  let current = workflow(["define", "collect"]);
+  const blocked = { ready: false, message: "Complete required inputs", requirements: [{ id: "embedding_connection", field: "GEMINI_API_KEY", kind: "credential", label: "Gemini API key", message: "Configure embeddings before extracting features." }] };
+  const fetchMock = workspaceFetch(() => current, path => {
+    if (path.includes("/readiness?action=discovery")) return blocked;
+    if (path.includes("/collection/candidates?")) return { items: [candidate("a", "Available paper", true)], total: 1 };
+    if (path.endsWith("/collection/selection")) return { candidate_ids: ["a"] };
+    return undefined;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { client } = renderWorkspace(<ProjectPage />, "/projects/p1");
+  await screen.findByRole("checkbox", { name: "Select Available paper" });
+  current = pdfsReady();
+  await act(async () => { await client.refetchQueries({ queryKey: ["workflow", "p1"] }); });
+  expect(await screen.findByText("Configure embeddings before extracting features.")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Extract features" })).toBeDisabled();
+  expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/discovery/run"))).toBe(false);
+});
+
+it("keeps live processing visible over an old inventory and opens final features when the chain finishes", async () => {
+  jobEvents();
+  let current = runningDiscovery("annotate");
+  current.steps.results.materials = { has_saved_inventory: true };
+  let live = discoveryRows("annotate");
+  let state = "running";
+  const fetchMock = workspaceFetch(() => current, path => {
+    if (path.includes("/discovery/live?")) return live;
+    if (path.endsWith("/projects/p1")) return { ...project, jobs: [{ id: "chain-1", kind: "discovery", status: state }] };
+    return undefined;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { client } = renderWorkspace(<ProjectPage />, "/projects/p1");
+  expect(nextWorkflowStep(current)).toBe("features");
+  expect(await screen.findByRole("heading", { name: "Features from your papers" })).toBeVisible();
+  expect(await screen.findByText("Live technique")).toBeVisible();
+  expect(screen.queryByRole("heading", { name: "Your concept inventory" })).not.toBeInTheDocument();
+  current = workflow(["define", "collect", "candidates", "extract", "filter", "annotate", "merge", "results"]);
+  current.steps.results.materials = { has_saved_inventory: true };
+  current.steps.merge.materials = { discovery_status: "completed", discovery_phase: "complete" };
+  live = { ...discoveryRows("complete", false), partial: false, completed: 5 };
+  state = "completed";
+  await act(async () => { await client.refetchQueries({ queryKey: ["workflow", "p1"] }); });
+  expect(await screen.findByRole("heading", { name: "Your concept inventory" })).toBeVisible();
+  expect(screen.queryByRole("heading", { name: "Features from your papers" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Loaded language" })).toBeVisible();
+  expect(fetchMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+});
+
+it.each(["annotate", "merge"])("shows %s progress and cancels the discovery job without launching work on mount", async phase => {
+  const { eventSource } = jobEvents();
+  const current = runningDiscovery(phase);
+  const fetchMock = workspaceFetch(() => current, path => {
+    if (path.includes("/discovery/live?")) return discoveryRows(phase);
+    if (path.endsWith("/projects/p1")) return { ...project, jobs: [{ id: "chain-1", kind: "discovery", status: "running" }] };
+    return undefined;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  renderWorkspace(<FeatureDiscovery projectId="p1" workflow={current} starting={false} resume={vi.fn()} />);
+  expect(await screen.findByText("Live technique")).toBeVisible();
+  const job = await screen.findByRole("complementary", { name: "Run status" });
+  expect(within(job).getByRole("status")).toHaveTextContent(phase === "annotate" ? "Adding definitions and examples" : "Combining equivalent features");
+  expect(eventSource).toHaveBeenCalledWith("/api/jobs/chain-1/events");
+  expect(fetchMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+  fireEvent.click(within(job).getByRole("button", { name: "Stop" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/jobs/chain-1/cancel", expect.objectContaining({ method: "POST" })));
+  expect(fetchMock.mock.calls.filter(([, options]) => options?.method === "POST").map(([path]) => path)).toEqual(["/api/jobs/chain-1/cancel"]);
+});
+
+it.each(["queued", "cancelling"])("keeps discovery controls safe while %s", async state => {
+  jobEvents();
+  const current = runningDiscovery();
+  const fetchMock = workspaceFetch(() => current, path => {
+    if (path.includes("/discovery/live?")) return discoveryRows();
+    if (path.endsWith("/projects/p1")) return { ...project, jobs: [{ id: "chain-1", kind: "discovery", status: state }] };
+    return undefined;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  renderWorkspace(<FeatureDiscovery projectId="p1" workflow={current} starting={false} resume={vi.fn()} />);
+  const stop = await screen.findByRole("button", { name: state === "queued" ? "Stop" : "Stopping…" });
+  if (state === "queued") expect(stop).toBeEnabled(); else expect(stop).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Extract features" })).not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+});
+
+it.each(["cancelled", "interrupted", "failed"])("retains partial features after discovery is %s and waits for an explicit resume", async state => {
+  const { eventSource } = jobEvents();
+  const current = pdfsReady();
+  current.steps.merge.materials = { discovery_status: state, discovery_phase: "annotate" };
+  const resume = vi.fn();
+  const fetchMock = workspaceFetch(() => current, path => {
+    if (path.includes("/discovery/live?")) return discoveryRows("annotate", false);
+    if (path.endsWith("/projects/p1")) return { ...project, jobs: [{ id: "chain-1", kind: "discovery", status: state, error: state === "failed" ? "Provider unavailable" : "" }] };
+    return undefined;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  renderWorkspace(<FeatureDiscovery projectId="p1" workflow={current} starting={false} resume={resume} />);
+  expect(await screen.findByText("Live technique")).toBeVisible();
+  expect(await screen.findByText("Saved progress is available below. Run this step again to finish.")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+  const action = screen.getByRole("button", { name: "Resume feature extraction" });
+  expect(action).toBeEnabled();
+  expect(eventSource).not.toHaveBeenCalled();
+  expect(resume).not.toHaveBeenCalled();
+  expect(fetchMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+  fireEvent.click(action);
+  expect(resume).toHaveBeenCalledOnce();
+});
+
+
+it("updates live feature definitions and progress without resetting the list search", async () => {
+  let live = discoveryRows("extract");
+  const current = runningDiscovery();
+  const fetchMock = workspaceFetch(() => current, path => path.includes("/discovery/live?") ? live : undefined);
+  vi.stubGlobal("fetch", fetchMock);
+  const { client } = renderWorkspace(<FeatureDiscovery projectId="p1" workflow={current} starting={false} resume={vi.fn()} />);
+  await screen.findByText("Live technique");
+  fireEvent.change(screen.getByLabelText("Search extracted features"), { target: { value: "Live" } });
+  await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => String(path).includes("/discovery/live?") && String(path).includes("query=Live"))).toBe(true));
+  const list = screen.getByRole("region", { name: "Items" });
+  list.scrollTop = 180;
+  live = { ...discoveryRows("annotate"), completed: 3, source_stage: "annotate", items: [{ ...sampleFeature, feature_name: "Live technique", annotation: { short_definition: "A clearer source-based definition" } }] };
+  await act(async () => { await client.refetchQueries({ queryKey: ["discoveryLive", "p1"] }); });
+  expect(await screen.findByText("A clearer source-based definition")).toBeVisible();
+  expect(screen.getByLabelText("Search extracted features")).toHaveValue("Live");
+  expect(list.scrollTop).toBe(180);
+  expect(screen.getByText("Adding definitions and examples")).toBeVisible();
+  expect(fetchMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+});
+
+it("keeps an old inventory hidden after starting discovery while its first status refresh is pending", async () => {
+  vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+  jobEvents();
+  const saved = pdfsReady();
+  saved.steps.results.materials = { has_saved_inventory: true };
+  saved.steps.merge.materials = { discovery_status: "completed" };
+  let started = false;
+  let releaseStatus: (() => void) | undefined;
+  const fetchMock = workspaceFetch(() => saved, (path, init) => {
+    if (path.endsWith("/discovery/run") && init?.method === "POST") { started = true; return { id: "new-chain", kind: "discovery", status: "queued" }; }
+    if (path.endsWith("/workflow") && started) return new Promise(resolve => { releaseStatus = () => resolve(runningDiscovery()); });
+    if (path.endsWith("/projects/p1") && started) return { ...project, jobs: [{ id: "new-chain", kind: "discovery", status: "queued" }] };
+    if (path.includes("/collection/candidates?")) return { items: [candidate("a", "Available paper", true)], total: 1 };
+    if (path.endsWith("/collection/selection")) return { candidate_ids: ["a"] };
+    return undefined;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  renderWorkspace(<ProjectPage />, "/projects/p1");
+  await screen.findByRole("heading", { name: "Your concept inventory" });
+  fireEvent.click(screen.getByRole("button", { name: /Features 3 \/ 3/ }));
+  fireEvent.click(within(screen.getByRole("navigation", { name: "Research steps" })).getByRole("button", { name: "Papers" }));
+  const extract = await screen.findByRole("button", { name: "Extract features" });
+  await waitFor(() => expect(extract).toBeEnabled());
+  fireEvent.click(extract);
+  await waitFor(() => expect(releaseStatus).toBeTypeOf("function"));
+  try {
+    expect(await screen.findByRole("heading", { name: "Features from your papers" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Your concept inventory" })).not.toBeInTheDocument();
+  } finally {
+    await act(async () => { releaseStatus?.(); });
+  }
 });
