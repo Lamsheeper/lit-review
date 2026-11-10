@@ -148,6 +148,12 @@ def add_url(urls: list[str], value: str | None) -> None:
         return
     if not re.match(r"^https?://", url, flags=re.IGNORECASE):
         return
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.hostname or "").lower() in {"aclanthology.org", "www.aclanthology.org"}:
+        acl_id = normalize_acl_id(parsed.path)
+        if acl_id:
+            suffix = ".pdf" if re.search(r"\.pdf$", parsed.path, re.IGNORECASE) else "/" if parsed.path.endswith("/") else ""
+            url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, f"/{acl_id}{suffix}", parsed.query, parsed.fragment))
     if url.lower() not in {existing.lower() for existing in urls}:
         urls.append(url)
 
@@ -221,9 +227,9 @@ def normalize_acl_id(value: str | None) -> str | None:
     identifier = identifier.strip().strip("/")
     identifier = re.sub(r"\.pdf$", "", identifier, flags=re.IGNORECASE)
     if re.match(r"^[a-z]\d{2}-\d{4}$", identifier, flags=re.IGNORECASE):
-        return identifier
+        return identifier.upper()
     if re.match(r"^\d{4}\.[a-z0-9-]+\.\d+$", identifier, flags=re.IGNORECASE):
-        return identifier
+        return identifier.lower()
     return None
 
 

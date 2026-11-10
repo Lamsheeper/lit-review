@@ -202,7 +202,7 @@ it("opens and exports a saved inventory even when upstream work is stale", async
   await screen.findByRole("heading", { name: "Your concept inventory" });
   expect(await screen.findByRole("button", { name: "Loaded language" })).toBeInTheDocument();
   expect(screen.getByText(/This saved inventory may need updating/)).toBeVisible();
-  expect(within(screen.getByRole("heading", { name: "Your concept inventory" }).closest("header")!).getByRole("link", { name: "Download CSV" })).toHaveAttribute("href", "/api/projects/p1/stages/merge/exports/llm_merged_features.csv");
+  expect(within(screen.getByRole("heading", { name: "Your concept inventory" }).closest("header")!).getByRole("button", { name: "Download CSV" })).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: /Features 3 \/ 3/ }));
   expect(within(screen.getByRole("navigation", { name: "Research steps" })).getByRole("button", { name: /Features$/ })).toBeEnabled();
 });
@@ -499,4 +499,44 @@ it("keeps an old inventory hidden after starting discovery while its first statu
   } finally {
     await act(async () => { releaseStatus?.(); });
   }
+});
+
+it("shows selected PDF progress through completion in the Papers card without starting extraction", async () => {
+  let current=workflow(["define","collect"]);
+  let pdfs={selected:3,ready:0,failed:0,unavailable:0,pending:3,processed:0,running:false,status:null as string|null,job_id:null as string|null,complete:false,ready_to_extract:false};
+  const papers=[candidate("a","First paper"),candidate("b","Second paper"),candidate("c","Third paper")];
+  const fetchMock=workspaceFetch(()=>current,(path,init)=>{
+    if(path.includes("/collection/candidates?"))return {items:path.includes("query=First")?[papers[0]]:papers,total:path.includes("query=First")?1:3};
+    if(path.endsWith("/collection/selection"))return {candidate_ids:["a","b","c"]};
+    if(path.endsWith("/collection/download-progress"))return pdfs;
+    if(path.endsWith("/collection/download")&&init?.method==="POST"){
+      current.steps.candidates.running=true;
+      pdfs={...pdfs,running:true,status:"running",job_id:"pdf-job"};return {id:"pdf-job",kind:"collection_download",status:"running"};
+    }
+    if(path.endsWith("/discovery/run")&&init?.method==="POST"){current=runningDiscovery();return {id:"features",kind:"discovery",status:"queued"};}
+    return undefined;
+  });
+  vi.stubGlobal("fetch",fetchMock);
+  const {client}=renderWorkspace(<ProjectPage/>,"/projects/p1");
+  await waitFor(()=>expect(screen.getByRole("checkbox",{name:"Select First paper"})).toBeChecked());
+  expect(fetchMock.mock.calls.some(([,init])=>init?.method==="POST")).toBe(false);
+  fireEvent.click(screen.getByRole("button",{name:"Download selected PDFs"}));
+  expect(await screen.findByRole("progressbar",{name:"PDF download progress"})).toHaveAttribute("value","0");
+  pdfs={...pdfs,ready:1,pending:2,processed:1};
+  await act(async()=>{await client.refetchQueries({queryKey:["downloadProgress","p1"]})});
+  await waitFor(()=>expect(screen.getByText("Downloading PDFs · 1 of 3 ready")).toBeVisible(),{timeout:3000});
+  expect(screen.getByRole("progressbar",{name:"PDF download progress"})).toHaveAttribute("max","3");
+  fireEvent.change(screen.getByLabelText("Search found papers"),{target:{value:"First"}});
+  await waitFor(()=>expect(screen.queryByText("Second paper")).not.toBeInTheDocument());
+  expect(screen.getByText("Downloading PDFs · 1 of 3 ready")).toBeVisible();
+  expect(screen.getByRole("checkbox",{name:"Select First paper"})).toBeVisible();
+  pdfs={...pdfs,ready:3,pending:0,processed:3,running:false,status:"completed",complete:true,ready_to_extract:true};
+  current=pdfsReady();current.steps.candidates.materials={selected_count:3,selected_downloaded_count:3};
+  await act(async()=>{await Promise.all([client.refetchQueries({queryKey:["downloadProgress","p1"]}),client.refetchQueries({queryKey:["workflow","p1"]})])});
+  expect(screen.getByText("3 PDFs ready · ready to extract")).toBeVisible();
+  expect(screen.getByRole("progressbar",{name:"PDF download progress"})).toHaveAttribute("value","3");
+  expect(screen.getByRole("button",{name:"Extract features"})).toBeEnabled();
+  expect(fetchMock.mock.calls.some(([path])=>String(path).endsWith("/discovery/run"))).toBe(false);
+  fireEvent.click(screen.getByRole("button",{name:"Extract features"}));
+  await waitFor(()=>expect(fetchMock).toHaveBeenCalledWith("/api/projects/p1/discovery/run",expect.objectContaining({method:"POST"})));
 });

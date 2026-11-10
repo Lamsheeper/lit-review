@@ -10,6 +10,7 @@ import clsx from "clsx";
 import { api, ExtractionPromptPreview, Family, Job, json, Project, RelevanceProfile, Taxonomy, Workflow, WorkflowStep } from "./api";
 
 import { GoogleCloudSettings } from "./google-cloud";
+import { InventoryExport } from "./export";
 
 import {ReadyContext,ReadinessNotice,useReadiness,ReadinessButton} from "./readiness";
 
@@ -288,6 +289,19 @@ function ScoreBreakdown({ candidate }: { candidate: Candidate }) {
     {breakdown.exclusion_penalty > 0 && <div className="text-red-700">Exclusion penalty: -{Number(breakdown.exclusion_penalty).toFixed(2)}</div>}
   </div></details>;
 }
+export type PDFDownloadProgress = { selected:number; ready:number; failed:number; unavailable:number; pending:number; processed:number; running:boolean; status:string|null; job_id:string|null; complete:boolean; ready_to_extract:boolean };
+export function DownloadProgress({progress,starting=false,selectedCount=0}:{progress?:PDFDownloadProgress;starting?:boolean;selectedCount?:number}) {
+  if(!starting&&!progress?.job_id&&!progress?.ready)return null;
+  const data=progress&&(!starting||progress.selected===selectedCount)?progress:undefined;
+  const total=data?.selected??selectedCount,ready=data?.ready??0;
+  const preparing=starting&&!data?.running;
+  const running=starting||Boolean(data?.running);
+  const failed=preparing?0:data?.failed??0,unavailable=preparing?0:data?.unavailable??0;
+  const label=total===0?"No papers selected":data?.ready_to_extract&&!starting?`${ready} PDF${ready===1?"":"s"} ready · ready to extract`:`${running?"Downloading PDFs":data?.status==="cancelled"||data?.status==="interrupted"?"Downloads paused":data?.status==="failed"?"Downloads stopped":data?.complete?"PDF downloads complete":"PDF downloads"} · ${ready} of ${total} ready`;
+  const details=[failed?`${failed} failed`:"",unavailable?`${unavailable} unavailable`:""].filter(Boolean).join(" · ");
+  return <section className="pdf-download-progress" aria-label="PDF downloads"><div><span role="status">{label}</span>{running?<LoaderCircle size={13} className="animate-spin"/>:data?.ready_to_extract?<CheckCircle2 size={13}/>:null}</div><progress aria-label="PDF download progress" aria-valuetext={`${ready} of ${total} selected PDFs ready${details?"; "+details:""}`} value={ready} max={Math.max(1,total)}/>{details&&<p>{details}{!running&&total>ready?". Deselect unavailable papers to extract from the PDFs that are ready.":""}</p>}</section>;
+}
+
 function Candidates({ projectId, status, onNext, extracting=false }: { projectId: string; status: WorkflowStep; onNext: () => void; extracting?:boolean }) {
   const client = useQueryClient();
   const [query, setQuery] = useState(""); const [page, setPage] = useState(1); const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -298,7 +312,9 @@ function Candidates({ projectId, status, onNext, extracting=false }: { projectId
   const savedSelection = useQuery({ enabled:Boolean(candidates.data), queryKey: ["candidateSelection", projectId], queryFn: () => api<{ candidate_ids: string[] }>(`/api/projects/${projectId}/collection/selection`) });
   useEffect(() => { if (savedSelection.data&&!selectionDirty) setSelected(new Set(savedSelection.data.candidate_ids)); }, [savedSelection.data]);
   const save = useMutation({ mutationFn: () => api(`/api/projects/${projectId}/collection/selection`, json("PUT", { candidate_ids: [...selected] })), onSuccess: () => { setSelectionDirty(false); client.invalidateQueries({queryKey:["candidateSelection",projectId]}); client.invalidateQueries({queryKey:["candidates",projectId]}); client.invalidateQueries({ queryKey: ["workflow", projectId] }); } });
-  const download = useMutation({ mutationFn: async () => { await save.mutateAsync(); return api<Job>(`/api/projects/${projectId}/collection/download`, { method: "POST" }); }, onSuccess: () => client.invalidateQueries({ queryKey: ["workflow", projectId] }) });
+  const pdfProgress=useQuery({queryKey:["downloadProgress",projectId],queryFn:()=>api<PDFDownloadProgress>(`/api/projects/${projectId}/collection/download-progress`),refetchInterval:1000});
+  const progress=Number.isFinite(pdfProgress.data?.selected)?pdfProgress.data:undefined;
+  const download = useMutation({ mutationFn: async () => { await save.mutateAsync(); return api<Job>(`/api/projects/${projectId}/collection/download`, { method: "POST" }); }, onSuccess: async () => {await Promise.all([client.invalidateQueries({ queryKey: ["workflow", projectId] }),client.invalidateQueries({queryKey:["downloadProgress",projectId]})]);} });
   const rows = useMemo(() => candidates.data?.items || [], [candidates.data]);
   const helper = createColumnHelper<Candidate>();
   const columns = useMemo(() => [
@@ -309,7 +325,8 @@ function Candidates({ projectId, status, onNext, extracting=false }: { projectId
     helper.accessor("download_status", { header: "Status", cell: info => <span className="badge">{info.getValue() || "not downloaded"}</span> }),
   ], [rows, selected]);
   const table = useReactTable({ data: rows, columns, state:{columnVisibility:metadata?{}:{relevance_score:false,citation_count:false,source_apis:false}}, getCoreRowModel: getCoreRowModel() });
-  return <section className="stage"><StepHeader eyebrow="PAPERS" rerun={false} title="Find and choose papers" description="Choose the papers to use, download their PDFs, then extract features." status={{...status,running:status.running||extracting}} ready={status.complete && !selectionDirty && !status.running && !extracting} onNext={extracting?undefined:onNext} nextLabel="Extract features" action={<><ReadinessButton className="button-primary" disabled={selected.size === 0 || download.isPending || status.running || extracting} onClick={() => download.mutate()}>{download.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <Download size={16} />} Download selected PDFs</ReadinessButton></>} />
+  return <section className="stage papers-stage"><StepHeader eyebrow="PAPERS" rerun={false} title="Find and choose papers" description="Choose the papers to use, download their PDFs, then extract features." status={{...status,running:status.running||extracting||download.isPending}} ready={status.complete && !selectionDirty && !status.running && !extracting && !download.isPending && (!progress||progress.ready_to_extract)} onNext={extracting?undefined:onNext} nextLabel="Extract features" action={<><ReadinessButton className="button-primary" disabled={selected.size === 0 || download.isPending || status.running || extracting} onClick={() => download.mutate()}>{download.isPending || status.running ? <LoaderCircle className="animate-spin" size={16} /> : <Download size={16} />} Download selected PDFs</ReadinessButton></>} />
+    <DownloadProgress progress={selectionDirty?undefined:progress} starting={download.isPending} selectedCount={selected.size}/><Error mutation={pdfProgress}/>
     <div className="paper-counts"><span>{candidates.data?.total||0} papers found · {selected.size} selected · {Number(status.materials.selected_downloaded_count||0)} PDFs available</span><details><summary>Ranking details</summary><label><input type="checkbox" checked={metadata} onChange={event=>setMetadata(event.target.checked)}/> Show relevance, citations and sources</label></details></div>
     <div className="space-y-4"><div className="panel overflow-hidden p-0"><div className="border-b border-slate-200 p-4"><input aria-label="Search found papers" className="input" placeholder="Search found papers..." value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} /></div><DataTable table={table} /><div className="flex items-center justify-between border-t border-slate-200 p-4 text-xs text-slate-500"><span>{candidates.data?.total || 0} candidates · page {page}</span><div className="flex gap-2"><button className="button-secondary" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous</button><button className="button-secondary" disabled={page * pageSize >= (candidates.data?.total || 0)} onClick={() => setPage(page + 1)}>Next</button></div></div></div><JobPanel projectId={projectId} kind="collection_download" /></div><Error mutation={download} />
   </section>;
@@ -434,10 +451,10 @@ export function Results({ projectId, status, scoreStatus }: { projectId: string;
     helper.accessor("evidence_types", { header: "Evidence", cell: info => <span className="text-xs">{info.getValue()?.join(", ")}</span> }),
   ], []);
   const table = useReactTable({ data: rows, columns, state:{columnVisibility:moreColumns?{}:{mention_count:false,confidence:false,evidence_types:false}}, getCoreRowModel: getCoreRowModel() });
-  return <section className="stage"><StepHeader inspection eyebrow="RESULTS" title="Your concept inventory" description={`${features.data?.total||0} concepts. Open one to read its definition and source evidence.`} status={status} action={<a className="button-primary" href={`/api/projects/${projectId}/stages/${inventory}/exports/${inventories[inventory].replace(".jsonl", ".csv")}`}><Download size={16} /> Download CSV</a>} />
+  return <section className="stage"><StepHeader inspection eyebrow="RESULTS" title="Your concept inventory" description={`${features.data?.total||0} concepts. Open one to read its definition and source evidence.`} status={status} action={<InventoryExport projectId={projectId} inventory={inventory}/>} />
     {status.stale&&<p className="saved-inventory-note">This saved inventory may need updating after changes to your search. You can still inspect and export it.</p>}
 <div className="panel overflow-hidden p-0"><div className="grid gap-3 border-b border-slate-200 p-4 md:grid-cols-[1fr_260px]"><input className="input" placeholder="Search features..." value={query} onChange={e => setQuery(e.target.value)} /><select className="input" value={category} onChange={e => setCategory(e.target.value)}><option value="">All families</option>{categories.map(x => <option key={x} value={x}>{humanCategory(x)}</option>)}</select></div><DataTable table={table} /></div>
-    <details className="details"><summary>Other exports and optional scoring</summary><label className="flex items-center gap-2 mt-4"><input type="checkbox" checked={moreColumns} onChange={event=>setMoreColumns(event.target.checked)}/> Show detailed evidence columns</label><div className="panel"><Field label="Inventory"><select className="input" value={inventory} onChange={e => setInventory(e.target.value)}>{Object.keys(inventories).filter(stage => stage !== "score" || scoreStatus.complete).map(stage => <option key={stage}>{stage}</option>)}</select></Field><a className="button-secondary mt-3" href={`/api/projects/${projectId}/stages/${inventory}/exports/${inventories[inventory].replace(".jsonl", ".csv")}`}>Download CSV</a></div>
+    <details className="details"><summary>Other exports and optional scoring</summary><label className="flex items-center gap-2 mt-4"><input type="checkbox" checked={moreColumns} onChange={event=>setMoreColumns(event.target.checked)}/> Show detailed evidence columns</label><div className="panel"><Field label="Inventory"><select className="input" value={inventory} onChange={e => setInventory(e.target.value)}>{Object.keys(inventories).filter(stage => stage !== "score" || scoreStatus.complete).map(stage => <option key={stage}>{stage}</option>)}</select></Field><div className="mt-3"><InventoryExport projectId={projectId} inventory={inventory}/></div></div>
     <details className="details bg-white"><summary>Optional feature scoring</summary><ProcessingStage projectId={projectId} stage="score" status={scoreStatus} /></details>
     </details>
     {(errors.data?.items.length || 0) > 0 && <details className="details bg-white"><summary>Extraction failures ({errors.data?.total}) </summary><div className="mt-4 space-y-2">{errors.data?.items.map((error, index) => <div className="rounded-sm bg-red-50 p-3 text-xs text-red-800" key={index}><strong>{error.paper_id || "Unknown paper"}</strong><div className="mt-1">{error.error}</div></div>)}</div></details>}

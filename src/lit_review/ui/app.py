@@ -3,6 +3,7 @@ from __future__ import annotations
 from lit_review.core.io import read_jsonl
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -29,6 +30,7 @@ from lit_review.core.taxonomy import load_taxonomy, validate_taxonomy
 
 from .readiness import summarize, provider_requirements, document_requirements
 from .jobs import JobManager
+from .exports import prepare_inventory_csv, prepared_inventory_csv
 from .store import ProjectStore
 from .google_cloud import GoogleCloudSetup, CloudSettings
 
@@ -468,6 +470,90 @@ def download_statuses(path: Path) -> dict:
             key = stable_candidate_id(candidate_from_dict(record))
             statuses.setdefault(key, (record.get("download") or {}).get("status"))
     return statuses
+
+
+def download_records(path: Path) -> tuple[dict[str, dict], list[dict]]:
+    """Resolve ledger rows by stable paper ID, retaining final records as fallbacks."""
+    final = read_json(path / "run/stages/collect/logs/manifest.json", {}) or {}
+    ledger = read_json(path / "run/stages/collect/logs/download_log.json", {}) or {}
+    records = {}
+    available = []
+    for raw in [*final.get("candidates", []), *ledger.get("records", [])]:
+        if not isinstance(raw, dict):
+            continue
+        candidate_id = raw.get("candidate_id") or stable_candidate_id(candidate_from_dict(raw))
+        records[candidate_id] = raw
+        available.append(dict(raw, candidate_id=candidate_id))
+    return records, available
+
+
+def download_record_signature(record: dict) -> str:
+    return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+
+
+def has_saved_pdf(path: Path, record: dict) -> bool:
+    from lit_review.evidence.pdf import resolve_download_path
+
+    download = record.get("download") or record
+    if (record.get("status") or download.get("status")) not in ("downloaded", "already_exists"):
+        return False
+    raw = record.get("path") or download.get("path") or record.get("filename") or download.get("filename")
+    if not raw:
+        return False
+    file = resolve_download_path(str(raw), path / "run/stages/collect", path / "run/stages/collect/logs/manifest.json")
+    try:
+        with file.open("rb") as handle:
+            return b"%PDF-" in handle.read(1024)
+    except OSError:
+        return False
+
+
+@app.get("/api/projects/{project_id}/collection/download-progress")
+def download_progress(project_id: str) -> dict:
+    """Report actual availability for the complete saved selection, without changing it."""
+    path = project_dir(project_id)
+    selected = set((read_json(path / "selection.json", {}) or {}).get("candidate_ids", []))
+    records, all_records = download_records(path)
+    active = store.active_job(project_id) or {}
+    job = active if active.get("kind") == "collection_download" else next(
+        (job for job in store.list_jobs(project_id) if job["kind"] == "collection_download"), {}
+    )
+    running = job.get("status") in ("queued", "running", "cancelling")
+    context = read_json(path / "cache/download-progress.json", {}) or {}
+    baseline = context.get("baseline", {}) if context.get("job_id") == job.get("id") else None
+    ready = {
+        row["candidate_id"] for row in all_records
+        if row["candidate_id"] in selected and has_saved_pdf(path, row)
+    }
+    failed = unavailable = 0
+    for candidate_id in selected - ready:
+        record = records.get(candidate_id, {})
+        status = record.get("status") or (record.get("download") or {}).get("status")
+        observed = bool(
+            record and (not job or baseline is not None and baseline.get(candidate_id) != download_record_signature(record))
+        )
+        if status == "failed" and observed:
+            failed += 1
+        elif observed and status in ("abstract_only", "not_attempted", "downloaded", "already_exists"):
+            unavailable += 1
+        elif job.get("status") == "completed" and status in (
+            "failed", "abstract_only", "not_attempted", "downloaded", "already_exists"
+        ):
+            # A completed run may deliberately reuse an earlier failed lookup.
+            # It is unavailable, rather than a newly completed attempt.
+            unavailable += 1
+    pending = len(selected) - len(ready) - failed - unavailable
+    _, recorded_pdfs = document_requirements(
+        path, read_json, lambda row: stable_candidate_id(candidate_from_dict(row))
+    )
+    return {
+        "selected": len(selected), "ready": len(ready), "failed": failed,
+        "unavailable": unavailable, "pending": pending,
+        "processed": len(selected) - pending,
+        "running": running, "status": job.get("status"), "job_id": job.get("id"),
+        "complete": bool(selected) and not running and pending == 0,
+        "ready_to_extract": bool(selected) and not running and ready == selected and selected.issubset(recorded_pdfs),
+    }
 
 
 def load_candidates(path: Path) -> list[dict[str, Any]]:
@@ -1499,7 +1585,11 @@ def start_download(project_id: str) -> dict:
         output_root=path / "run",
         stages=[StageSpec(id="collect", operation="collect.search", options=options)],
     )
-    return pipeline_job(project_id, "collection_download", config, ["collect"])
+    before, _ = download_records(path)
+    baseline = {key: download_record_signature(record) for key, record in before.items()}
+    job = pipeline_job(project_id, "collection_download", config, ["collect"])
+    store.write_json(path / "cache/download-progress.json", {"job_id": job["id"], "baseline": baseline})
+    return job
 
 
 @app.post("/api/projects/{project_id}/extraction/run")
@@ -1734,6 +1824,28 @@ def export_stage(project_id: str, stage: str, artifact: str) -> FileResponse:
     if not path.is_file():
         raise HTTPException(404, "Artifact does not exist yet")
     return FileResponse(path, filename=artifact)
+
+
+@app.post("/api/projects/{project_id}/exports/csv")
+def prepare_csv_export(project_id: str, payload: dict) -> dict:
+    try:
+        result = prepare_inventory_csv(project_dir(project_id), str(payload.get("inventory", "merge")))
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {**result, "download_url": f"/api/projects/{project_id}/exports/prepared/{result['filename']}"}
+
+
+@app.get("/api/projects/{project_id}/exports/prepared/{filename}")
+def prepared_csv_export(project_id: str, filename: str) -> FileResponse:
+    try:
+        path = prepared_inventory_csv(project_dir(project_id), filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return FileResponse(path, filename=filename)
 
 
 @app.get("/api/projects/{project_id}/exports/{artifact}")
